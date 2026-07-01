@@ -32248,6 +32248,9 @@ function extractToolError(p) {
 function reasoningText(p) {
 	const parts = [];
 	for (const s of p.summary ?? []) if (s?.text) parts.push(s.text);
+	if (Array.isArray(p.content)) {
+		for (const c of p.content) if (c?.text) parts.push(c.text);
+	}
 	if (typeof p.content === "string") parts.push(p.content);
 	return parts.length ? parts.join("\n") : void 0;
 }

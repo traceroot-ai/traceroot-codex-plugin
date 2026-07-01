@@ -55,6 +55,28 @@ describe("parseRollout", () => {
     expect(t.steps[0]!.text).toBeUndefined();
   });
 
+  it("captures reasoning text from content parts", () => {
+    const lines: RolloutLine[] = [
+      { timestamp: ts(100), type: "session_meta", payload: { id: "sess-1" } },
+      { timestamp: ts(101), type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } },
+      {
+        timestamp: ts(102),
+        type: "response_item",
+        payload: {
+          type: "reasoning",
+          content: [
+            { type: "reasoning_text", text: "Check the transcript shape." },
+            { type: "reasoning_text", text: "Then emit the trace." },
+          ],
+        },
+      },
+      { timestamp: ts(103), type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } },
+    ];
+
+    const { turns } = parseRollout(lines);
+    expect(turns[0]!.steps[0]!.reasoning).toBe("Check the transcript shape.\nThen emit the trace.");
+  });
+
   it("captures final output from agent_message even without task_complete (live-read race)", () => {
     // Codex writes agent_message BEFORE the terminal task_complete (which lands
     // just after the Stop hook fires). finalOutput must come from agent_message
