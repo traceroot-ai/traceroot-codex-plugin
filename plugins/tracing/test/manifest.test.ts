@@ -13,12 +13,13 @@ describe("plugin manifest", () => {
     expect(m.hooks).toBe("./hooks/hooks.json");
   });
 
-  it("hooks.json registers PostToolUse, Stop, SubagentStop pointing at dist bundle", async () => {
+  it("hooks.json resolves the dist bundle from the installed plugin root", async () => {
     const h = JSON.parse(await fs.readFile(path.join(root, "hooks", "hooks.json"), "utf-8"));
     for (const ev of ["PostToolUse", "Stop", "SubagentStop"]) {
       expect(h.hooks[ev]).toBeDefined();
       const cmd = h.hooks[ev][0].hooks[0].command;
-      expect(cmd).toContain("dist/index.mjs");
+      expect(cmd).toBe('node "$PLUGIN_ROOT/dist/index.mjs"');
+      expect(cmd).not.toContain("/plugins/cache/");
     }
   });
 });

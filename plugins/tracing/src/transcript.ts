@@ -56,6 +56,37 @@ function messageText(content: unknown): string | undefined {
   return parts.length ? parts.join("") : undefined;
 }
 
+// Codex and plugins reuse role:"user" for synthetic context blocks. These can
+// appear before or after the real prompt and must not become trace input. This
+// denylist is best-effort: third-party plugins may introduce new wrapper tags.
+const INJECTED_USER_MESSAGE_TAGS = new Set([
+  "environment_context",
+  "user_instructions",
+  "subagent_notification",
+  "user_shell_command",
+  "recommended_plugins",
+  "turn_aborted",
+  "knowledge-context",
+  "memory-context",
+  "memory-cli",
+  "activity-cli",
+  "skill",
+]);
+
+function isInjectedUserMessage(text: string): boolean {
+  const tag = /^<([A-Za-z0-9_-]+)\b/.exec(text.trimStart())?.[1];
+  return tag !== undefined && INJECTED_USER_MESSAGE_TAGS.has(tag);
+}
+
+function isInjectedFallbackText(text: string): boolean {
+  if (isInjectedUserMessage(text)) return true;
+  if (/^# AGENTS\.md instructions for\b/.test(text.trim())) return true;
+  // Modern Codex can fuse a preamble and injected context into one user-role
+  // response item, so inspect structural wrapper lines anywhere in the text.
+  // Inline mentions remain valid fallback prompts.
+  return /(?:^|\n)[ \t]*<\/?(environment_context|user_instructions)\b/.test(text);
+}
+
 /** Codex's spawn_agent tool returns {"agent_id":"<thread id>","nickname":"..."}. */
 function parseSpawnAgentId(output: unknown): string | undefined {
   let obj: unknown = output;
@@ -72,6 +103,8 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
   let turn: Turn | undefined;
   let step: ModelStep | undefined;
   const toolsByCallId = new Map<string, ToolCall>();
+  const userInputFallback = new Map<Turn, string>();
+  const authoritativeUserInputs = new Map<Turn, Set<string>>();
   // call_ids of spawn_agent tool calls, so we can read the child thread id from
   // the matching function_call_output ({"agent_id": "..."}).
   const spawnAgentCallIds = new Set<string>();
@@ -82,6 +115,17 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
       t.steps.push(step);
     }
     return step;
+  };
+
+  const appendAuthoritativeUserInput = (t: Turn, text: string): void => {
+    let inputs = authoritativeUserInputs.get(t);
+    if (!inputs) {
+      inputs = new Set<string>();
+      authoritativeUserInputs.set(t, inputs);
+    }
+    if (inputs.has(text)) return;
+    inputs.add(text);
+    t.userInput = [...inputs].join("\n\n");
   };
 
   for (const line of lines) {
@@ -118,14 +162,22 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
           turns.push(turn);
           break;
         case "user_message":
-          if (turn && typeof p.message === "string") turn.userInput = p.message;
+          if (turn && typeof p.message === "string" && !isInjectedUserMessage(p.message)) {
+            appendAuthoritativeUserInput(turn, p.message);
+          }
+          break;
+        case "item_completed":
+          if (turn && p.item?.type === "UserMessage") {
+            // Current Codex versions emit the bare prompt in this structured
+            // event. It is authoritative; response_item/user is only fallback.
+            const text = messageText(p.item.content);
+            if (text) appendAuthoritativeUserInput(turn, text);
+          }
           break;
         case "agent_message":
-          // The agent's final message. Codex writes this BEFORE the terminal
-          // task_complete line (which lands just AFTER the Stop hook fires), so
-          // capturing the output here is what lets the root span carry the output
-          // on a live run — relying only on task_complete, our hook reads too early
-          // to see it. Last one wins.
+          // Older Codex versions emit this before task_complete. Keep it as a
+          // provisional final output for live reads; newer versions use the
+          // assistant response_item path handled below. Last one wins.
           if (turn && typeof p.message === "string") turn.finalOutput = p.message;
           break;
         case "token_count":
@@ -142,7 +194,7 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
             turn.endTime = at;
             const lastText = [...turn.steps].reverse().find((s) => s.text)?.text;
             // Prefer an explicit last_agent_message; otherwise keep what the
-            // agent_message event already captured, then fall back to step text.
+            // live message events already captured, then fall back to step text.
             turn.finalOutput = (p.last_agent_message ?? turn.finalOutput ?? lastText) ?? undefined;
           }
           break;
@@ -187,7 +239,22 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
       if (p.type === "reasoning") {
         s.reasoning = reasoningText(p);
       } else if (p.type === "message") {
-        if (p.role !== "developer" && p.role !== "user") s.text = messageText(p.content);
+        const text = messageText(p.content);
+        if (p.role === "user") {
+          // Some Codex versions expose the prompt only as a response item. Keep
+          // the first plausible prompt as fallback, but never let it shadow the
+          // clean user_message or item_completed/UserMessage representation.
+          if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) {
+            userInputFallback.set(turn, text);
+          }
+        } else if (p.role !== "developer") {
+          s.text = text;
+          // Newer Codex versions may fire the Stop hook after the final assistant
+          // response_item but before task_complete, without an agent_message event.
+          // Treat the latest non-empty assistant message as provisional final
+          // output so the root span is complete in that live-read window.
+          if (p.role === "assistant" && text) turn.finalOutput = text;
+        }
       } else if (p.type === "function_call") {
         let args: unknown = p.arguments;
         try { args = JSON.parse(p.arguments); } catch { /* keep string */ }
@@ -209,6 +276,10 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
       continue;
     }
   }
+
+  // Resolve fallbacks after parsing so authoritative events win regardless of
+  // file order while incomplete turns remain usable by a live Stop hook.
+  for (const t of turns) t.userInput ??= userInputFallback.get(t);
 
   return { sessionMeta, turns };
 }

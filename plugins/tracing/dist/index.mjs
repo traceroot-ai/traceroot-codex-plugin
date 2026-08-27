@@ -32256,6 +32256,28 @@ function messageText(content) {
 	const parts = content.filter((c) => typeof c?.text === "string").map((c) => c.text);
 	return parts.length ? parts.join("") : void 0;
 }
+const INJECTED_USER_MESSAGE_TAGS = new Set([
+	"environment_context",
+	"user_instructions",
+	"subagent_notification",
+	"user_shell_command",
+	"recommended_plugins",
+	"turn_aborted",
+	"knowledge-context",
+	"memory-context",
+	"memory-cli",
+	"activity-cli",
+	"skill"
+]);
+function isInjectedUserMessage(text) {
+	const tag = /^<([A-Za-z0-9_-]+)\b/.exec(text.trimStart())?.[1];
+	return tag !== void 0 && INJECTED_USER_MESSAGE_TAGS.has(tag);
+}
+function isInjectedFallbackText(text) {
+	if (isInjectedUserMessage(text)) return true;
+	if (/^# AGENTS\.md instructions for\b/.test(text.trim())) return true;
+	return /(?:^|\n)[ \t]*<\/?(environment_context|user_instructions)\b/.test(text);
+}
 /** Codex's spawn_agent tool returns {"agent_id":"<thread id>","nickname":"..."}. */
 function parseSpawnAgentId(output) {
 	let obj = output;
@@ -32273,6 +32295,8 @@ function parseRollout(lines) {
 	let turn;
 	let step;
 	const toolsByCallId = /* @__PURE__ */ new Map();
+	const userInputFallback = /* @__PURE__ */ new Map();
+	const authoritativeUserInputs = /* @__PURE__ */ new Map();
 	const spawnAgentCallIds = /* @__PURE__ */ new Set();
 	const ensureStep = (t, at) => {
 		if (!step) {
@@ -32287,6 +32311,16 @@ function parseRollout(lines) {
 			t.steps.push(step);
 		}
 		return step;
+	};
+	const appendAuthoritativeUserInput = (t, text) => {
+		let inputs = authoritativeUserInputs.get(t);
+		if (!inputs) {
+			inputs = /* @__PURE__ */ new Set();
+			authoritativeUserInputs.set(t, inputs);
+		}
+		if (inputs.has(text)) return;
+		inputs.add(text);
+		t.userInput = [...inputs].join("\n\n");
 	};
 	for (const line of lines) {
 		const at = ms(line.timestamp);
@@ -32325,7 +32359,13 @@ function parseRollout(lines) {
 					turns.push(turn);
 					break;
 				case "user_message":
-					if (turn && typeof p.message === "string") turn.userInput = p.message;
+					if (turn && typeof p.message === "string" && !isInjectedUserMessage(p.message)) appendAuthoritativeUserInput(turn, p.message);
+					break;
+				case "item_completed":
+					if (turn && p.item?.type === "UserMessage") {
+						const text = messageText(p.item.content);
+						if (text) appendAuthoritativeUserInput(turn, text);
+					}
 					break;
 				case "agent_message":
 					if (turn && typeof p.message === "string") turn.finalOutput = p.message;
@@ -32386,7 +32426,13 @@ function parseRollout(lines) {
 			const s = ensureStep(turn, at);
 			if (p.type === "reasoning") s.reasoning = reasoningText(p);
 			else if (p.type === "message") {
-				if (p.role !== "developer" && p.role !== "user") s.text = messageText(p.content);
+				const text = messageText(p.content);
+				if (p.role === "user") {
+					if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) userInputFallback.set(turn, text);
+				} else if (p.role !== "developer") {
+					s.text = text;
+					if (p.role === "assistant" && text) turn.finalOutput = text;
+				}
 			} else if (p.type === "function_call") {
 				let args = p.arguments;
 				try {
@@ -32418,6 +32464,7 @@ function parseRollout(lines) {
 			continue;
 		}
 	}
+	for (const t of turns) t.userInput ??= userInputFallback.get(t);
 	return {
 		sessionMeta,
 		turns
