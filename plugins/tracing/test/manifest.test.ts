@@ -9,7 +9,7 @@ describe("plugin manifest", () => {
   it("plugin.json references hooks file and has name/version", async () => {
     const m = JSON.parse(await fs.readFile(path.join(root, ".codex-plugin", "plugin.json"), "utf-8"));
     expect(m.name).toBe("tracing");
-    expect(m.version).toBe("0.1.0");
+    expect(m.version).toBe("0.1.1");
     expect(m.hooks).toBe("./hooks/hooks.json");
   });
 

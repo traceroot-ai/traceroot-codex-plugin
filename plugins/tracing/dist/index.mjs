@@ -31886,7 +31886,7 @@ var PrimedIdGenerator = class {
 //#endregion
 //#region src/sdk.ts
 const SDK_NAME = "traceroot-codex-plugin";
-const SDK_VERSION = "0.1.0";
+const SDK_VERSION = "0.1.1";
 
 //#endregion
 //#region src/exporter.ts
