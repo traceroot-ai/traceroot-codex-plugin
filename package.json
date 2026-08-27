@@ -1,6 +1,6 @@
 {
   "name": "traceroot-codex-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Trace OpenAI Codex sessions to TraceRoot",
   "license": "Apache-2.0",
   "type": "module",
