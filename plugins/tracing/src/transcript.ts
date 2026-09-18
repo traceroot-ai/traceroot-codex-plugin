@@ -44,6 +44,9 @@ function extractToolError(p: EventMsgPayload): string | undefined {
 function reasoningText(p: { summary?: unknown[]; content?: unknown }): string | undefined {
   const parts: string[] = [];
   for (const s of (p.summary ?? []) as Array<{ text?: string }>) if (s?.text) parts.push(s.text);
+  if (Array.isArray(p.content)) {
+    for (const c of p.content as Array<{ text?: string }>) if (c?.text) parts.push(c.text);
+  }
   if (typeof p.content === "string") parts.push(p.content);
   return parts.length ? parts.join("\n") : undefined;
 }
