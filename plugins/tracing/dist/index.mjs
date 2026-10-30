@@ -87,6 +87,7 @@ async function getConfig(cwd = process.cwd()) {
 		maxRequestBytes: ((n) => Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_REQUEST_BYTES)(Number(envFirst("TRACEROOT_CODEX_MAX_REQUEST_BYTES") ?? j.max_request_bytes ?? DEFAULT_MAX_REQUEST_BYTES)),
 		debug: truthy(envFirst("TRACEROOT_CODEX_DEBUG") ?? j.debug),
 		failOnError: truthy(envFirst("TRACEROOT_CODEX_FAIL_ON_ERROR") ?? j.fail_on_error),
+		captureImages: truthy(envFirst("TRACEROOT_CODEX_CAPTURE_IMAGES") ?? j.capture_images),
 		enabled: false
 	};
 	config.enabled = truthy(enabledFlag) && Boolean(apiKey);
@@ -30014,6 +30015,83 @@ async function markSpanEmitted(rolloutFile, spanId) {
 }
 
 //#endregion
+//#region src/images.ts
+const IMAGE_DATA_URL = /data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/]+={0,2}/g;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_SPAN_BYTES = 8 * 1024 * 1024;
+const OVERSIZE_IMAGE = "[image omitted: larger than 5 MiB]";
+const SPAN_TOO_LARGE_IMAGE = "[image omitted: span larger than 8 MiB]";
+/** Decoded size of a base64 data URL's payload, in bytes. */
+function decodedBytes(dataUrl) {
+	const payload = dataUrl.slice(dataUrl.indexOf(",") + 1);
+	const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+	return Math.floor(payload.length * 3 / 4) - padding;
+}
+/** Applies `fn` to every string in a JSON value, keeping its shape. */
+function mapStrings(value, fn) {
+	if (typeof value === "string") return fn(value);
+	if (Array.isArray(value)) return value.map((v) => mapStrings(v, fn));
+	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mapStrings(v, fn)]));
+	return value;
+}
+/** Cuts `text` to what is left of the budget, unless the cut marker would be longer than the text it drops. */
+function capText(text, budget) {
+	const cut = truncate(text, budget.left);
+	budget.left = Math.max(0, budget.left - text.length);
+	return cut.length < text.length ? cut : text;
+}
+function capString(s, budget) {
+	let out = "";
+	let at = 0;
+	for (const m of s.matchAll(IMAGE_DATA_URL)) {
+		const image = decodedBytes(m[0]) > MAX_IMAGE_BYTES ? OVERSIZE_IMAGE : m[0];
+		out += capText(s.slice(at, m.index), budget) + image;
+		at = m.index + m[0].length;
+	}
+	return out + capText(s.slice(at), budget);
+}
+/**
+* Serializes `value` for a span attribute and caps it at `max` characters like
+* the plain cut, but keeps image data URLs whole: only the text counts toward
+* `max`, and strings are cut one by one so JSON stays valid. An image over
+* 5 MiB decoded becomes a placeholder. A value without images is cut exactly
+* as the plain cut does.
+*/
+function capWithImages(value, max) {
+	const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+	if (text.search(IMAGE_DATA_URL) === -1) return truncate(text, max);
+	const budget = { left: max };
+	const cap = (s) => capString(s, budget);
+	return typeof value === "string" ? cap(value) : JSON.stringify(mapStrings(value, cap));
+}
+/** `value` with every image data URL in it replaced by `placeholder`. */
+function replaceImages(value, placeholder) {
+	return mapStrings(value, (s) => s.replace(IMAGE_DATA_URL, () => placeholder));
+}
+/**
+* Replaces image data URLs in `attributes` with a placeholder, largest first,
+* until the attributes' estimated size is within MAX_SPAN_BYTES.
+*/
+function fitSpanImages(attributes) {
+	let size = attributesBytes(attributes);
+	if (size <= MAX_SPAN_BYTES) return;
+	const images = [];
+	for (const [key, value] of Object.entries(attributes)) {
+		if (typeof value !== "string") continue;
+		for (const m of value.matchAll(IMAGE_DATA_URL)) images.push({
+			key,
+			url: m[0]
+		});
+	}
+	images.sort((a, b) => b.url.length - a.url.length);
+	for (const { key, url } of images) {
+		if (size <= MAX_SPAN_BYTES) break;
+		attributes[key] = attributes[key].replace(url, () => SPAN_TOO_LARGE_IMAGE);
+		size -= url.length - 39;
+	}
+}
+
+//#endregion
 //#region src/tokens.ts
 /**
 * Map Codex `last_token_usage` to the backend's flat token attribute keys.
@@ -30036,6 +30114,24 @@ function mapUsage(u) {
 init_esm$2();
 const ROOT_NAME = "Codex Turn";
 const str = (v, max) => truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
+/** Span input/output capped at maxChars; with image capture on, images stay whole. */
+const io = (v, ctx) => ctx.captureImages ? capWithImages(v, ctx.maxChars) : str(v, ctx.maxChars);
+/** The prompt as the model got it: its text, plus attached images when image capture is on. */
+function promptOf(turn, ctx) {
+	if (!ctx.captureImages || !turn.userImages?.length) return turn.userInput;
+	return [...turn.userInput ? [{
+		type: "input_text",
+		text: turn.userInput
+	}] : [], ...turn.userImages.map((url) => ({
+		type: "input_image",
+		image_url: url
+	}))];
+}
+/**
+* A tool's output as the next model call is shown it. With image capture on, each
+* image points at the tool span that already holds it instead of being sent twice.
+*/
+const fedBackOutput = (tc, ctx) => ctx.captureImages ? replaceImages(tc.output, `[image: see tool call ${tc.callId}]`) : tc.output;
 function commonTrace(attrs, sessionMeta, ctx) {
 	attrs["traceroot.sdk.name"] = SDK_NAME;
 	attrs["traceroot.sdk.version"] = SDK_VERSION;
@@ -30055,7 +30151,8 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		"traceroot.span.path": [ROOT_NAME]
 	};
 	commonTrace(rootAttrs, sessionMeta, ctx);
-	if (turn.userInput) rootAttrs["traceroot.span.input"] = str(turn.userInput, ctx.maxChars);
+	const prompt = promptOf(turn, ctx);
+	if (prompt) rootAttrs["traceroot.span.input"] = io(prompt, ctx);
 	if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
 	rootAttrs["traceroot.span.metadata"] = JSON.stringify(pruneUndefined({
 		"codex.turn_id": turn.turnId,
@@ -30086,14 +30183,15 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 	let prevToolResults;
 	for (const step of turn.steps) {
 		const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
-		const input = step.index === 0 ? turn.userInput : prevToolResults;
+		const input = step.index === 0 ? prompt : prevToolResults;
 		out.push(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input));
 		for (const tc of step.toolCalls) out.push(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx));
 		if (step.toolCalls.length) prevToolResults = str(step.toolCalls.map((tc) => ({
 			name: tc.name,
-			output: tc.output
+			output: fedBackOutput(tc, ctx)
 		})), ctx.maxChars);
 	}
+	if (ctx.captureImages) for (const span of out) fitSpanImages(span.attributes);
 	return out;
 }
 function pruneUndefined(o) {
@@ -30120,7 +30218,7 @@ function planStepSpan(sessionMeta, turn, step, spanId, parentSpanId, traceId, ct
 	};
 	commonTrace(attrs, sessionMeta, ctx);
 	if (turn.model) attrs["traceroot.llm.model"] = turn.model;
-	if (input) attrs["traceroot.span.input"] = truncate(input, ctx.maxChars);
+	if (input) attrs["traceroot.span.input"] = io(input, ctx);
 	const output = buildStepOutput(step, ctx.maxChars);
 	if (output) attrs["traceroot.span.output"] = output;
 	attrs["traceroot.span.metadata"] = JSON.stringify({ "codex.step_index": step.index });
@@ -30144,7 +30242,7 @@ function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx) {
 	};
 	commonTrace(attrs, sessionMeta, ctx);
 	attrs["traceroot.span.input"] = str(tc.args, ctx.maxChars);
-	if (tc.output !== void 0) attrs["traceroot.span.output"] = str(tc.output, ctx.maxChars);
+	if (tc.output !== void 0) attrs["traceroot.span.output"] = io(tc.output, ctx);
 	const meta = {};
 	if (tc.kind !== void 0) meta["tool_kind"] = tc.kind;
 	if (tc.status !== void 0) meta["status"] = tc.status;
@@ -30574,7 +30672,8 @@ async function dispatch(hook, config, deps) {
 		userId: config.userId,
 		git,
 		maxChars: config.maxChars,
-		turnEnding
+		turnEnding,
+		captureImages: config.captureImages
 	};
 	const already = await loadEmittedSpanIds(transcript);
 	const tracing = buildTracingFn(config);

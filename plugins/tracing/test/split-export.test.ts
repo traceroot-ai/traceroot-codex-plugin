@@ -133,7 +133,7 @@ describe("SizeLimitedExporter", () => {
 
 const config: Config = {
   enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: BUDGET,
-  debug: false, failOnError: true,
+  debug: false, failOnError: true, captureImages: false,
 };
 
 describe("buildTracing splits each flush by max_request_bytes", () => {

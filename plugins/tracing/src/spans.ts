@@ -1,6 +1,7 @@
 import { ROOT_CONTEXT, type SpanContext, SpanKind, TraceFlags, trace } from "@opentelemetry/api";
 import type { Tracing } from "./exporter.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
+import { capWithImages, fitSpanImages, replaceImages } from "./images.js";
 import { SDK_NAME, SDK_VERSION } from "./sdk.js";
 import { mapUsage } from "./tokens.js";
 import type { ModelStep, SessionMeta, ToolCall, Turn } from "./types.js";
@@ -20,6 +21,9 @@ export type EmitCtx = {
   // root in ClickHouse — which is how the backend's live-stream detector knows
   // the trace is in progress and keeps streaming (matching the SDK's model).
   turnEnding?: boolean;
+  // Keep image data URLs in tool output and prompts whole instead of cutting
+  // them at maxChars (off by default).
+  captureImages?: boolean;
 };
 
 type SpanAttrs = Record<string, string | number | string[]>;
@@ -38,6 +42,26 @@ export type EmittableSpan = {
 
 const str = (v: unknown, max: number): string =>
   truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
+
+/** Span input/output capped at maxChars; with image capture on, images stay whole. */
+const io = (v: unknown, ctx: EmitCtx): string =>
+  ctx.captureImages ? capWithImages(v, ctx.maxChars) : str(v, ctx.maxChars);
+
+/** The prompt as the model got it: its text, plus attached images when image capture is on. */
+function promptOf(turn: Turn, ctx: EmitCtx): unknown {
+  if (!ctx.captureImages || !turn.userImages?.length) return turn.userInput;
+  return [
+    ...(turn.userInput ? [{ type: "input_text", text: turn.userInput }] : []),
+    ...turn.userImages.map((url) => ({ type: "input_image", image_url: url })),
+  ];
+}
+
+/**
+ * A tool's output as the next model call is shown it. With image capture on, each
+ * image points at the tool span that already holds it instead of being sent twice.
+ */
+const fedBackOutput = (tc: ToolCall, ctx: EmitCtx): unknown =>
+  ctx.captureImages ? replaceImages(tc.output, `[image: see tool call ${tc.callId}]`) : tc.output;
 
 function commonTrace(attrs: SpanAttrs, sessionMeta: SessionMeta, ctx: EmitCtx): void {
   attrs["traceroot.sdk.name"] = SDK_NAME;
@@ -70,7 +94,8 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
   // Root AGENT span (trace-level attrs live here).
   const rootAttrs: SpanAttrs = { "traceroot.span.type": "AGENT", "traceroot.span.path": [ROOT_NAME] };
   commonTrace(rootAttrs, sessionMeta, ctx);
-  if (turn.userInput) rootAttrs["traceroot.span.input"] = str(turn.userInput, ctx.maxChars);
+  const prompt = promptOf(turn, ctx);
+  if (prompt) rootAttrs["traceroot.span.input"] = io(prompt, ctx);
   if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
   rootAttrs["traceroot.span.metadata"] = JSON.stringify(pruneUndefined({
     "codex.turn_id": turn.turnId,
@@ -115,13 +140,18 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
   let prevToolResults: string | undefined;
   for (const step of turn.steps) {
     const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
-    const input = step.index === 0 ? turn.userInput : prevToolResults;
+    const input = step.index === 0 ? prompt : prevToolResults;
     out.push(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input));
     for (const tc of step.toolCalls) out.push(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx));
     if (step.toolCalls.length) {
-      prevToolResults = str(step.toolCalls.map((tc) => ({ name: tc.name, output: tc.output })), ctx.maxChars);
+      prevToolResults = str(
+        step.toolCalls.map((tc) => ({ name: tc.name, output: fedBackOutput(tc, ctx) })), ctx.maxChars,
+      );
     }
   }
+  // Images are kept whole, so a span can grow past what the backend stores;
+  // trade its largest images for placeholders until it fits.
+  if (ctx.captureImages) for (const span of out) fitSpanImages(span.attributes);
   return out;
 }
 
@@ -143,7 +173,7 @@ function buildStepOutput(step: ModelStep, max: number): string | undefined {
 
 function planStepSpan(
   sessionMeta: SessionMeta, turn: Turn, step: ModelStep,
-  spanId: string, parentSpanId: string, traceId: string, ctx: EmitCtx, input: string | undefined,
+  spanId: string, parentSpanId: string, traceId: string, ctx: EmitCtx, input: unknown,
 ): EmittableSpan {
   const attrs: SpanAttrs = {
     "traceroot.span.type": "LLM",
@@ -154,7 +184,7 @@ function planStepSpan(
   };
   commonTrace(attrs, sessionMeta, ctx);
   if (turn.model) attrs["traceroot.llm.model"] = turn.model;
-  if (input) attrs["traceroot.span.input"] = truncate(input, ctx.maxChars);
+  if (input) attrs["traceroot.span.input"] = io(input, ctx);
   const output = buildStepOutput(step, ctx.maxChars);
   if (output) attrs["traceroot.span.output"] = output;
   attrs["traceroot.span.metadata"] = JSON.stringify({ "codex.step_index": step.index });
@@ -175,7 +205,7 @@ function planToolSpan(
   };
   commonTrace(attrs, sessionMeta, ctx);
   attrs["traceroot.span.input"] = str(tc.args, ctx.maxChars);
-  if (tc.output !== undefined) attrs["traceroot.span.output"] = str(tc.output, ctx.maxChars);
+  if (tc.output !== undefined) attrs["traceroot.span.output"] = io(tc.output, ctx);
   const meta: Record<string, unknown> = {};
   if (tc.kind !== undefined) meta["tool_kind"] = tc.kind;
   if (tc.status !== undefined) meta["status"] = tc.status;
