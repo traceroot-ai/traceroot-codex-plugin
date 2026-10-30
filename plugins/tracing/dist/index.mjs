@@ -30246,6 +30246,7 @@ function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx) {
 	attrs["traceroot.span.input"] = str(tc.args, ctx.maxChars);
 	if (tc.output !== void 0) attrs["traceroot.span.output"] = io(tc.output, ctx);
 	const meta = {};
+	if (ctx.captureImages) meta["call_id"] = tc.callId;
 	if (tc.kind !== void 0) meta["tool_kind"] = tc.kind;
 	if (tc.status !== void 0) meta["status"] = tc.status;
 	if (tc.exitCode !== void 0) meta["exit_code"] = tc.exitCode;

@@ -212,6 +212,9 @@ function planToolSpan(
   attrs["traceroot.span.input"] = str(tc.args, ctx.maxChars);
   if (tc.output !== undefined) attrs["traceroot.span.output"] = io(tc.output, ctx);
   const meta: Record<string, unknown> = {};
+  // Matches this span to the "[image: see tool call <call_id>]" placeholders in
+  // the next model call's input.
+  if (ctx.captureImages) meta["call_id"] = tc.callId;
   if (tc.kind !== undefined) meta["tool_kind"] = tc.kind;
   if (tc.status !== undefined) meta["status"] = tc.status;
   if (tc.exitCode !== undefined) meta["exit_code"] = tc.exitCode;

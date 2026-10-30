@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type Config, getConfig } from "../src/config.js";
 import { dispatch } from "../src/emit.js";
+import { makeSpanId } from "../src/ids.js";
 import { MAX_SPAN_BYTES, OVERSIZE_IMAGE, SPAN_TOO_LARGE_IMAGE } from "../src/images.js";
 import { attributesBytes } from "../src/size.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
@@ -53,6 +54,13 @@ describe("image capture on: tool output", () => {
       { type: "input_text", text: "Captured a 4x4 screenshot." },
       { type: "input_image", image_url: png },
     ]);
+  });
+
+  it("records the Codex call id on the tool span, so the placeholder resolves to it", async () => {
+    const spans = await plan("rollout-tool-image.jsonl", { ...on, maxChars: 20000 });
+    const tool = spans.find((s) => s.kind === "TOOL");
+    expect(JSON.parse(attr(tool, "traceroot.span.metadata"))).toEqual({ call_id: "call-shot" });
+    expect(attr(spans.filter((s) => s.kind === "LLM")[1], INPUT)).toContain("[image: see tool call call-shot]");
   });
 
   it("puts a placeholder, not a second copy, into the next model call's input", async () => {
@@ -149,9 +157,15 @@ describe("image capture off", () => {
   });
 
   it.each(cases.filter(([f]) => !f.includes("image")))(
-    "%s (%s context) without images is unchanged with capture on too",
+    "%s (%s context) without images changes only by the tool call ids with capture on",
     async (fixture, context) => {
       const spans = await plan(fixture, { ...contexts[context]!, captureImages: true });
+      for (const span of spans.filter((s) => s.kind === "TOOL")) {
+        const { call_id, ...rest } = JSON.parse(String(span.attributes["traceroot.span.metadata"]));
+        expect(makeSpanId(call_id)).toBe(span.spanId);
+        if (Object.keys(rest).length) span.attributes["traceroot.span.metadata"] = JSON.stringify(rest);
+        else delete span.attributes["traceroot.span.metadata"];
+      }
       expect(JSON.stringify(spans)).toBe(JSON.stringify(golden[fixture]![context]));
     },
   );
