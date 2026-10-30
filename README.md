@@ -59,6 +59,7 @@ Resolved highest-precedence first: env vars → project `.codex/traceroot.json` 
 | `max_request_bytes` | `TRACEROOT_CODEX_MAX_REQUEST_BYTES` | `12582912` (12 MiB) | Upper bound on the estimated size of one upload request. Larger batches of spans are sent as several requests. |
 | `debug` | `TRACEROOT_CODEX_DEBUG` | `false` | Log to stderr. |
 | `fail_on_error` | `TRACEROOT_CODEX_FAIL_ON_ERROR` | `false` | Off by default — tracing never blocks a Codex turn. |
+| `capture_images` | `TRACEROOT_CODEX_CAPTURE_IMAGES` | `false` | Send screenshots from tool output and images attached to prompts. See [Images](#images). |
 
 </details>
 
@@ -87,9 +88,18 @@ Non-interactive Codex never shows the trust prompt, so untrusted hooks are skipp
 
 To check a headless setup, run `codex exec --skip-git-repo-check "echo hello" < /dev/null`. The output should include `hook: Stop Completed`, and a trace should appear in TraceRoot. If there are no `hook:` lines, the hooks aren't trusted. If the hooks run but no trace appears, check `api_key` and `host_url`.
 
+## Images
+
+By default, tool output is cut at `max_chars`, which also cuts any screenshot in it, and images attached to a prompt are left out of the trace. Set `capture_images` to `true` (or `TRACEROOT_CODEX_CAPTURE_IMAGES=true`) to keep them:
+
+- Tool output keeps PNG, JPEG, GIF and WebP images (`data:image/...;base64,` URLs) whole. `max_chars` applies to the text around them.
+- Images attached to a prompt appear in the turn's input and in the first model call's input.
+- When a tool's output is fed to the next model call, each image in it shows there as `[image: see tool call <call id>]` instead of a second copy.
+- An image larger than 5 MiB is replaced with `[image omitted: larger than 5 MiB]`. If a span would still be larger than 8 MiB, its largest images are replaced with `[image omitted: span larger than 8 MiB]` until it fits.
+
 ## Privacy
 
-Only what appears in your traces is sent to your TraceRoot host: prompts, tool inputs/outputs (which can include commands and file contents), model and token info, and git repo/branch. If your tools handle secrets, their inputs/outputs are part of the trace.
+Only what appears in your traces is sent to your TraceRoot host: prompts, tool inputs/outputs (which can include commands and file contents), model and token info, and git repo/branch. If your tools handle secrets, their inputs/outputs are part of the trace. With `capture_images` on, screenshots and other images in tool output, and images you attach to prompts, are sent too.
 
 ## License
 
