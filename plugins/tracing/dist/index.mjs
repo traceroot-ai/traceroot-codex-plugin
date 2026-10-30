@@ -29800,6 +29800,17 @@ const SDK_VERSION = "0.1.1";
 //#endregion
 //#region src/exporter.ts
 var import_src = require_src$7();
+/** One export call; a throwing exporter is reported as a failed export. */
+function exportSafely(exporter, spans, resultCallback) {
+	try {
+		exporter.export(spans, resultCallback);
+	} catch (error) {
+		resultCallback({
+			code: import_src.ExportResultCode.FAILED,
+			error: error instanceof Error ? error : new Error(String(error))
+		});
+	}
+}
 /**
 * Passes spans through to `inner` and records the ids of every span whose export
 * call succeeded, so a span is only treated as sent once the backend accepted it.
@@ -29811,18 +29822,10 @@ var DeliveryTrackingExporter = class {
 		this.inner = inner;
 	}
 	export(spans, resultCallback) {
-		const done = (result) => {
+		exportSafely(this.inner, spans, (result) => {
 			if (result.code === import_src.ExportResultCode.SUCCESS) for (const span of spans) this.delivered.add(span.spanContext().spanId);
 			resultCallback(result);
-		};
-		try {
-			this.inner.export(spans, done);
-		} catch (error) {
-			done({
-				code: import_src.ExportResultCode.FAILED,
-				error: error instanceof Error ? error : new Error(String(error))
-			});
-		}
+		});
 	}
 	shutdown() {
 		return this.inner.shutdown();
