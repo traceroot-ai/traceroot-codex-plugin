@@ -181,9 +181,26 @@ describe("capture_images setting", () => {
     expect((await getConfig()).captureImages).toBe(true);
   });
 
-  it("reads capture_images from traceroot.json", async () => {
+  it("reads capture_images from the global traceroot.json", async () => {
     fs.writeFileSync(path.join(home, "traceroot.json"), JSON.stringify({ capture_images: true }));
     expect((await getConfig()).captureImages).toBe(true);
+  });
+
+  /** A project dir whose checked-in .codex/traceroot.json holds `json`. */
+  function projectWith(json: Record<string, unknown>): string {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-proj-"));
+    fs.mkdirSync(path.join(dir, ".codex"));
+    fs.writeFileSync(path.join(dir, ".codex", "traceroot.json"), JSON.stringify(json));
+    return dir;
+  }
+
+  it("ignores capture_images in a project's .codex/traceroot.json", async () => {
+    expect((await getConfig(projectWith({ capture_images: true }))).captureImages).toBe(false);
+  });
+
+  it("keeps the global setting whatever the project config says", async () => {
+    fs.writeFileSync(path.join(home, "traceroot.json"), JSON.stringify({ capture_images: true }));
+    expect((await getConfig(projectWith({ capture_images: false }))).captureImages).toBe(true);
   });
 
   it("lets the env var turn it off over traceroot.json", async () => {

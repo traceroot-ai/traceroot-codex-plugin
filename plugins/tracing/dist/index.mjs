@@ -87,7 +87,7 @@ async function getConfig(cwd = process.cwd()) {
 		maxRequestBytes: ((n) => Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_REQUEST_BYTES)(Number(envFirst("TRACEROOT_CODEX_MAX_REQUEST_BYTES") ?? j.max_request_bytes ?? DEFAULT_MAX_REQUEST_BYTES)),
 		debug: truthy(envFirst("TRACEROOT_CODEX_DEBUG") ?? j.debug),
 		failOnError: truthy(envFirst("TRACEROOT_CODEX_FAIL_ON_ERROR") ?? j.fail_on_error),
-		captureImages: truthy(envFirst("TRACEROOT_CODEX_CAPTURE_IMAGES") ?? j.capture_images),
+		captureImages: truthy(envFirst("TRACEROOT_CODEX_CAPTURE_IMAGES") ?? globalJson.capture_images),
 		enabled: false
 	};
 	config.enabled = truthy(enabledFlag) && Boolean(apiKey);

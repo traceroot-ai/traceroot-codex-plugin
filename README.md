@@ -59,7 +59,7 @@ Resolved highest-precedence first: env vars → project `.codex/traceroot.json` 
 | `max_request_bytes` | `TRACEROOT_CODEX_MAX_REQUEST_BYTES` | `12582912` (12 MiB) | Upper bound on the estimated size of one upload request. Larger batches of spans are sent as several requests. |
 | `debug` | `TRACEROOT_CODEX_DEBUG` | `false` | Log to stderr. |
 | `fail_on_error` | `TRACEROOT_CODEX_FAIL_ON_ERROR` | `false` | Off by default — tracing never blocks a Codex turn. |
-| `capture_images` | `TRACEROOT_CODEX_CAPTURE_IMAGES` | `false` | Send screenshots from tool output and images attached to prompts. See [Images](#images). |
+| `capture_images` | `TRACEROOT_CODEX_CAPTURE_IMAGES` | `false` | Send screenshots from tool output and images attached to prompts. Read only from the env var or the global `~/.codex/traceroot.json`. See [Images](#images). |
 
 </details>
 
@@ -90,7 +90,7 @@ To check a headless setup, run `codex exec --skip-git-repo-check "echo hello" < 
 
 ## Images
 
-By default, tool output is cut at `max_chars`, which also cuts any screenshot in it, and images attached to a prompt are left out of the trace. Set `capture_images` to `true` (or `TRACEROOT_CODEX_CAPTURE_IMAGES=true`) to keep them:
+By default, tool output is cut at `max_chars`, which also cuts any screenshot in it, and images attached to a prompt are left out of the trace. Set `capture_images` to `true` in `~/.codex/traceroot.json` (or `TRACEROOT_CODEX_CAPTURE_IMAGES=true`) to keep them. A project's `.codex/traceroot.json` can't turn this on, so a repository you open can't start sending your screen content. With it on:
 
 - Tool output keeps PNG, JPEG, GIF and WebP images (`data:image/...;base64,` URLs) whole. `max_chars` applies to the text around them.
 - Images attached to a prompt appear in the first model call's input. The turn's input shows `[image: see first model call]` in their place, because the turn is sent again on every hook.
