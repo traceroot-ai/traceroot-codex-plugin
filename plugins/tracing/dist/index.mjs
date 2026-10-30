@@ -92,128 +92,6 @@ async function getConfig(cwd = process.cwd()) {
 }
 
 //#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/OTLPExporterBase.js
-var OTLPExporterBase;
-var init_OTLPExporterBase = __esmMin((() => {
-	OTLPExporterBase = class {
-		_delegate;
-		constructor(_delegate) {
-			this._delegate = _delegate;
-		}
-		/**
-		* Export items.
-		* @param items
-		* @param resultCallback
-		*/
-		export(items, resultCallback) {
-			this._delegate.export(items, resultCallback);
-		}
-		forceFlush() {
-			return this._delegate.forceFlush();
-		}
-		shutdown() {
-			return this._delegate.shutdown();
-		}
-	};
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/types.js
-var OTLPExporterError;
-var init_types$1 = __esmMin((() => {
-	OTLPExporterError = class extends Error {
-		code;
-		name = "OTLPExporterError";
-		data;
-		constructor(message, code, data) {
-			super(message);
-			this.data = data;
-			this.code = code;
-		}
-	};
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/shared-configuration.js
-function validateTimeoutMillis(timeoutMillis) {
-	if (Number.isFinite(timeoutMillis) && timeoutMillis > 0) return timeoutMillis;
-	throw new Error(`Configuration: timeoutMillis is invalid, expected number greater than 0 (actual: '${timeoutMillis}')`);
-}
-function wrapStaticHeadersInFunction(headers) {
-	if (headers == null) return;
-	return () => headers;
-}
-/**
-* @param userProvidedConfiguration  Configuration options provided by the user in code.
-* @param fallbackConfiguration Fallback to use when the {@link userProvidedConfiguration} does not specify an option.
-* @param defaultConfiguration The defaults as defined by the exporter specification
-*/
-function mergeOtlpSharedConfigurationWithDefaults(userProvidedConfiguration, fallbackConfiguration, defaultConfiguration) {
-	return {
-		timeoutMillis: validateTimeoutMillis(userProvidedConfiguration.timeoutMillis ?? fallbackConfiguration.timeoutMillis ?? defaultConfiguration.timeoutMillis),
-		concurrencyLimit: userProvidedConfiguration.concurrencyLimit ?? fallbackConfiguration.concurrencyLimit ?? defaultConfiguration.concurrencyLimit,
-		compression: userProvidedConfiguration.compression ?? fallbackConfiguration.compression ?? defaultConfiguration.compression
-	};
-}
-function getSharedConfigurationDefaults() {
-	return {
-		timeoutMillis: 1e4,
-		concurrencyLimit: 30,
-		compression: "none"
-	};
-}
-var init_shared_configuration = __esmMin((() => {}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/legacy-node-configuration.js
-var CompressionAlgorithm;
-var init_legacy_node_configuration = __esmMin((() => {
-	;
-	(function(CompressionAlgorithm$1) {
-		CompressionAlgorithm$1["NONE"] = "none";
-		CompressionAlgorithm$1["GZIP"] = "gzip";
-	})(CompressionAlgorithm || (CompressionAlgorithm = {}));
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/bounded-queue-export-promise-handler.js
-/**
-* Promise queue for keeping track of export promises. Finished promises will be auto-dequeued.
-* Allows for awaiting all promises in the queue.
-*/
-function createBoundedQueueExportPromiseHandler(options) {
-	return new BoundedQueueExportPromiseHandler(options.concurrencyLimit);
-}
-var BoundedQueueExportPromiseHandler;
-var init_bounded_queue_export_promise_handler = __esmMin((() => {
-	BoundedQueueExportPromiseHandler = class {
-		_concurrencyLimit;
-		_sendingPromises = [];
-		/**
-		* @param concurrencyLimit maximum promises allowed in a queue at the same time.
-		*/
-		constructor(concurrencyLimit) {
-			this._concurrencyLimit = concurrencyLimit;
-		}
-		pushPromise(promise) {
-			if (this.hasReachedLimit()) throw new Error("Concurrency Limit reached");
-			this._sendingPromises.push(promise);
-			const popPromise = () => {
-				const index = this._sendingPromises.indexOf(promise);
-				this._sendingPromises.splice(index, 1);
-			};
-			promise.then(popPromise, popPromise);
-		}
-		hasReachedLimit() {
-			return this._sendingPromises.length >= this._concurrencyLimit;
-		}
-		async awaitAll() {
-			await Promise.all(this._sendingPromises);
-		}
-	};
-}));
-
-//#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+api@1.9.1/node_modules/@opentelemetry/api/build/esm/version.js
 var VERSION;
 var init_version = __esmMin((() => {
@@ -362,7 +240,7 @@ var init_ComponentLogger = __esmMin((() => {
 //#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+api@1.9.1/node_modules/@opentelemetry/api/build/esm/diag/types.js
 var DiagLogLevel;
-var init_types = __esmMin((() => {
+var init_types$1 = __esmMin((() => {
 	;
 	(function(DiagLogLevel$1) {
 		/** Diagnostic Logging level setting to disable all logging (except and forced logs) */
@@ -405,7 +283,7 @@ function createLogLevelDiagLogger(maxLevel, logger) {
 	};
 }
 var init_logLevelLogger = __esmMin((() => {
-	init_types();
+	init_types$1();
 }));
 
 //#endregion
@@ -414,7 +292,7 @@ var API_NAME$4, DiagAPI;
 var init_diag = __esmMin((() => {
 	init_ComponentLogger();
 	init_logLevelLogger();
-	init_types();
+	init_types$1();
 	init_global_utils();
 	API_NAME$4 = "diag";
 	DiagAPI = class DiagAPI {
@@ -1750,7 +1628,7 @@ var init_esm$2 = __esmMin((() => {
 	init_utils$2();
 	init_context$1();
 	init_consoleLogger();
-	init_types();
+	init_types$1();
 	init_NoopMeter();
 	init_Metric();
 	init_TextMapPropagator();
@@ -4599,9 +4477,9 @@ var require_ExportResult = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.ExportResultCode = void 0;
 	var ExportResultCode;
-	(function(ExportResultCode$1) {
-		ExportResultCode$1[ExportResultCode$1["SUCCESS"] = 0] = "SUCCESS";
-		ExportResultCode$1[ExportResultCode$1["FAILED"] = 1] = "FAILED";
+	(function(ExportResultCode$2) {
+		ExportResultCode$2[ExportResultCode$2["SUCCESS"] = 0] = "SUCCESS";
+		ExportResultCode$2[ExportResultCode$2["FAILED"] = 1] = "FAILED";
 	})(ExportResultCode || (exports.ExportResultCode = ExportResultCode = {}));
 }));
 
@@ -5645,6 +5523,128 @@ var require_src$7 = /* @__PURE__ */ __commonJSMin(((exports) => {
 }));
 
 //#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/OTLPExporterBase.js
+var OTLPExporterBase;
+var init_OTLPExporterBase = __esmMin((() => {
+	OTLPExporterBase = class {
+		_delegate;
+		constructor(_delegate) {
+			this._delegate = _delegate;
+		}
+		/**
+		* Export items.
+		* @param items
+		* @param resultCallback
+		*/
+		export(items, resultCallback) {
+			this._delegate.export(items, resultCallback);
+		}
+		forceFlush() {
+			return this._delegate.forceFlush();
+		}
+		shutdown() {
+			return this._delegate.shutdown();
+		}
+	};
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/types.js
+var OTLPExporterError;
+var init_types = __esmMin((() => {
+	OTLPExporterError = class extends Error {
+		code;
+		name = "OTLPExporterError";
+		data;
+		constructor(message, code, data) {
+			super(message);
+			this.data = data;
+			this.code = code;
+		}
+	};
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/shared-configuration.js
+function validateTimeoutMillis(timeoutMillis) {
+	if (Number.isFinite(timeoutMillis) && timeoutMillis > 0) return timeoutMillis;
+	throw new Error(`Configuration: timeoutMillis is invalid, expected number greater than 0 (actual: '${timeoutMillis}')`);
+}
+function wrapStaticHeadersInFunction(headers) {
+	if (headers == null) return;
+	return () => headers;
+}
+/**
+* @param userProvidedConfiguration  Configuration options provided by the user in code.
+* @param fallbackConfiguration Fallback to use when the {@link userProvidedConfiguration} does not specify an option.
+* @param defaultConfiguration The defaults as defined by the exporter specification
+*/
+function mergeOtlpSharedConfigurationWithDefaults(userProvidedConfiguration, fallbackConfiguration, defaultConfiguration) {
+	return {
+		timeoutMillis: validateTimeoutMillis(userProvidedConfiguration.timeoutMillis ?? fallbackConfiguration.timeoutMillis ?? defaultConfiguration.timeoutMillis),
+		concurrencyLimit: userProvidedConfiguration.concurrencyLimit ?? fallbackConfiguration.concurrencyLimit ?? defaultConfiguration.concurrencyLimit,
+		compression: userProvidedConfiguration.compression ?? fallbackConfiguration.compression ?? defaultConfiguration.compression
+	};
+}
+function getSharedConfigurationDefaults() {
+	return {
+		timeoutMillis: 1e4,
+		concurrencyLimit: 30,
+		compression: "none"
+	};
+}
+var init_shared_configuration = __esmMin((() => {}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/legacy-node-configuration.js
+var CompressionAlgorithm;
+var init_legacy_node_configuration = __esmMin((() => {
+	;
+	(function(CompressionAlgorithm$1) {
+		CompressionAlgorithm$1["NONE"] = "none";
+		CompressionAlgorithm$1["GZIP"] = "gzip";
+	})(CompressionAlgorithm || (CompressionAlgorithm = {}));
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/bounded-queue-export-promise-handler.js
+/**
+* Promise queue for keeping track of export promises. Finished promises will be auto-dequeued.
+* Allows for awaiting all promises in the queue.
+*/
+function createBoundedQueueExportPromiseHandler(options) {
+	return new BoundedQueueExportPromiseHandler(options.concurrencyLimit);
+}
+var BoundedQueueExportPromiseHandler;
+var init_bounded_queue_export_promise_handler = __esmMin((() => {
+	BoundedQueueExportPromiseHandler = class {
+		_concurrencyLimit;
+		_sendingPromises = [];
+		/**
+		* @param concurrencyLimit maximum promises allowed in a queue at the same time.
+		*/
+		constructor(concurrencyLimit) {
+			this._concurrencyLimit = concurrencyLimit;
+		}
+		pushPromise(promise) {
+			if (this.hasReachedLimit()) throw new Error("Concurrency Limit reached");
+			this._sendingPromises.push(promise);
+			const popPromise = () => {
+				const index = this._sendingPromises.indexOf(promise);
+				this._sendingPromises.splice(index, 1);
+			};
+			promise.then(popPromise, popPromise);
+		}
+		hasReachedLimit() {
+			return this._sendingPromises.length >= this._concurrencyLimit;
+		}
+		async awaitAll() {
+			await Promise.all(this._sendingPromises);
+		}
+	};
+}));
+
+//#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/logging-response-handler.js
 function isPartialSuccessResponse(response) {
 	return Object.prototype.hasOwnProperty.call(response, "partialSuccess");
@@ -5671,10 +5671,10 @@ var init_logging_response_handler = __esmMin((() => {
 function createOtlpExportDelegate(components, settings) {
 	return new OTLPExportDelegate(components.transport, components.serializer, createLoggingPartialSuccessResponseHandler(), components.promiseHandler, settings.timeout);
 }
-var import_src$3, OTLPExportDelegate;
+var import_src$4, OTLPExportDelegate;
 var init_otlp_export_delegate = __esmMin((() => {
-	import_src$3 = require_src$7();
-	init_types$1();
+	import_src$4 = require_src$7();
+	init_types();
 	init_logging_response_handler();
 	init_esm$2();
 	OTLPExportDelegate = class {
@@ -5696,7 +5696,7 @@ var init_otlp_export_delegate = __esmMin((() => {
 			this._diagLogger.debug("items to be sent", internalRepresentation);
 			if (this._promiseQueue.hasReachedLimit()) {
 				resultCallback({
-					code: import_src$3.ExportResultCode.FAILED,
+					code: import_src$4.ExportResultCode.FAILED,
 					error: /* @__PURE__ */ new Error("Concurrent export limit reached")
 				});
 				return;
@@ -5704,7 +5704,7 @@ var init_otlp_export_delegate = __esmMin((() => {
 			const serializedRequest = this._serializer.serializeRequest(internalRepresentation);
 			if (serializedRequest == null) {
 				resultCallback({
-					code: import_src$3.ExportResultCode.FAILED,
+					code: import_src$4.ExportResultCode.FAILED,
 					error: /* @__PURE__ */ new Error("Nothing to send")
 				});
 				return;
@@ -5716,24 +5716,24 @@ var init_otlp_export_delegate = __esmMin((() => {
 					} catch (e) {
 						this._diagLogger.warn("Export succeeded but could not deserialize response - is the response specification compliant?", e, response.data);
 					}
-					resultCallback({ code: import_src$3.ExportResultCode.SUCCESS });
+					resultCallback({ code: import_src$4.ExportResultCode.SUCCESS });
 					return;
 				} else if (response.status === "failure" && response.error) {
 					resultCallback({
-						code: import_src$3.ExportResultCode.FAILED,
+						code: import_src$4.ExportResultCode.FAILED,
 						error: response.error
 					});
 					return;
 				} else if (response.status === "retryable") resultCallback({
-					code: import_src$3.ExportResultCode.FAILED,
+					code: import_src$4.ExportResultCode.FAILED,
 					error: new OTLPExporterError("Export failed with retryable status")
 				});
 				else resultCallback({
-					code: import_src$3.ExportResultCode.FAILED,
+					code: import_src$4.ExportResultCode.FAILED,
 					error: new OTLPExporterError("Export failed with unknown error")
 				});
 			}, (reason) => resultCallback({
-				code: import_src$3.ExportResultCode.FAILED,
+				code: import_src$4.ExportResultCode.FAILED,
 				error: reason
 			})));
 		}
@@ -5774,7 +5774,7 @@ var esm_exports = /* @__PURE__ */ __exportAll({
 });
 var init_esm = __esmMin((() => {
 	init_OTLPExporterBase();
-	init_types$1();
+	init_types();
 	init_shared_configuration();
 	init_legacy_node_configuration();
 	init_otlp_network_export_delegate();
@@ -27061,7 +27061,7 @@ function readableFromUint8Array(buff) {
 }
 var init_http_transport_utils = __esmMin((() => {
 	init_is_export_retryable();
-	init_types$1();
+	init_types();
 }));
 
 //#endregion
@@ -27216,12 +27216,12 @@ var init_shared_env_configuration = __esmMin((() => {
 //#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/otlp-node-http-env-configuration.js
 function getStaticHeadersFromEnv(signalIdentifier) {
-	const signalSpecificRawHeaders = (0, import_src$2.getStringFromEnv)(`OTEL_EXPORTER_OTLP_${signalIdentifier}_HEADERS`);
-	const nonSignalSpecificRawHeaders = (0, import_src$2.getStringFromEnv)("OTEL_EXPORTER_OTLP_HEADERS");
-	const signalSpecificHeaders = (0, import_src$2.parseKeyPairsIntoRecord)(signalSpecificRawHeaders);
-	const nonSignalSpecificHeaders = (0, import_src$2.parseKeyPairsIntoRecord)(nonSignalSpecificRawHeaders);
+	const signalSpecificRawHeaders = (0, import_src$3.getStringFromEnv)(`OTEL_EXPORTER_OTLP_${signalIdentifier}_HEADERS`);
+	const nonSignalSpecificRawHeaders = (0, import_src$3.getStringFromEnv)("OTEL_EXPORTER_OTLP_HEADERS");
+	const signalSpecificHeaders = (0, import_src$3.parseKeyPairsIntoRecord)(signalSpecificRawHeaders);
+	const nonSignalSpecificHeaders = (0, import_src$3.parseKeyPairsIntoRecord)(nonSignalSpecificRawHeaders);
 	if (Object.keys(signalSpecificHeaders).length === 0 && Object.keys(nonSignalSpecificHeaders).length === 0) return;
-	return Object.assign({}, (0, import_src$2.parseKeyPairsIntoRecord)(nonSignalSpecificRawHeaders), (0, import_src$2.parseKeyPairsIntoRecord)(signalSpecificRawHeaders));
+	return Object.assign({}, (0, import_src$3.parseKeyPairsIntoRecord)(nonSignalSpecificRawHeaders), (0, import_src$3.parseKeyPairsIntoRecord)(signalSpecificRawHeaders));
 }
 function appendRootPathToUrlIfNeeded(url) {
 	try {
@@ -27249,12 +27249,12 @@ function appendResourcePathToUrl(url, path$1) {
 	return url;
 }
 function getNonSpecificUrlFromEnv(signalResourcePath) {
-	const envUrl = (0, import_src$2.getStringFromEnv)("OTEL_EXPORTER_OTLP_ENDPOINT");
+	const envUrl = (0, import_src$3.getStringFromEnv)("OTEL_EXPORTER_OTLP_ENDPOINT");
 	if (envUrl === void 0) return;
 	return appendResourcePathToUrl(envUrl, signalResourcePath);
 }
 function getSpecificUrlFromEnv(signalIdentifier) {
-	const envUrl = (0, import_src$2.getStringFromEnv)(`OTEL_EXPORTER_OTLP_${signalIdentifier}_ENDPOINT`);
+	const envUrl = (0, import_src$3.getStringFromEnv)(`OTEL_EXPORTER_OTLP_${signalIdentifier}_ENDPOINT`);
 	if (envUrl === void 0) return;
 	return appendRootPathToUrlIfNeeded(envUrl);
 }
@@ -27271,9 +27271,9 @@ function getNodeHttpConfigurationFromEnvironment(signalIdentifier, signalResourc
 		headers: wrapStaticHeadersInFunction(getStaticHeadersFromEnv(signalIdentifier))
 	};
 }
-var import_src$2;
+var import_src$3;
 var init_otlp_node_http_env_configuration = __esmMin((() => {
-	import_src$2 = require_src$7();
+	import_src$3 = require_src$7();
 	init_esm$2();
 	init_shared_env_configuration();
 	init_shared_configuration();
@@ -29754,9 +29754,9 @@ var require_src = /* @__PURE__ */ __commonJSMin(((exports) => {
 
 //#endregion
 //#region src/ids.ts
-var import_src$1 = require_src();
+var import_src$2 = require_src();
 var import_index_shim = require_index_shim();
-var import_src = require_src$3();
+var import_src$1 = require_src$3();
 function hashHex(input, bytes) {
 	return createHash("sha256").update(input).digest("hex").slice(0, bytes * 2);
 }
@@ -29799,22 +29799,55 @@ const SDK_VERSION = "0.1.1";
 
 //#endregion
 //#region src/exporter.ts
-function buildTracingWith(processor, idGen) {
-	const provider = new import_src$1.NodeTracerProvider({
+var import_src = require_src$7();
+/**
+* Passes spans through to `inner` and records the ids of every span whose export
+* call succeeded, so a span is only treated as sent once the backend accepted it.
+* A throwing `inner.export` is reported as a failed export, never propagated.
+*/
+var DeliveryTrackingExporter = class {
+	delivered = /* @__PURE__ */ new Set();
+	constructor(inner) {
+		this.inner = inner;
+	}
+	export(spans, resultCallback) {
+		const done = (result) => {
+			if (result.code === import_src.ExportResultCode.SUCCESS) for (const span of spans) this.delivered.add(span.spanContext().spanId);
+			resultCallback(result);
+		};
+		try {
+			this.inner.export(spans, done);
+		} catch (error) {
+			done({
+				code: import_src.ExportResultCode.FAILED,
+				error: error instanceof Error ? error : new Error(String(error))
+			});
+		}
+	}
+	shutdown() {
+		return this.inner.shutdown();
+	}
+	forceFlush() {
+		return this.inner.forceFlush?.() ?? Promise.resolve();
+	}
+};
+function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set()) {
+	const provider = new import_src$2.NodeTracerProvider({
 		idGenerator: idGen,
 		spanProcessors: [processor]
 	});
 	return {
 		tracer: provider.getTracer(SDK_NAME, SDK_VERSION),
 		idGen,
+		delivered,
 		shutdown: async () => {
 			await provider.forceFlush();
 			await provider.shutdown();
 		}
 	};
 }
-function buildTracing(config) {
-	return buildTracingWith(new import_index_shim.BatchSpanProcessor(new import_src.OTLPTraceExporter({
+function otlpExporter(config) {
+	return new import_src$1.OTLPTraceExporter({
 		url: `${config.hostUrl}/api/v1/public/traces`,
 		headers: {
 			Authorization: `Bearer ${config.apiKey ?? ""}`,
@@ -29822,11 +29855,15 @@ function buildTracing(config) {
 			"x-traceroot-sdk-version": SDK_VERSION
 		},
 		compression: "gzip"
-	}), {
+	});
+}
+function buildTracing(config, exporter = otlpExporter(config)) {
+	const tracked = new DeliveryTrackingExporter(exporter);
+	return buildTracingWith(new import_index_shim.BatchSpanProcessor(tracked, {
 		maxQueueSize: 4096,
 		maxExportBatchSize: 1024,
 		scheduledDelayMillis: 3e4
-	}), new PrimedIdGenerator());
+	}), new PrimedIdGenerator(), tracked.delivered);
 }
 
 //#endregion
