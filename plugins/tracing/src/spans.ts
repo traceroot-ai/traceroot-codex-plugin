@@ -56,6 +56,10 @@ function promptOf(turn: Turn, ctx: EmitCtx): unknown {
   ];
 }
 
+// The turn span is re-sent on every hook, so it never carries image bytes: its
+// prompt images point at the first model call span, which is sent once.
+const FIRST_CALL_IMAGE = "[image: see first model call]";
+
 /**
  * A tool's output as the next model call is shown it. With image capture on, each
  * image points at the tool span that already holds it instead of being sent twice.
@@ -95,7 +99,8 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
   const rootAttrs: SpanAttrs = { "traceroot.span.type": "AGENT", "traceroot.span.path": [ROOT_NAME] };
   commonTrace(rootAttrs, sessionMeta, ctx);
   const prompt = promptOf(turn, ctx);
-  if (prompt) rootAttrs["traceroot.span.input"] = io(prompt, ctx);
+  const rootInput = ctx.captureImages ? replaceImages(prompt, FIRST_CALL_IMAGE) : prompt;
+  if (rootInput) rootAttrs["traceroot.span.input"] = io(rootInput, ctx);
   if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
   rootAttrs["traceroot.span.metadata"] = JSON.stringify(pruneUndefined({
     "codex.turn_id": turn.turnId,

@@ -91,26 +91,43 @@ describe("image capture on: tool output", () => {
 });
 
 describe("image capture on: prompt images", () => {
-  it("puts the attached image in the turn input and the first model call's input", async () => {
+  const FIRST_CALL = "[image: see first model call]";
+
+  it("puts the attached image in the first model call's input, and a placeholder in the turn input", async () => {
     const jpeg = await fixtureImage("rollout-prompt-image.jsonl", "jpeg");
-    const spans = await plan("rollout-prompt-image.jsonl", on);
-    const expected = [{ type: "input_text", text: "what colour is this image?" }, { type: "input_image", image_url: jpeg }];
-    expect(JSON.parse(attr(spans.find((s) => s.kind === "AGENT"), INPUT))).toEqual(expected);
-    expect(JSON.parse(attr(spans.find((s) => s.kind === "LLM"), INPUT))).toEqual(expected);
+    // Without images left in it, the turn input takes the plain maxChars cut.
+    const spans = await plan("rollout-prompt-image.jsonl", { ...on, maxChars: 20000 });
+    const text = { type: "input_text", text: "what colour is this image?" };
+    expect(JSON.parse(attr(spans.find((s) => s.kind === "LLM"), INPUT))).toEqual([text, { type: "input_image", image_url: jpeg }]);
+    const root = attr(spans.find((s) => s.kind === "AGENT"), INPUT);
+    expect(JSON.parse(root)).toEqual([text, { type: "input_image", image_url: FIRST_CALL }]);
+    expect(root).not.toContain("data:image");
   });
 
   it("sends an image-only prompt as the image alone", () => {
     const png = imageOf(30);
-    const root = planTurnSpans(sessionMeta, turnWith({ userInput: undefined, userImages: [png] }), on)[0]!;
-    expect(JSON.parse(attr(root, INPUT))).toEqual([{ type: "input_image", image_url: png }]);
+    const [root, step] = planTurnSpans(
+      sessionMeta, turnWith({ userInput: undefined, userImages: [png] }), { ...on, maxChars: 20000 },
+    );
+    expect(JSON.parse(attr(step, INPUT))).toEqual([{ type: "input_image", image_url: png }]);
+    expect(JSON.parse(attr(root, INPUT))).toEqual([{ type: "input_image", image_url: FIRST_CALL }]);
   });
 
-  it("fits prompt images into 8 MiB on the turn span too", () => {
+  it("never puts image bytes in the turn span, even from a data URL pasted as text", () => {
+    const png = imageOf(30);
+    const [root, step] = planTurnSpans(sessionMeta, turnWith({ userInput: `look: ${png}` }), on);
+    expect(attr(root, INPUT)).toBe(`look: ${FIRST_CALL}`);
+    expect(attr(step, INPUT)).toBe(`look: ${png}`);
+  });
+
+  it("fits prompt images into 8 MiB on the first model call span", () => {
     const [a, b] = [imageOf(4.5 * MiB), imageOf(4 * MiB)];
-    const spans = planTurnSpans(sessionMeta, turnWith({ userImages: [a, b] }), on);
-    for (const span of spans) expect(attributesBytes(span.attributes)).toBeLessThanOrEqual(MAX_SPAN_BYTES);
-    expect(JSON.parse(attr(spans[0], INPUT))[1].image_url).toBe(SPAN_TOO_LARGE_IMAGE);
-    expect(JSON.parse(attr(spans[0], INPUT))[2].image_url).toBe(b);
+    const [root, step] = planTurnSpans(sessionMeta, turnWith({ userImages: [a, b] }), on);
+    expect(attributesBytes(step!.attributes)).toBeLessThanOrEqual(MAX_SPAN_BYTES);
+    expect(JSON.parse(attr(step, INPUT))[1].image_url).toBe(SPAN_TOO_LARGE_IMAGE);
+    expect(JSON.parse(attr(step, INPUT))[2].image_url).toBe(b);
+    expect(attr(root, INPUT)).not.toContain("data:image");
+    expect(attributesBytes(root!.attributes)).toBeLessThan(4096);
   });
 });
 
