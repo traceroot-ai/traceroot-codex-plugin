@@ -24,6 +24,7 @@ const baseConfig: Config = {
   enabled: false,
   hostUrl: "https://app.traceroot.ai",
   maxChars: 20000,
+  maxRequestBytes: 12 * 1024 * 1024,
   debug: false,
   failOnError: false,
 };

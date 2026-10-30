@@ -9,9 +9,14 @@ export type Config = {
   environment?: string;
   userId?: string;
   maxChars: number;
+  maxRequestBytes: number;
   debug: boolean;
   failOnError: boolean;
 };
+
+// Default upper bound on the estimated size of one export request. It leaves
+// headroom under the ingest endpoint's request size limit.
+const DEFAULT_MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 
 async function readJson(file: string): Promise<Record<string, unknown>> {
   try {
@@ -58,6 +63,9 @@ export async function getConfig(cwd: string = process.cwd()): Promise<Config> {
     environment: envFirst("TRACEROOT_ENVIRONMENT") ?? (j.environment as string | undefined),
     userId: envFirst("TRACEROOT_CODEX_USER_ID") ?? (j.user_id as string | undefined),
     maxChars: (n => Number.isFinite(n) ? n : 20000)(Number(envFirst("TRACEROOT_CODEX_MAX_CHARS") ?? j.max_chars ?? 20000)),
+    maxRequestBytes: (n => Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_REQUEST_BYTES)(
+      Number(envFirst("TRACEROOT_CODEX_MAX_REQUEST_BYTES") ?? j.max_request_bytes ?? DEFAULT_MAX_REQUEST_BYTES),
+    ),
     debug: truthy(envFirst("TRACEROOT_CODEX_DEBUG") ?? j.debug),
     failOnError: truthy(envFirst("TRACEROOT_CODEX_FAIL_ON_ERROR") ?? j.fail_on_error),
     enabled: false,

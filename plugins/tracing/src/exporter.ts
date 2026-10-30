@@ -127,7 +127,10 @@ export function buildTracing(config: Config, exporter: SpanExporter = otlpExport
   // per span, and a burst loses the tail before this short-lived process exits.
   // Batch coalesces them into few large OTLP POSTs that forceFlush ships reliably.
   // Liveness is unchanged: each hook invocation still flushes its spans on shutdown.
-  const processor = new BatchSpanProcessor(tracked, {
+  // Batches are split by size before they reach delivery tracking, so each
+  // request's result is recorded on its own: a failed request leaves only its
+  // spans unmarked.
+  const processor = new BatchSpanProcessor(new SizeLimitedExporter(tracked, config.maxRequestBytes), {
     maxQueueSize: 4096,
     maxExportBatchSize: 1024,
     scheduledDelayMillis: 30000, // won't auto-fire in a short hook; we forceFlush on shutdown
