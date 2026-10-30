@@ -121,3 +121,64 @@ describe("dispatch marks spans as sent only after their export succeeded", () =>
     expect(ids(retry.calls.flat()).sort()).toEqual([ROOT, TOOL].sort());
   });
 });
+
+// More than one 1,024-span batch in a single hook. The processor exports the
+// first full batch as soon as it fills, outside the final flush, so a failure
+// there does not make shutdown fail; a failure in the final flush does.
+describe("dispatch with more spans than one export batch", () => {
+  const TOOL_CALLS = 1100; // + root + one LLM step = 1,102 spans
+
+  async function writeBigRollout(): Promise<string> {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-batches-"));
+    const transcript = path.join(dir, "rollout.jsonl");
+    const lines: unknown[] = [
+      { timestamp: "2026-06-30T00:00:00.000Z", type: "session_meta", payload: { id: "sess-batches" } },
+      { timestamp: "2026-06-30T00:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "big" } },
+    ];
+    for (let i = 0; i < TOOL_CALLS; i++) {
+      const call = { type: "function_call", name: "exec_command", call_id: `c${i}`, arguments: "{}" };
+      lines.push({ timestamp: "2026-06-30T00:00:02.000Z", type: "response_item", payload: call });
+      lines.push({
+        timestamp: "2026-06-30T00:00:03.000Z", type: "response_item",
+        payload: { type: "function_call_output", call_id: `c${i}`, output: "ok" },
+      });
+    }
+    lines.push(
+      { timestamp: "2026-06-30T00:00:04.000Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 1 } } } },
+      { timestamp: "2026-06-30T00:00:05.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "big" } },
+    );
+    await fs.writeFile(transcript, lines.map((l) => JSON.stringify(l)).join("\n"));
+    return transcript;
+  }
+
+  it("a failed first batch is left unmarked and re-sent, although shutdown succeeds", async () => {
+    const transcript = await writeBigRollout();
+    let call = 0;
+    const exporter = new ScriptedExporter(() => (++call === 1 ? httpError("Service Unavailable", 503) : OK));
+
+    expect((await dispatch({ transcript_path: transcript }, config, deps(exporter))).emitted).toBe(TOOL_CALLS + 2);
+    expect(exporter.calls.map((c) => c.length)).toEqual([1024, TOOL_CALLS + 2 - 1024]);
+    const firstBatch = ids(exporter.calls[0]!);
+    expect(await sidecar(transcript)).toEqual(ids(exporter.calls[1]!).sort());
+
+    const retry = new ScriptedExporter();
+    await dispatch({ transcript_path: transcript }, config, deps(retry));
+    expect(ids(retry.calls.flat()).sort()).toEqual([...firstBatch].sort());
+  });
+
+  it("a failed final batch does not cause the accepted first batch to be re-sent", async () => {
+    const transcript = await writeBigRollout();
+    let call = 0;
+    const exporter = new ScriptedExporter(() => (++call === 2 ? httpError("Service Unavailable", 503) : OK));
+
+    await expect(dispatch({ transcript_path: transcript }, config, deps(exporter))).rejects.toBeDefined();
+    expect(exporter.calls).toHaveLength(2);
+    const [firstBatch, finalBatch] = [ids(exporter.calls[0]!), ids(exporter.calls[1]!)];
+    expect(await sidecar(transcript)).toEqual([...firstBatch].sort());
+
+    // Only the rejected batch goes again, plus the always re-sent root.
+    const retry = new ScriptedExporter();
+    await dispatch({ transcript_path: transcript }, config, deps(retry));
+    expect(ids(retry.calls.flat()).sort()).toEqual([...finalBatch, makeSpanId("big:root")].sort());
+  });
+});
