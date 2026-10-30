@@ -30492,9 +30492,12 @@ async function dispatch(hook, config, deps) {
 	try {
 		for (const turn of turns) emitted += await emitTurnTree(sessionMeta, turn, ctx, {}, visited, 0, tracing, already, emittedIds, findSubagentFn);
 	} finally {
-		await tracing.shutdown();
+		try {
+			await tracing.shutdown();
+		} finally {
+			for (const id of emittedIds) if (tracing.delivered.has(id)) await markSpanEmitted(transcript, id);
+		}
 	}
-	for (const id of emittedIds) await markSpanEmitted(transcript, id);
 	debugLog(`emitted ${emitted} spans`);
 	return { emitted };
 }

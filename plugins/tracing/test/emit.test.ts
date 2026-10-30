@@ -1,13 +1,12 @@
-import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildTracingWith } from "../src/exporter.js";
-import { PrimedIdGenerator } from "../src/ids.js";
 import { dispatch } from "../src/emit.js";
 import type { Config } from "../src/config.js";
+import { memTracing } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const config: Config = {
@@ -28,15 +27,8 @@ describe("dispatch", () => {
   it("emits AGENT+LLM+TOOL once, and is idempotent on a second run", async () => {
     const transcript = await copyFixture();
     const mem = new InMemorySpanExporter();
-    // dispatch() calls tracing.shutdown() internally, and provider.shutdown()
-    // clears InMemorySpanExporter. Override shutdown with a no-op so the
-    // exporter retains the spans for assertions (SimpleSpanProcessor already
-    // exported them on span.end()).
     const deps = {
-      buildTracing: () => ({
-        ...buildTracingWith(new SimpleSpanProcessor(mem), new PrimedIdGenerator()),
-        shutdown: async () => {},
-      }),
+      buildTracing: () => memTracing(mem),
       getGit: async () => ({ repo: "traceroot-ai/traceroot", ref: "a".repeat(40) }),
     };
 
@@ -56,13 +48,10 @@ describe("dispatch", () => {
     await fs.copyFile(path.join(here, "fixtures", "rollout-inprogress.jsonl"), transcript);
 
     const mem = new InMemorySpanExporter();
-    // no-op shutdown so the InMemory exporter keeps spans across dispatch() calls
-    // (dispatch calls provider.shutdown() internally, which would clear it).
+    // memTracing's shutdown only flushes, so the InMemory exporter keeps spans
+    // across dispatch() calls.
     const deps = {
-      buildTracing: () => ({
-        ...buildTracingWith(new SimpleSpanProcessor(mem), new PrimedIdGenerator()),
-        shutdown: async () => {},
-      }),
+      buildTracing: () => memTracing(mem),
       getGit: async () => ({}),
     };
 
@@ -97,7 +86,7 @@ describe("dispatch", () => {
     await fs.writeFile(transcript, lines);
     const mem = new InMemorySpanExporter();
     const deps = {
-      buildTracing: () => ({ ...buildTracingWith(new SimpleSpanProcessor(mem), new PrimedIdGenerator()), shutdown: async () => {} }),
+      buildTracing: () => memTracing(mem),
       getGit: async () => ({}),
     };
     const r = await dispatch({ transcript_path: transcript }, config, deps);

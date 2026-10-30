@@ -155,10 +155,15 @@ export async function dispatch(
       );
     }
   } finally {
-    await tracing.shutdown();
-  }
-  for (const id of emittedIds) {
-    await markSpanEmitted(transcript, id);
+    try {
+      await tracing.shutdown();
+    } finally {
+      // Mark only the spans the backend accepted, even when shutdown reports a
+      // failed export: anything left unmarked is sent again on the next hook.
+      for (const id of emittedIds) {
+        if (tracing.delivered.has(id)) await markSpanEmitted(transcript, id);
+      }
+    }
   }
   debugLog(`emitted ${emitted} spans`);
   return { emitted };
