@@ -102,6 +102,23 @@ describe("SizeLimitedExporter", () => {
     expect(inner.calls).toHaveLength(0);
   });
 
+  it.each(["shutdown", "forceFlush"] as const)("%s waits for the requests of an export in flight", async (method) => {
+    const spans = await makeSpans(3, MiB);
+    const order: string[] = [];
+    const inner: SpanExporter = {
+      export: (_spans, resultCallback) => { order.push("export"); setTimeout(() => resultCallback(OK), 1); },
+      shutdown: async () => { order.push("shutdown"); },
+      forceFlush: async () => { order.push("forceFlush"); },
+    };
+    const limited = new SizeLimitedExporter(inner, MiB + 1024);
+    let result: ExportResult | undefined;
+    limited.export(spans, (r) => { result = r; });
+
+    await limited[method]();
+    expect(order).toEqual(["export", "export", "export", method]);
+    expect(result).toEqual(OK);
+  });
+
   it("forwards shutdown and forceFlush to the wrapped exporter", async () => {
     const inner = { export: vi.fn(), shutdown: vi.fn(async () => {}), forceFlush: vi.fn(async () => {}) };
     const limited = new SizeLimitedExporter(inner, BUDGET);
@@ -149,6 +166,27 @@ describe("buildTracing splits each flush by max_request_bytes", () => {
     expect(lost.length).toBeGreaterThan(0);
     expect([...tracing.delivered].sort()).toEqual(ids(inner.calls.flat()).filter((id) => !lost.includes(id)).sort());
   });
+});
+
+it("buildTracing delivers a first full batch split across requests before shutdown returns", async () => {
+  // The processor exports a full 1,024-span batch as soon as it fills, outside
+  // the final flush, so shutdown must wait for all of that batch's requests.
+  let stopped = false;
+  const late: string[] = [];
+  const inner = new ScriptedExporter((spans) => {
+    if (stopped) late.push(...ids(spans));
+    return OK;
+  });
+  inner.shutdown = async () => { stopped = true; };
+  const tracing = buildTracing({ ...config, maxRequestBytes: 64 * 1024 }, inner);
+  for (let i = 0; i < 1100; i++) {
+    tracing.tracer.startSpan(`span-${i}`, { attributes: { "traceroot.span.output": "x".repeat(1000) } }).end();
+  }
+  await tracing.shutdown();
+
+  expect(late).toEqual([]);
+  expect(inner.calls.length).toBeGreaterThan(2);
+  expect(tracing.delivered.size).toBe(1100);
 });
 
 describe("dispatch with a request that fails", () => {

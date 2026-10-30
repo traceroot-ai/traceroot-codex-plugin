@@ -67,10 +67,17 @@ export class DeliveryTrackingExporter implements SpanExporter {
  * spans; the call as a whole reports the first failure, after trying every request.
  */
 export class SizeLimitedExporter implements SpanExporter {
+  // Export calls whose requests are still being sent. The batch processor exports
+  // a full batch as soon as it fills, outside its final flush, so shutdown and
+  // forceFlush wait for these before reaching `inner`.
+  private readonly inFlight = new Set<Promise<void>>();
+
   constructor(private readonly inner: SpanExporter, private readonly maxBytes: number) {}
 
   export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    void this.exportInRequests(spans).then(resultCallback);
+    const call = this.exportInRequests(spans).then(resultCallback);
+    this.inFlight.add(call);
+    void call.finally(() => this.inFlight.delete(call));
   }
 
   private async exportInRequests(spans: ReadableSpan[]): Promise<ExportResult> {
@@ -82,12 +89,14 @@ export class SizeLimitedExporter implements SpanExporter {
     return firstFailure ?? { code: ExportResultCode.SUCCESS };
   }
 
-  shutdown(): Promise<void> {
-    return this.inner.shutdown();
+  async shutdown(): Promise<void> {
+    await Promise.all(this.inFlight);
+    await this.inner.shutdown();
   }
 
-  forceFlush(): Promise<void> {
-    return this.inner.forceFlush?.() ?? Promise.resolve();
+  async forceFlush(): Promise<void> {
+    await Promise.all(this.inFlight);
+    await this.inner.forceFlush?.();
   }
 }
 

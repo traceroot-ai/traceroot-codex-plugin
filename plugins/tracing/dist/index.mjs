@@ -29888,12 +29888,15 @@ var DeliveryTrackingExporter = class {
 * spans; the call as a whole reports the first failure, after trying every request.
 */
 var SizeLimitedExporter = class {
+	inFlight = /* @__PURE__ */ new Set();
 	constructor(inner, maxBytes) {
 		this.inner = inner;
 		this.maxBytes = maxBytes;
 	}
 	export(spans, resultCallback) {
-		this.exportInRequests(spans).then(resultCallback);
+		const call = this.exportInRequests(spans).then(resultCallback);
+		this.inFlight.add(call);
+		call.finally(() => this.inFlight.delete(call));
 	}
 	async exportInRequests(spans) {
 		let firstFailure;
@@ -29903,11 +29906,13 @@ var SizeLimitedExporter = class {
 		}
 		return firstFailure ?? { code: import_src.ExportResultCode.SUCCESS };
 	}
-	shutdown() {
-		return this.inner.shutdown();
+	async shutdown() {
+		await Promise.all(this.inFlight);
+		await this.inner.shutdown();
 	}
-	forceFlush() {
-		return this.inner.forceFlush?.() ?? Promise.resolve();
+	async forceFlush() {
+		await Promise.all(this.inFlight);
+		await this.inner.forceFlush?.();
 	}
 };
 function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set()) {
