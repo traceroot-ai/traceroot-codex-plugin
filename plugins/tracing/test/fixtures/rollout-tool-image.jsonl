@@ -1,0 +1,11 @@
+{"timestamp":"2026-07-01T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-tool-image","cwd":"/repo","cli_version":"0.165.0","model_provider":"openai"}}
+{"timestamp":"2026-07-01T10:00:00.010Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-shot"}}
+{"timestamp":"2026-07-01T10:00:00.020Z","type":"turn_context","payload":{"turn_id":"turn-shot","cwd":"/repo","model":"gpt-5.5"}}
+{"timestamp":"2026-07-01T10:00:00.100Z","type":"event_msg","payload":{"type":"user_message","message":"take a screenshot of the page"}}
+{"timestamp":"2026-07-01T10:00:01.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"I'll capture the page."}]}}
+{"timestamp":"2026-07-01T10:00:01.500Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-shot","name":"exec","input":"browser.screenshot()"}}
+{"timestamp":"2026-07-01T10:00:01.600Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":900,"output_tokens":30,"total_tokens":930}}}}
+{"timestamp":"2026-07-01T10:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-shot","output":[{"type":"input_text","text":"Captured a 4x4 screenshot."},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGO4IycHRwzEcQDTIxGBFNCZswAAAABJRU5ErkJggg=="}]}}
+{"timestamp":"2026-07-01T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The page is a solid red square."}]}}
+{"timestamp":"2026-07-01T10:00:03.050Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1100,"output_tokens":12,"total_tokens":1112}}}}
+{"timestamp":"2026-07-01T10:00:03.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-shot","last_agent_message":"The page is a solid red square."}}
