@@ -56,6 +56,14 @@ function messageText(content: unknown): string | undefined {
   return parts.length ? parts.join("") : undefined;
 }
 
+/** Image data URLs among a message's `input_image` content parts. */
+function messageImages(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  return (content as Array<{ type?: string; image_url?: unknown }>)
+    .filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && c.image_url.startsWith("data:image/"))
+    .map((c) => c.image_url as string);
+}
+
 // Codex and plugins reuse role:"user" for synthetic context blocks. These can
 // appear before or after the real prompt and must not become trace input. This
 // denylist is best-effort: third-party plugins may introduce new wrapper tags.
@@ -246,6 +254,13 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
           // clean user_message or item_completed/UserMessage representation.
           if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) {
             userInputFallback.set(turn, text);
+          }
+          // Images attached to the prompt are read from here, whichever event
+          // carried the prompt text.
+          if (!text || !isInjectedFallbackText(text)) {
+            for (const url of messageImages(p.content)) {
+              if (!(turn.userImages ??= []).includes(url)) turn.userImages.push(url);
+            }
           }
         } else if (p.role !== "developer") {
           s.text = text;

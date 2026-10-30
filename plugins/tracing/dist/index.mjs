@@ -30286,6 +30286,11 @@ function messageText(content) {
 	const parts = content.filter((c) => typeof c?.text === "string").map((c) => c.text);
 	return parts.length ? parts.join("") : void 0;
 }
+/** Image data URLs among a message's `input_image` content parts. */
+function messageImages(content) {
+	if (!Array.isArray(content)) return [];
+	return content.filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && c.image_url.startsWith("data:image/")).map((c) => c.image_url);
+}
 const INJECTED_USER_MESSAGE_TAGS = new Set([
 	"environment_context",
 	"user_instructions",
@@ -30459,6 +30464,9 @@ function parseRollout(lines) {
 				const text = messageText(p.content);
 				if (p.role === "user") {
 					if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) userInputFallback.set(turn, text);
+					if (!text || !isInjectedFallbackText(text)) {
+						for (const url of messageImages(p.content)) if (!(turn.userImages ??= []).includes(url)) turn.userImages.push(url);
+					}
 				} else if (p.role !== "developer") {
 					s.text = text;
 					if (p.role === "assistant" && text) turn.finalOutput = text;

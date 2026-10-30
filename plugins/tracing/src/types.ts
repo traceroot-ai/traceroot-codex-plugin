@@ -115,6 +115,8 @@ export type Turn = {
   endTime: number;
   model?: string;
   userInput?: string;
+  /** Image data URLs attached to the prompt, in order, without duplicates. */
+  userImages?: string[];
   finalOutput?: string;
   steps: ModelStep[];
   /** Subagent spawns captured from spawn_agent / collab_agent_spawn_end. */
