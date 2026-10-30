@@ -56,6 +56,7 @@ Resolved highest-precedence first: env vars → project `.codex/traceroot.json` 
 | `api_key` | `TRACEROOT_API_KEY` | — | Required. |
 | `host_url` | `TRACEROOT_HOST_URL` | `https://app.traceroot.ai` | Point at a self-hosted instance. |
 | `max_chars` | `TRACEROOT_CODEX_MAX_CHARS` | `20000` | Truncate long span attributes. |
+| `max_request_bytes` | `TRACEROOT_CODEX_MAX_REQUEST_BYTES` | `12582912` (12 MiB) | Upper bound on the estimated size of one upload request. Larger batches of spans are sent as several requests. |
 | `debug` | `TRACEROOT_CODEX_DEBUG` | `false` | Log to stderr. |
 | `fail_on_error` | `TRACEROOT_CODEX_FAIL_ON_ERROR` | `false` | Off by default — tracing never blocks a Codex turn. |
 
