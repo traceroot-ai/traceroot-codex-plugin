@@ -63,6 +63,23 @@ describe("capWithImages", () => {
     expect(parsed[3]).toEqual({ type: "input_image", image_url: PNG });
   });
 
+  it("keeps the image item when content items arrive as serialized JSON and the text is cut", () => {
+    const parsed = JSON.parse(capWithImages(JSON.stringify(items("t".repeat(21000))), 20000));
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]).toEqual({ type: "input_text", text: `${"t".repeat(19990)}…[truncated 1010 chars]` });
+    expect(parsed[1]).toEqual({ type: "input_image", image_url: PNG });
+  });
+
+  it("leaves serialized JSON with images exactly as it was when the text fits", () => {
+    const s = JSON.stringify(items("Captured."), null, 2);
+    expect(capWithImages(s, 20000)).toBe(s);
+  });
+
+  it("cuts a string that only looks like JSON as one string", () => {
+    const s = `[not json ${"r".repeat(100)} ${PNG}`;
+    expect(capWithImages(s, 20)).toBe(`${"[not json ".padEnd(20, "r")}…[truncated 91 chars]${PNG}`);
+  });
+
   it("keeps a data URL inside a plain string whole and cuts the text around it", () => {
     const s = `${"p".repeat(100)} ${PNG} and ${PNG} ${"q".repeat(100)}`;
     expect(capWithImages(s, 20)).toBe(

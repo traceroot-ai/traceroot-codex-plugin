@@ -30050,6 +30050,16 @@ function capString(s, budget) {
 	}
 	return out + capText(s.slice(at), budget);
 }
+/** `text` parsed, when it is a serialized JSON array or object; otherwise undefined. */
+function parseJsonContainer(text) {
+	if (!/^\s*[[{]/.test(text)) return void 0;
+	try {
+		const parsed = JSON.parse(text);
+		return parsed !== null && typeof parsed === "object" ? parsed : void 0;
+	} catch {
+		return;
+	}
+}
 /**
 * Serializes `value` for a span attribute and caps it at `max` characters like
 * the plain cut, but keeps image data URLs whole: only the text counts toward
@@ -30062,7 +30072,9 @@ function capWithImages(value, max) {
 	if (text.search(IMAGE_DATA_URL) === -1) return truncate(text, max);
 	const budget = { left: max };
 	const cap = (s) => capString(s, budget);
-	return typeof value === "string" ? cap(value) : JSON.stringify(mapStrings(value, cap));
+	if (typeof value !== "string") return JSON.stringify(mapStrings(value, cap));
+	const parsed = text.replace(IMAGE_DATA_URL, "").length > max ? parseJsonContainer(text) : void 0;
+	return parsed === void 0 ? cap(text) : JSON.stringify(mapStrings(parsed, cap));
 }
 /** `value` with every image data URL in it replaced by `placeholder`. */
 function replaceImages(value, placeholder) {

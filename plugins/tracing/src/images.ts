@@ -47,6 +47,17 @@ function capString(s: string, budget: Budget): string {
   return out + capText(s.slice(at), budget);
 }
 
+/** `text` parsed, when it is a serialized JSON array or object; otherwise undefined. */
+function parseJsonContainer(text: string): unknown {
+  if (!/^\s*[[{]/.test(text)) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null && typeof parsed === "object" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Serializes `value` for a span attribute and caps it at `max` characters like
  * the plain cut, but keeps image data URLs whole: only the text counts toward
@@ -59,7 +70,12 @@ export function capWithImages(value: unknown, max: number): string {
   if (text.search(IMAGE_DATA_URL) === -1) return truncate(text, max);
   const budget: Budget = { left: max };
   const cap = (s: string): string => capString(s, budget);
-  return typeof value === "string" ? cap(value) : JSON.stringify(mapStrings(value, cap));
+  if (typeof value !== "string") return JSON.stringify(mapStrings(value, cap));
+  // A string can itself be serialized JSON, such as content items. Cutting it as
+  // one string would fold the image items into the text item before them, so
+  // when a cut is needed, cut inside its strings instead.
+  const parsed = text.replace(IMAGE_DATA_URL, "").length > max ? parseJsonContainer(text) : undefined;
+  return parsed === undefined ? cap(text) : JSON.stringify(mapStrings(parsed, cap));
 }
 
 /** `value` with every image data URL in it replaced by `placeholder`. */
