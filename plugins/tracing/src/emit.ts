@@ -2,7 +2,7 @@ import type { Config } from "./config.js";
 import { buildTracing as defaultBuildTracing, type Tracing } from "./exporter.js";
 import { getGitContext } from "./git.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
-import { type LockTimings, withSessionLock } from "./lock.js";
+import { type LockTimings, type SessionLock, withSessionLock } from "./lock.js";
 import { loadEmittedSpanIds, markSpanEmitted } from "./sidecar.js";
 import { emitSpan, planTurnSpans, type EmitCtx, type PlanOpts } from "./spans.js";
 import { locateSubagentRollout } from "./subagents.js";
@@ -109,11 +109,15 @@ export async function dispatch(
   if (!transcript) { debugLog("no transcript_path; skipping"); return { emitted: 0 }; }
   // Reading the rollout, exporting and recording what was sent run under the
   // session's lock, so concurrent hooks of one session deliver in the order they read.
-  return withSessionLock(transcript, () => emitSession(hook, transcript, config, deps), deps?.lockTimings);
+  const result = await withSessionLock(
+    transcript, (lock) => emitSession(hook, transcript, config, lock, deps), deps?.lockTimings,
+  );
+  // undefined: the hook holding the lock runs again for this one.
+  return result ?? { emitted: 0 };
 }
 
 async function emitSession(
-  hook: HookInput, transcript: string, config: Config, deps?: Partial<Deps>,
+  hook: HookInput, transcript: string, config: Config, lock: SessionLock, deps?: Partial<Deps>,
 ): Promise<{ emitted: number }> {
   const buildTracingFn = deps?.buildTracing ?? defaultBuildTracing;
   const getGit = deps?.getGit ?? getGitContext;
@@ -150,6 +154,8 @@ async function emitSession(
   };
 
   const already = await loadEmittedSpanIds(transcript);
+  // A hook that froze past the stale limit and lost the lock must not send what it read.
+  if (!(await lock.held())) { debugLog("session lock lost before export; skipping"); return { emitted: 0 }; }
   const tracing = buildTracingFn(config);
   let emitted = 0;
   const emittedIds: string[] = [];

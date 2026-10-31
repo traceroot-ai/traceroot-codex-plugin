@@ -29998,13 +29998,15 @@ function truncate(s, max) {
 
 //#endregion
 //#region src/lock.ts
-const suffix$1 = ".traceroot.lock";
 const DEFAULT_TIMINGS = {
-	waitMs: 15e3,
-	staleMs: 6e4,
+	waitMs: 1e4,
+	staleMs: 3e4,
+	heartbeatMs: 5e3,
+	rerunBudgetMs: 15e3,
 	pollMs: 50
 };
 const sleep = (ms$1) => new Promise((resolve) => setTimeout(resolve, ms$1));
+const exists = (p) => fs.access(p).then(() => true, () => false);
 function isAlive(pid) {
 	try {
 		process.kill(pid, 0);
@@ -30013,50 +30015,124 @@ function isAlive(pid) {
 		return error.code === "EPERM";
 	}
 }
-/** True when the lock's content shows a holder that is gone or has held it too long. */
-function isStale(content, staleMs) {
-	const [pid = NaN, since = NaN] = content.split(" ").map(Number);
-	if (!Number.isInteger(pid) || !Number.isFinite(since)) return true;
-	return Date.now() - since > staleMs || !isAlive(pid);
+/** Creates the lock holding `token`. It is written in full first, so a lock file is never seen empty. */
+async function tryCreate(lockPath, token) {
+	const tmp = `${lockPath}.${randomUUID()}.tmp`;
+	try {
+		await fs.writeFile(tmp, token);
+		await fs.link(tmp, lockPath);
+		return "created";
+	} catch (error) {
+		return error.code === "EEXIST" ? "exists" : error;
+	} finally {
+		await fs.rm(tmp, { force: true });
+	}
 }
-async function acquire(lockPath, t) {
-	const token = `${process.pid} ${Date.now()} ${randomUUID()}`;
+/** The lock's content when its holder is gone: exited, or silent past staleMs. Otherwise undefined. */
+async function staleContent(lockPath, staleMs) {
+	try {
+		const [stat, content] = await Promise.all([fs.stat(lockPath), fs.readFile(lockPath, "utf-8")]);
+		if (Date.now() - stat.mtimeMs > staleMs) return content;
+		const pid = Number(content.split(" ")[0]);
+		return Number.isInteger(pid) && pid > 0 && !isAlive(pid) ? content : void 0;
+	} catch {
+		return;
+	}
+}
+/**
+* Removes a stale lock, and puts back a fresh one if another hook replaced the
+* stale one first. False when the stale lock could not be moved.
+*/
+async function breakStale(lockPath, seen) {
+	const moved = `${lockPath}.${randomUUID()}.stale`;
+	try {
+		await fs.rename(lockPath, moved);
+	} catch {
+		return false;
+	}
+	if (await fs.readFile(moved, "utf-8").catch(() => void 0) !== seen) await fs.link(moved, lockPath).catch(() => {});
+	await fs.rm(moved, { force: true });
+	return true;
+}
+/** One attempt to take the lock, breaking a stale one on the way. */
+async function tryLock(lockPath, token, staleMs) {
+	for (;;) {
+		const created = await tryCreate(lockPath, token);
+		if (created === "created") return "held";
+		if (created instanceof Error) return created;
+		const stale = await staleContent(lockPath, staleMs);
+		if (stale === void 0 || !await breakStale(lockPath, stale)) return "busy";
+	}
+}
+async function acquire(lockPath, pendingPath, token, t) {
 	const deadline = Date.now() + t.waitMs;
 	for (;;) {
-		try {
-			await fs.writeFile(lockPath, token, { flag: "wx" });
-			return async () => {
-				if (await fs.readFile(lockPath, "utf-8").catch(() => "") === token) await fs.rm(lockPath, { force: true });
-			};
-		} catch (error) {
-			if (error.code !== "EEXIST") {
-				debugLog("session lock unavailable; continuing without it:", error);
-				return async () => {};
-			}
+		let attempt = await tryLock(lockPath, token, t.staleMs);
+		if (attempt === "busy" && Date.now() >= deadline) {
+			await fs.writeFile(pendingPath, "").catch(() => {});
+			attempt = await tryLock(lockPath, token, t.staleMs);
+			if (attempt === "busy") return "handed-off";
 		}
-		const held = await fs.readFile(lockPath, "utf-8").catch(() => void 0);
-		if (held !== void 0 && isStale(held, t.staleMs)) {
-			if (await fs.readFile(lockPath, "utf-8").catch(() => void 0) === held) await fs.rm(lockPath, { force: true });
-			continue;
-		}
-		if (Date.now() >= deadline) {
-			debugLog(`session lock still held after ${t.waitMs} ms; continuing without it`);
-			return async () => {};
+		if (attempt === "held") return "held";
+		if (attempt instanceof Error) {
+			debugLog("session lock unavailable; continuing without it:", attempt);
+			return "unlocked";
 		}
 		await sleep(t.pollMs);
 	}
 }
 /**
-* Runs `fn` while holding the session's lock, a file next to the rollout. Hooks
-* of one session (a subagent's SubagentStop beside the parent's own hooks, say)
-* then read the rollout, export and record what was sent one at a time, so a
-* hook that read an older rollout can never deliver after one that read a newer.
+* Runs `run` while holding the session's lock, a file next to the rollout, so
+* hooks of one session (a subagent's SubagentStop beside the parent's own hooks,
+* say) read the rollout, export and record what they sent one at a time.
+*
+* A hook that can't get the lock within `waitMs` never runs on its own: it leaves
+* a request and returns undefined, and the holder runs again, reading the rollout
+* as it is then. The holder keeps its lock file fresh while it runs, so it is
+* taken over only if it exits or freezes, and `run` checks `held()` before
+* exporting so a frozen holder that resumes sends nothing.
 */
-async function withSessionLock(rolloutFile, fn, timings = DEFAULT_TIMINGS) {
-	const release = await acquire(`${rolloutFile}${suffix$1}`, timings);
+async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS) {
+	const lockPath = `${rolloutFile}.traceroot.lock`;
+	const pendingPath = `${rolloutFile}.traceroot.pending`;
+	const token = `${process.pid} ${randomUUID()}`;
+	const acquired = await acquire(lockPath, pendingPath, token, timings);
+	if (acquired === "handed-off") {
+		debugLog("another hook of this session holds the lock; it runs again for this one");
+		return;
+	}
+	if (acquired === "unlocked") return run$1({ held: async () => true });
+	const lock = { held: async () => await fs.readFile(lockPath, "utf-8").catch(() => "") === token };
+	const release = async () => {
+		if (await lock.held()) await fs.rm(lockPath, { force: true });
+	};
+	const heartbeat = setInterval(() => {
+		lock.held().then((mine) => {
+			if (mine) return fs.utimes(lockPath, /* @__PURE__ */ new Date(), /* @__PURE__ */ new Date());
+		}).catch(() => {});
+	}, timings.heartbeatMs);
+	heartbeat.unref();
+	const started = Date.now();
+	const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
 	try {
-		return await fn();
+		for (;;) {
+			await fs.rm(pendingPath, { force: true });
+			const result = await run$1(lock);
+			if (await exists(pendingPath)) {
+				if (budgetLeft() && await lock.held()) {
+					debugLog("running again for a hook that handed its run to this one");
+					continue;
+				}
+				debugLog("leaving a handed-off run for the session's next hook");
+				return result;
+			}
+			await release();
+			if (!await exists(pendingPath) || !budgetLeft()) return result;
+			if (await tryLock(lockPath, token, timings.staleMs) !== "held") return result;
+			debugLog("running again for a hook that asked while this one released");
+		}
 	} finally {
+		clearInterval(heartbeat);
 		await release();
 	}
 }
@@ -30737,9 +30813,9 @@ async function dispatch(hook, config, deps) {
 		debugLog("no transcript_path; skipping");
 		return { emitted: 0 };
 	}
-	return withSessionLock(transcript, () => emitSession(hook, transcript, config, deps), deps?.lockTimings);
+	return await withSessionLock(transcript, (lock) => emitSession(hook, transcript, config, lock, deps), deps?.lockTimings) ?? { emitted: 0 };
 }
-async function emitSession(hook, transcript, config, deps) {
+async function emitSession(hook, transcript, config, lock, deps) {
 	const buildTracingFn = deps?.buildTracing ?? buildTracing;
 	const getGit = deps?.getGit ?? getGitContext;
 	const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
@@ -30759,6 +30835,10 @@ async function emitSession(hook, transcript, config, deps) {
 		captureImages: config.captureImages
 	};
 	const already = await loadEmittedSpanIds(transcript);
+	if (!await lock.held()) {
+		debugLog("session lock lost before export; skipping");
+		return { emitted: 0 };
+	}
 	const tracing = buildTracingFn(config);
 	let emitted = 0;
 	const emittedIds = [];
