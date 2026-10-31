@@ -4,7 +4,7 @@ import * as os$1 from "node:os";
 import * as path from "node:path";
 import * as zlib from "zlib";
 import { Readable } from "stream";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -29997,6 +29997,71 @@ function truncate(s, max) {
 }
 
 //#endregion
+//#region src/lock.ts
+const suffix$1 = ".traceroot.lock";
+const DEFAULT_TIMINGS = {
+	waitMs: 15e3,
+	staleMs: 6e4,
+	pollMs: 50
+};
+const sleep = (ms$1) => new Promise((resolve) => setTimeout(resolve, ms$1));
+function isAlive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error.code === "EPERM";
+	}
+}
+/** True when the lock's content shows a holder that is gone or has held it too long. */
+function isStale(content, staleMs) {
+	const [pid = NaN, since = NaN] = content.split(" ").map(Number);
+	if (!Number.isInteger(pid) || !Number.isFinite(since)) return true;
+	return Date.now() - since > staleMs || !isAlive(pid);
+}
+async function acquire(lockPath, t) {
+	const token = `${process.pid} ${Date.now()} ${randomUUID()}`;
+	const deadline = Date.now() + t.waitMs;
+	for (;;) {
+		try {
+			await fs.writeFile(lockPath, token, { flag: "wx" });
+			return async () => {
+				if (await fs.readFile(lockPath, "utf-8").catch(() => "") === token) await fs.rm(lockPath, { force: true });
+			};
+		} catch (error) {
+			if (error.code !== "EEXIST") {
+				debugLog("session lock unavailable; continuing without it:", error);
+				return async () => {};
+			}
+		}
+		const held = await fs.readFile(lockPath, "utf-8").catch(() => void 0);
+		if (held !== void 0 && isStale(held, t.staleMs)) {
+			if (await fs.readFile(lockPath, "utf-8").catch(() => void 0) === held) await fs.rm(lockPath, { force: true });
+			continue;
+		}
+		if (Date.now() >= deadline) {
+			debugLog(`session lock still held after ${t.waitMs} ms; continuing without it`);
+			return async () => {};
+		}
+		await sleep(t.pollMs);
+	}
+}
+/**
+* Runs `fn` while holding the session's lock, a file next to the rollout. Hooks
+* of one session (a subagent's SubagentStop beside the parent's own hooks, say)
+* then read the rollout, export and record what was sent one at a time, so a
+* hook that read an older rollout can never deliver after one that read a newer.
+*/
+async function withSessionLock(rolloutFile, fn, timings = DEFAULT_TIMINGS) {
+	const release = await acquire(`${rolloutFile}${suffix$1}`, timings);
+	try {
+		return await fn();
+	} finally {
+		await release();
+	}
+}
+
+//#endregion
 //#region src/sidecar.ts
 const suffix = ".traceroot";
 async function loadEmittedSpanIds(rolloutFile) {
@@ -30672,6 +30737,9 @@ async function dispatch(hook, config, deps) {
 		debugLog("no transcript_path; skipping");
 		return { emitted: 0 };
 	}
+	return withSessionLock(transcript, () => emitSession(hook, transcript, config, deps), deps?.lockTimings);
+}
+async function emitSession(hook, transcript, config, deps) {
 	const buildTracingFn = deps?.buildTracing ?? buildTracing;
 	const getGit = deps?.getGit ?? getGitContext;
 	const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;

@@ -2,6 +2,7 @@ import type { Config } from "./config.js";
 import { buildTracing as defaultBuildTracing, type Tracing } from "./exporter.js";
 import { getGitContext } from "./git.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
+import { type LockTimings, withSessionLock } from "./lock.js";
 import { loadEmittedSpanIds, markSpanEmitted } from "./sidecar.js";
 import { emitSpan, planTurnSpans, type EmitCtx, type PlanOpts } from "./spans.js";
 import { locateSubagentRollout } from "./subagents.js";
@@ -21,6 +22,7 @@ export type Deps = {
    * NOT assume it — the per-subagent resolve/read/parse is wrapped in try/catch.
    */
   findSubagent: (threadId: string) => Promise<string | undefined>;
+  lockTimings: LockTimings;
 };
 
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
@@ -105,7 +107,14 @@ export async function dispatch(
 ): Promise<{ emitted: number }> {
   const transcript = hook.transcript_path;
   if (!transcript) { debugLog("no transcript_path; skipping"); return { emitted: 0 }; }
+  // Reading the rollout, exporting and recording what was sent run under the
+  // session's lock, so concurrent hooks of one session deliver in the order they read.
+  return withSessionLock(transcript, () => emitSession(hook, transcript, config, deps), deps?.lockTimings);
+}
 
+async function emitSession(
+  hook: HookInput, transcript: string, config: Config, deps?: Partial<Deps>,
+): Promise<{ emitted: number }> {
   const buildTracingFn = deps?.buildTracing ?? defaultBuildTracing;
   const getGit = deps?.getGit ?? getGitContext;
   const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
