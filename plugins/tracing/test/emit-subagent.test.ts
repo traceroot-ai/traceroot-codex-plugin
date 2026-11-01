@@ -2,17 +2,16 @@
  * Subagent tracing emission tests.
  * These tests inject findSubagent so they never touch the real ~/.codex.
  */
-import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildTracingWith } from "../src/exporter.js";
-import { PrimedIdGenerator } from "../src/ids.js";
 import { makeSpanId, makeTraceId } from "../src/ids.js";
 import { dispatch } from "../src/emit.js";
 import type { Config } from "../src/config.js";
+import { memTracing } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.join(here, "fixtures");
@@ -32,13 +31,10 @@ async function copyFixture(name: string): Promise<string> {
   return dst;
 }
 
-/** Build a no-op-shutdown buildTracing that keeps spans in `mem`. */
+/** Build a buildTracing that keeps spans in `mem`. */
 function makeTracingDeps(mem: InMemorySpanExporter) {
   return {
-    buildTracing: () => ({
-      ...buildTracingWith(new SimpleSpanProcessor(mem), new PrimedIdGenerator()),
-      shutdown: async () => {},
-    }),
+    buildTracing: () => memTracing(mem),
     getGit: async () => ({}),
   };
 }
