@@ -12,6 +12,8 @@ export type LockTimings = {
   /** The holder runs again for hooks that handed it their run only while it has run less than this. */
   rerunBudgetMs: number;
   pollMs: number;
+  /** How a waiting hook sleeps between attempts; tests replace it to know when a hook is waiting. */
+  sleep?: (ms: number) => Promise<void>;
 };
 
 // Codex gives a hook 30 s. A hook that can't get the lock in 10 s hands its run
@@ -26,7 +28,13 @@ export type SessionLock = {
   held: () => Promise<boolean>;
 };
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** What the hooks that handed their run to this one asked of it. */
+export type HandOff = {
+  /** When the latest of them that ended its turn (Codex's Stop) arrived. */
+  turnEndedAt?: number;
+};
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const exists = (p: string) => fs.access(p).then(() => true, () => false);
 
 function isAlive(pid: number): boolean {
@@ -37,6 +45,31 @@ function isAlive(pid: number): boolean {
     // EPERM: the process exists but belongs to someone else.
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+type LockFile = { content: string; mtimeMs: number };
+
+/** A lock file's content and age, both read through one handle so they come from the same file. */
+async function inspect(file: string): Promise<LockFile | undefined> {
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(file, "r");
+    const { mtimeMs } = await handle.stat();
+    return { content: await handle.readFile("utf-8"), mtimeMs };
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/** Whether the lock's holder is gone: exited, or silent past staleMs. */
+function isStale(lock: LockFile, staleMs: number): boolean {
+  // A live holder touches the file every heartbeat, so only an old file is judged
+  // by age; content that doesn't parse is judged by age alone.
+  if (Date.now() - lock.mtimeMs > staleMs) return true;
+  const pid = Number(lock.content.split(" ")[0]);
+  return Number.isInteger(pid) && pid > 0 && !isAlive(pid);
 }
 
 /** Creates the lock holding `token`. It is written in full first, so a lock file is never seen empty. */
@@ -53,38 +86,28 @@ async function tryCreate(lockPath: string, token: string): Promise<"created" | "
   }
 }
 
-/** The lock's content when its holder is gone: exited, or silent past staleMs. Otherwise undefined. */
-async function staleContent(lockPath: string, staleMs: number): Promise<string | undefined> {
-  try {
-    const [stat, content] = await Promise.all([fs.stat(lockPath), fs.readFile(lockPath, "utf-8")]);
-    // A live holder touches the file every heartbeat, so only an old file is judged
-    // by age; content that doesn't parse is judged by age alone.
-    if (Date.now() - stat.mtimeMs > staleMs) return content;
-    const pid = Number(content.split(" ")[0]);
-    return Number.isInteger(pid) && pid > 0 && !isAlive(pid) ? content : undefined;
-  } catch {
-    return undefined; // released meanwhile: just try again
-  }
-}
-
 /**
- * Removes a stale lock, and puts back a fresh one if another hook replaced the
- * stale one first. False when the stale lock could not be moved.
+ * Removes the lock only if `isIt` holds for it. The lock is first moved to a
+ * path no other hook uses, so the check and the removal act on one file that
+ * nobody can replace in between. A lock that fails the check is moved back.
  */
-async function breakStale(lockPath: string, seen: string): Promise<boolean> {
-  const moved = `${lockPath}.${randomUUID()}.stale`;
+async function removeLockIf(lockPath: string, isIt: (lock: LockFile) => boolean): Promise<boolean> {
+  const moved = `${lockPath}.${randomUUID()}.moved`;
   try {
     await fs.rename(lockPath, moved);
   } catch {
-    return false;
+    return false; // released meanwhile
   }
-  if ((await fs.readFile(moved, "utf-8").catch(() => undefined)) !== seen) {
-    // If this fails, someone else already holds the lock, and the hook whose lock
-    // was moved sees it no longer holds it before it exports.
-    await fs.link(moved, lockPath).catch(() => {});
+  const lock = await inspect(moved);
+  if (lock && isIt(lock)) {
+    await fs.rm(moved, { force: true });
+    return true;
   }
-  await fs.rm(moved, { force: true });
-  return true;
+  // Moved back over any lock taken in the moment it was away: its holder may
+  // already be exporting, while a hook that has only just taken the lock checks
+  // that it still holds it before it exports.
+  await fs.rename(moved, lockPath).catch(() => fs.rm(moved, { force: true }));
+  return false;
 }
 
 /** One attempt to take the lock, breaking a stale one on the way. */
@@ -93,23 +116,69 @@ async function tryLock(lockPath: string, token: string, staleMs: number): Promis
     const created = await tryCreate(lockPath, token);
     if (created === "created") return "held";
     if (created instanceof Error) return created;
-    const stale = await staleContent(lockPath, staleMs);
-    if (stale === undefined || !(await breakStale(lockPath, stale))) return "busy";
+    const seen = await inspect(lockPath);
+    if (!seen || !isStale(seen, staleMs)) return "busy";
+    // Judged again once moved aside: the file may have been replaced, or touched
+    // by a holder that resumed, since it was first looked at.
+    const broken = await removeLockIf(lockPath, (lock) => lock.content === seen.content && isStale(lock, staleMs));
+    if (!broken) return "busy";
   }
 }
 
-type Acquired = "held" | "handed-off" | "unlocked";
+/**
+ * Asks the holder to run again for this hook, written in full before it appears.
+ * A hook that ended its turn replaces any request already waiting with one that
+ * says when it arrived; any other leaves a waiting request in place, since that
+ * one already gets a run.
+ */
+async function requestRun(pendingPath: string, turnEndedAt: number | undefined): Promise<boolean> {
+  const tmp = `${pendingPath}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tmp, turnEndedAt === undefined ? "" : String(turnEndedAt));
+    if (turnEndedAt !== undefined) {
+      await fs.rename(tmp, pendingPath);
+    } else {
+      await fs.link(tmp, pendingPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      });
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await fs.rm(tmp, { force: true });
+  }
+}
 
-async function acquire(lockPath: string, pendingPath: string, token: string, t: LockTimings): Promise<Acquired> {
+/** Takes the requests waiting for a run, so that requests made after this get a run of their own. */
+async function claimRequests(pendingPath: string): Promise<HandOff> {
+  const claimed = `${pendingPath}.${randomUUID()}.claimed`;
+  try {
+    await fs.rename(pendingPath, claimed);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+  const request = await fs.readFile(claimed, "utf-8").catch(() => "");
+  await fs.rm(claimed, { force: true });
+  const turnEndedAt = Number(request);
+  return request && Number.isFinite(turnEndedAt) ? { turnEndedAt } : {};
+}
+
+type Acquired = "held" | "handed-off" | "not-handed-off" | "unlocked";
+
+async function acquire(
+  lockPath: string, pendingPath: string, token: string, turnEndedAt: number | undefined, t: LockTimings,
+): Promise<Acquired> {
   const deadline = Date.now() + t.waitMs;
   for (;;) {
     let attempt = await tryLock(lockPath, token, t.staleMs);
     if (attempt === "busy" && Date.now() >= deadline) {
       // Ask the holder to run again for this hook, then look once more: the holder
       // may have released after it last looked for requests.
-      await fs.writeFile(pendingPath, "").catch(() => {});
+      const asked = await requestRun(pendingPath, turnEndedAt);
       attempt = await tryLock(lockPath, token, t.staleMs);
-      if (attempt === "busy") return "handed-off";
+      if (attempt === "busy") return asked ? "handed-off" : "not-handed-off";
     }
     if (attempt === "held") return "held";
     if (attempt instanceof Error) {
@@ -117,7 +186,7 @@ async function acquire(lockPath: string, pendingPath: string, token: string, t: 
       debugLog("session lock unavailable; continuing without it:", attempt);
       return "unlocked";
     }
-    await sleep(t.pollMs);
+    await (t.sleep ?? sleep)(t.pollMs);
   }
 }
 
@@ -128,29 +197,37 @@ async function acquire(lockPath: string, pendingPath: string, token: string, t: 
  *
  * A hook that can't get the lock within `waitMs` never runs on its own: it leaves
  * a request and returns undefined, and the holder runs again, reading the rollout
- * as it is then. The holder keeps its lock file fresh while it runs, so it is
- * taken over only if it exits or freezes, and `run` checks `held()` before
- * exporting so a frozen holder that resumes sends nothing.
+ * as it is then. A hook that `endsTurn` says so in its request, and the run that
+ * serves it is told when it arrived. The holder keeps its lock file fresh while it
+ * runs, so it is taken over only if it exits or freezes, and `run` checks `held()`
+ * before exporting so a frozen holder that resumes sends nothing.
  */
 export async function withSessionLock<T>(
   rolloutFile: string,
-  run: (lock: SessionLock) => Promise<T>,
+  run: (lock: SessionLock, handOff: HandOff) => Promise<T>,
   timings: LockTimings = DEFAULT_TIMINGS,
+  endsTurn = false,
 ): Promise<T | undefined> {
   const lockPath = `${rolloutFile}.traceroot.lock`;
   const pendingPath = `${rolloutFile}.traceroot.pending`;
   const token = `${process.pid} ${randomUUID()}`;
-  const acquired = await acquire(lockPath, pendingPath, token, timings);
+  const acquired = await acquire(lockPath, pendingPath, token, endsTurn ? Date.now() : undefined, timings);
   if (acquired === "handed-off") {
     debugLog("another hook of this session holds the lock; it runs again for this one");
     return undefined;
   }
-  if (acquired === "unlocked") return run({ held: async () => true });
+  if (acquired === "not-handed-off") {
+    debugLog("another hook of this session holds the lock, and this one could not ask it to run again; sending nothing");
+    return undefined;
+  }
+  if (acquired === "unlocked") return run({ held: async () => true }, {});
 
   const lock: SessionLock = {
     held: async () => (await fs.readFile(lockPath, "utf-8").catch(() => "")) === token,
   };
-  const release = async () => { if (await lock.held()) await fs.rm(lockPath, { force: true }); };
+  const release = async () => {
+    if (await lock.held()) await removeLockIf(lockPath, (mine) => mine.content === token);
+  };
   const heartbeat = setInterval(() => {
     void lock.held().then((mine) => {
       if (mine) return fs.utimes(lockPath, new Date(), new Date());
@@ -161,10 +238,10 @@ export async function withSessionLock<T>(
   const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
   try {
     for (;;) {
-      // Cleared before reading the rollout: a request made after this point is
+      // Claimed before reading the rollout: a request made after this point is
       // for a newer rollout, so it gets a run of its own.
-      await fs.rm(pendingPath, { force: true });
-      const result = await run(lock);
+      const handOff = await claimRequests(pendingPath);
+      const result = await run(lock, handOff);
       if (await exists(pendingPath)) {
         if (budgetLeft() && (await lock.held())) {
           debugLog("running again for a hook that handed its run to this one");

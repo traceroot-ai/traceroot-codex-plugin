@@ -27444,13 +27444,13 @@ var require_inspect = /* @__PURE__ */ __commonJSMin(((exports) => {
 	* `inspect` callback (e.g. browsers), falls back to returning the raw
 	* payload object.
 	*/
-	function formatInspect(className, payload, depth, options, inspect) {
+	function formatInspect(className, payload, depth, options, inspect$1) {
 		if (typeof depth === "number" && depth < 0) {
 			const tag = `[${className}]`;
 			return options?.stylize ? options.stylize(tag, "special") : tag;
 		}
-		if (typeof inspect !== "function" || !options) return payload;
-		return `${className} ${inspect(payload, {
+		if (typeof inspect$1 !== "function" || !options) return payload;
+		return `${className} ${inspect$1(payload, {
 			...options,
 			depth: options.depth == null ? options.depth : options.depth - 1
 		})}`;
@@ -27739,7 +27739,7 @@ var require_Span = /* @__PURE__ */ __commonJSMin(((exports) => {
 			if (Array.isArray(value)) return value.map((val) => typeof val === "string" ? this._truncateToLimitUtil(val, limit) : val);
 			return value;
 		}
-		[inspect_1.inspectCustom](depth, options, inspect) {
+		[inspect_1.inspectCustom](depth, options, inspect$1) {
 			const payload = {
 				name: this.name,
 				kind: this.kind,
@@ -27759,7 +27759,7 @@ var require_Span = /* @__PURE__ */ __commonJSMin(((exports) => {
 				instrumentationScope: this.instrumentationScope,
 				resource: { attributes: (0, inspect_1.settledResourceAttributes)(this.resource) }
 			};
-			return (0, inspect_1.formatInspect)("SpanImpl", payload, depth, options, inspect);
+			return (0, inspect_1.formatInspect)("SpanImpl", payload, depth, options, inspect$1);
 		}
 	};
 	exports.SpanImpl = SpanImpl;
@@ -28079,13 +28079,13 @@ var require_Tracer = /* @__PURE__ */ __commonJSMin(((exports) => {
 			const contextWithSpanSet = api.trace.setSpan(parentContext, span);
 			return api.context.with(contextWithSpanSet, fn, void 0, span);
 		}
-		[inspect_1.inspectCustom](depth, options, inspect) {
+		[inspect_1.inspectCustom](depth, options, inspect$1) {
 			const payload = {
 				instrumentationScope: this.instrumentationScope,
 				resource: { attributes: (0, inspect_1.settledResourceAttributes)(this._resource) },
 				spanLimits: this._spanLimits
 			};
-			return (0, inspect_1.formatInspect)("Tracer", payload, depth, options, inspect);
+			return (0, inspect_1.formatInspect)("Tracer", payload, depth, options, inspect$1);
 		}
 	};
 	exports.Tracer = Tracer;
@@ -28625,14 +28625,14 @@ var require_TracerProvider = /* @__PURE__ */ __commonJSMin(((exports) => {
 		shutdown() {
 			return this._activeSpanProcessor.shutdown();
 		}
-		[inspect_1.inspectCustom](depth, options, inspect) {
+		[inspect_1.inspectCustom](depth, options, inspect$1) {
 			const processors = this._activeSpanProcessor["_spanProcessors"];
 			const payload = {
 				resource: { attributes: (0, inspect_1.settledResourceAttributes)(this._resource) },
 				tracers: Array.from(this._tracers.keys()),
 				spanProcessors: processors.map((p) => p.constructor?.name ?? "SpanProcessor")
 			};
-			return (0, inspect_1.formatInspect)("TracerProvider", payload, depth, options, inspect);
+			return (0, inspect_1.formatInspect)("TracerProvider", payload, depth, options, inspect$1);
 		}
 	};
 	exports.TracerProvider = TracerProvider;
@@ -29916,6 +29916,32 @@ var SizeLimitedExporter = class {
 		await this.inner.forceFlush?.();
 	}
 };
+/**
+* Sends a request only if `stillHeld()` says this hook still holds the session's
+* lock, checked right before each request. A request held back is reported as
+* failed, so its spans are not recorded as delivered and the next hook sends them.
+*/
+var LockGuardedExporter = class {
+	constructor(inner, stillHeld) {
+		this.inner = inner;
+		this.stillHeld = stillHeld;
+	}
+	export(spans, resultCallback) {
+		this.stillHeld().catch(() => false).then((held) => {
+			if (held) exportSafely(this.inner, spans, resultCallback);
+			else resultCallback({
+				code: import_src.ExportResultCode.FAILED,
+				error: /* @__PURE__ */ new Error("not sent: the session lock was taken over")
+			});
+		});
+	}
+	shutdown() {
+		return this.inner.shutdown();
+	}
+	forceFlush() {
+		return this.inner.forceFlush?.() ?? Promise.resolve();
+	}
+};
 function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set()) {
 	const provider = new import_src$2.NodeTracerProvider({
 		idGenerator: idGen,
@@ -29942,8 +29968,8 @@ function otlpExporter(config) {
 		compression: "gzip"
 	});
 }
-function buildTracing(config, exporter = otlpExporter(config)) {
-	const tracked = new DeliveryTrackingExporter(exporter);
+function buildTracing(config, exporter = otlpExporter(config), stillHeld) {
+	const tracked = new DeliveryTrackingExporter(stillHeld ? new LockGuardedExporter(exporter, stillHeld) : exporter);
 	return buildTracingWith(new import_index_shim.BatchSpanProcessor(new SizeLimitedExporter(tracked, config.maxRequestBytes), {
 		maxQueueSize: 4096,
 		maxExportBatchSize: 1024,
@@ -30015,6 +30041,28 @@ function isAlive(pid) {
 		return error.code === "EPERM";
 	}
 }
+/** A lock file's content and age, both read through one handle so they come from the same file. */
+async function inspect(file) {
+	let handle;
+	try {
+		handle = await fs.open(file, "r");
+		const { mtimeMs } = await handle.stat();
+		return {
+			content: await handle.readFile("utf-8"),
+			mtimeMs
+		};
+	} catch {
+		return;
+	} finally {
+		await handle?.close().catch(() => {});
+	}
+}
+/** Whether the lock's holder is gone: exited, or silent past staleMs. */
+function isStale(lock, staleMs) {
+	if (Date.now() - lock.mtimeMs > staleMs) return true;
+	const pid = Number(lock.content.split(" ")[0]);
+	return Number.isInteger(pid) && pid > 0 && !isAlive(pid);
+}
 /** Creates the lock holding `token`. It is written in full first, so a lock file is never seen empty. */
 async function tryCreate(lockPath, token) {
 	const tmp = `${lockPath}.${randomUUID()}.tmp`;
@@ -30028,31 +30076,25 @@ async function tryCreate(lockPath, token) {
 		await fs.rm(tmp, { force: true });
 	}
 }
-/** The lock's content when its holder is gone: exited, or silent past staleMs. Otherwise undefined. */
-async function staleContent(lockPath, staleMs) {
-	try {
-		const [stat, content] = await Promise.all([fs.stat(lockPath), fs.readFile(lockPath, "utf-8")]);
-		if (Date.now() - stat.mtimeMs > staleMs) return content;
-		const pid = Number(content.split(" ")[0]);
-		return Number.isInteger(pid) && pid > 0 && !isAlive(pid) ? content : void 0;
-	} catch {
-		return;
-	}
-}
 /**
-* Removes a stale lock, and puts back a fresh one if another hook replaced the
-* stale one first. False when the stale lock could not be moved.
+* Removes the lock only if `isIt` holds for it. The lock is first moved to a
+* path no other hook uses, so the check and the removal act on one file that
+* nobody can replace in between. A lock that fails the check is moved back.
 */
-async function breakStale(lockPath, seen) {
-	const moved = `${lockPath}.${randomUUID()}.stale`;
+async function removeLockIf(lockPath, isIt) {
+	const moved = `${lockPath}.${randomUUID()}.moved`;
 	try {
 		await fs.rename(lockPath, moved);
 	} catch {
 		return false;
 	}
-	if (await fs.readFile(moved, "utf-8").catch(() => void 0) !== seen) await fs.link(moved, lockPath).catch(() => {});
-	await fs.rm(moved, { force: true });
-	return true;
+	const lock = await inspect(moved);
+	if (lock && isIt(lock)) {
+		await fs.rm(moved, { force: true });
+		return true;
+	}
+	await fs.rename(moved, lockPath).catch(() => fs.rm(moved, { force: true }));
+	return false;
 }
 /** One attempt to take the lock, breaking a stale one on the way. */
 async function tryLock(lockPath, token, staleMs) {
@@ -30060,25 +30102,61 @@ async function tryLock(lockPath, token, staleMs) {
 		const created = await tryCreate(lockPath, token);
 		if (created === "created") return "held";
 		if (created instanceof Error) return created;
-		const stale = await staleContent(lockPath, staleMs);
-		if (stale === void 0 || !await breakStale(lockPath, stale)) return "busy";
+		const seen = await inspect(lockPath);
+		if (!seen || !isStale(seen, staleMs)) return "busy";
+		if (!await removeLockIf(lockPath, (lock) => lock.content === seen.content && isStale(lock, staleMs))) return "busy";
 	}
 }
-async function acquire(lockPath, pendingPath, token, t) {
+/**
+* Asks the holder to run again for this hook, written in full before it appears.
+* A hook that ended its turn replaces any request already waiting with one that
+* says when it arrived; any other leaves a waiting request in place, since that
+* one already gets a run.
+*/
+async function requestRun(pendingPath, turnEndedAt) {
+	const tmp = `${pendingPath}.${randomUUID()}.tmp`;
+	try {
+		await fs.writeFile(tmp, turnEndedAt === void 0 ? "" : String(turnEndedAt));
+		if (turnEndedAt !== void 0) await fs.rename(tmp, pendingPath);
+		else await fs.link(tmp, pendingPath).catch((error) => {
+			if (error.code !== "EEXIST") throw error;
+		});
+		return true;
+	} catch {
+		return false;
+	} finally {
+		await fs.rm(tmp, { force: true });
+	}
+}
+/** Takes the requests waiting for a run, so that requests made after this get a run of their own. */
+async function claimRequests(pendingPath) {
+	const claimed = `${pendingPath}.${randomUUID()}.claimed`;
+	try {
+		await fs.rename(pendingPath, claimed);
+	} catch (error) {
+		if (error.code === "ENOENT") return {};
+		throw error;
+	}
+	const request = await fs.readFile(claimed, "utf-8").catch(() => "");
+	await fs.rm(claimed, { force: true });
+	const turnEndedAt = Number(request);
+	return request && Number.isFinite(turnEndedAt) ? { turnEndedAt } : {};
+}
+async function acquire(lockPath, pendingPath, token, turnEndedAt, t) {
 	const deadline = Date.now() + t.waitMs;
 	for (;;) {
 		let attempt = await tryLock(lockPath, token, t.staleMs);
 		if (attempt === "busy" && Date.now() >= deadline) {
-			await fs.writeFile(pendingPath, "").catch(() => {});
+			const asked = await requestRun(pendingPath, turnEndedAt);
 			attempt = await tryLock(lockPath, token, t.staleMs);
-			if (attempt === "busy") return "handed-off";
+			if (attempt === "busy") return asked ? "handed-off" : "not-handed-off";
 		}
 		if (attempt === "held") return "held";
 		if (attempt instanceof Error) {
 			debugLog("session lock unavailable; continuing without it:", attempt);
 			return "unlocked";
 		}
-		await sleep(t.pollMs);
+		await (t.sleep ?? sleep)(t.pollMs);
 	}
 }
 /**
@@ -30088,23 +30166,28 @@ async function acquire(lockPath, pendingPath, token, t) {
 *
 * A hook that can't get the lock within `waitMs` never runs on its own: it leaves
 * a request and returns undefined, and the holder runs again, reading the rollout
-* as it is then. The holder keeps its lock file fresh while it runs, so it is
-* taken over only if it exits or freezes, and `run` checks `held()` before
-* exporting so a frozen holder that resumes sends nothing.
+* as it is then. A hook that `endsTurn` says so in its request, and the run that
+* serves it is told when it arrived. The holder keeps its lock file fresh while it
+* runs, so it is taken over only if it exits or freezes, and `run` checks `held()`
+* before exporting so a frozen holder that resumes sends nothing.
 */
-async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS) {
+async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS, endsTurn = false) {
 	const lockPath = `${rolloutFile}.traceroot.lock`;
 	const pendingPath = `${rolloutFile}.traceroot.pending`;
 	const token = `${process.pid} ${randomUUID()}`;
-	const acquired = await acquire(lockPath, pendingPath, token, timings);
+	const acquired = await acquire(lockPath, pendingPath, token, endsTurn ? Date.now() : void 0, timings);
 	if (acquired === "handed-off") {
 		debugLog("another hook of this session holds the lock; it runs again for this one");
 		return;
 	}
-	if (acquired === "unlocked") return run$1({ held: async () => true });
+	if (acquired === "not-handed-off") {
+		debugLog("another hook of this session holds the lock, and this one could not ask it to run again; sending nothing");
+		return;
+	}
+	if (acquired === "unlocked") return run$1({ held: async () => true }, {});
 	const lock = { held: async () => await fs.readFile(lockPath, "utf-8").catch(() => "") === token };
 	const release = async () => {
-		if (await lock.held()) await fs.rm(lockPath, { force: true });
+		if (await lock.held()) await removeLockIf(lockPath, (mine) => mine.content === token);
 	};
 	const heartbeat = setInterval(() => {
 		lock.held().then((mine) => {
@@ -30116,8 +30199,7 @@ async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS) {
 	const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
 	try {
 		for (;;) {
-			await fs.rm(pendingPath, { force: true });
-			const result = await run$1(lock);
+			const result = await run$1(lock, await claimRequests(pendingPath));
 			if (await exists(pendingPath)) {
 				if (budgetLeft() && await lock.held()) {
 					debugLog("running again for a hook that handed its run to this one");
@@ -30766,6 +30848,7 @@ function parseRollout(lines) {
 //#endregion
 //#region src/emit.ts
 const STACK_GUARD = 32;
+const buildLockedTracing = (c, stillHeld) => buildTracing(c, void 0, stillHeld);
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
 async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, emittedIds, findSubagent) {
 	let n = 0;
@@ -30813,14 +30896,16 @@ async function dispatch(hook, config, deps) {
 		debugLog("no transcript_path; skipping");
 		return { emitted: 0 };
 	}
-	return await withSessionLock(transcript, (lock) => emitSession(hook, transcript, config, lock, deps), deps?.lockTimings) ?? { emitted: 0 };
+	return await withSessionLock(transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), deps?.lockTimings, hook.hook_event_name === "Stop") ?? { emitted: 0 };
 }
-async function emitSession(hook, transcript, config, lock, deps) {
-	const buildTracingFn = deps?.buildTracing ?? buildTracing;
+async function emitSession(hook, transcript, config, lock, handOff, deps) {
+	const buildTracingFn = deps?.buildTracing ?? buildLockedTracing;
 	const getGit = deps?.getGit ?? getGitContext;
 	const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
 	const turnEnding = hook.hook_event_name === "Stop";
 	const { sessionMeta, turns } = parseRollout(await readRollout(transcript));
+	const latest = turns.at(-1);
+	const handedOffStop = handOff.turnEndedAt !== void 0 && !!latest && latest.startTime <= handOff.turnEndedAt;
 	if (sessionMeta.threadSource === "subagent" || sessionMeta.parentThreadId) {
 		debugLog(`subagent session ${sessionMeta.sessionId}; skipping standalone emit (nested under parent)`);
 		return { emitted: 0 };
@@ -30831,7 +30916,7 @@ async function emitSession(hook, transcript, config, lock, deps) {
 		userId: config.userId,
 		git,
 		maxChars: config.maxChars,
-		turnEnding,
+		turnEnding: turnEnding || handedOffStop,
 		captureImages: config.captureImages
 	};
 	const already = await loadEmittedSpanIds(transcript);
@@ -30839,7 +30924,7 @@ async function emitSession(hook, transcript, config, lock, deps) {
 		debugLog("session lock lost before export; skipping");
 		return { emitted: 0 };
 	}
-	const tracing = buildTracingFn(config);
+	const tracing = buildTracingFn(config, lock.held);
 	let emitted = 0;
 	const emittedIds = [];
 	const visited = /* @__PURE__ */ new Set();

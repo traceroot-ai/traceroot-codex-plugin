@@ -1,6 +1,7 @@
 import type { ExportResult } from "@opentelemetry/core";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,8 +11,9 @@ import type { Config } from "../src/config.js";
 import { dispatch } from "../src/emit.js";
 import { buildTracing } from "../src/exporter.js";
 import { makeSpanId } from "../src/ids.js";
-import { type LockTimings, withSessionLock } from "../src/lock.js";
-import { ids, OK } from "./helpers.js";
+import { type HandOff, type LockTimings, withSessionLock } from "../src/lock.js";
+import { loadEmittedSpanIds } from "../src/sidecar.js";
+import { ids, OK, ScriptedExporter } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const T: LockTimings = { waitMs: 2_000, staleMs: 60_000, heartbeatMs: 1_000, rerunBudgetMs: 60_000, pollMs: 5 };
@@ -27,12 +29,25 @@ async function rolloutPath(): Promise<string> {
 const lockOf = (rollout: string) => `${rollout}.traceroot.lock`;
 const pendingOf = (rollout: string) => `${rollout}.traceroot.pending`;
 const exists = (p: string) => fs.access(p).then(() => true, () => false);
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((r) => { resolve = r; });
   return { promise, resolve };
+}
+
+/** Timings whose hook resolves `waiting` once it has found the lock held and starts waiting. */
+function waitingTimings(timings: LockTimings, waiting: { resolve: () => void }): LockTimings {
+  return { ...timings, sleep: (ms) => { waiting.resolve(); return sleep(ms); } };
+}
+
+/** Waits until `check` passes: a barrier on something another task does, not a guess at how long it takes. */
+async function until(check: () => Promise<boolean>, what: string): Promise<void> {
+  for (const started = Date.now(); !(await check());) {
+    if (Date.now() - started > 4_000) throw new Error(`timed out waiting for ${what}`);
+    await sleep(2);
+  }
 }
 
 async function deadPid(): Promise<number> {
@@ -58,16 +73,19 @@ describe("withSessionLock", () => {
   it("runs a second hook of the same session only after the first finishes", async () => {
     const rollout = await rolloutPath();
     const events: string[] = [];
+    const started = deferred();
     const gate = deferred();
+    const waiting = deferred();
 
     const first = withSessionLock(rollout, async () => {
       events.push("first:start");
+      started.resolve();
       await gate.promise;
       events.push("first:end");
     }, T);
-    await sleep(20);
-    const second = withSessionLock(rollout, async () => { events.push("second:start"); }, T);
-    await sleep(50);
+    await started.promise;
+    const second = withSessionLock(rollout, async () => { events.push("second:start"); }, waitingTimings(T, waiting));
+    await waiting.promise; // the second hook found the lock held
     expect(events).toEqual(["first:start"]);
 
     gate.resolve();
@@ -79,18 +97,19 @@ describe("withSessionLock", () => {
   it("hands its run to the holder when the wait runs out, and never runs unlocked", async () => {
     const rollout = await rolloutPath();
     const { t, run } = tracker();
+    const started = deferred();
     const gate = deferred();
     let holderRuns = 0;
     let waiterRan = false;
 
     const holder = withSessionLock(rollout, () => run(async () => {
       holderRuns += 1;
-      if (holderRuns === 1) await gate.promise;
+      if (holderRuns === 1) { started.resolve(); await gate.promise; }
       return holderRuns;
     }), T);
-    await sleep(20);
+    await started.promise;
     const arrived = performance.now();
-    const waiter = await withSessionLock(rollout, async () => { waiterRan = true; }, { ...T, waitMs: 50 });
+    const waiter = await withSessionLock(rollout, async () => { waiterRan = true; }, { ...T, waitMs: 0 });
 
     expect(waiter).toBeUndefined();
     expect(waiterRan).toBe(false);
@@ -104,6 +123,36 @@ describe("withSessionLock", () => {
     expect(await exists(lockOf(rollout))).toBe(false);
   });
 
+  it.each([
+    ["before", [true, false]],
+    ["after", [false, true]],
+  ])("tells the run serving a hand-off that a hook ending its turn handed off %s one that doesn't", async (_order, endsTurn) => {
+    const rollout = await rolloutPath();
+    const started = deferred();
+    const gate = deferred();
+    const served: HandOff[] = [];
+
+    const holder = withSessionLock(rollout, async (_lock, handOff) => {
+      served.push(handOff);
+      if (served.length === 1) { started.resolve(); await gate.promise; }
+    }, T);
+    await started.promise;
+    const firstArrived = Date.now();
+    for (const ends of endsTurn) {
+      expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, ends)).toBeUndefined();
+    }
+    const lastArrived = Date.now();
+    gate.resolve();
+    await holder;
+
+    expect(served).toHaveLength(2);
+    expect(served[0]).toEqual({});
+    expect(served[1]!.turnEndedAt).toBeGreaterThanOrEqual(firstArrived);
+    expect(served[1]!.turnEndedAt).toBeLessThanOrEqual(lastArrived);
+  });
+
+  // A stress test: the hooks arrive and run for staggered times, and the
+  // assertions must hold for whatever interleaving that produces.
   it("under many concurrent hooks never runs two at once, and serves every hook with a run that started after it", async () => {
     const rollout = await rolloutPath();
     const { t, run } = tracker();
@@ -111,7 +160,7 @@ describe("withSessionLock", () => {
     const hooks = Array.from({ length: 12 }, (_, i) => (async () => {
       await sleep((i * 37) % 120);
       arrivals.push(performance.now());
-      return withSessionLock(rollout, () => run(() => sleep(15 + ((i * 7) % 20))), { ...T, waitMs: 25 });
+      return withSessionLock(rollout, () => run(() => sleep(15 + ((i * 7) % 20))), { ...T, waitMs: 25 }, i % 3 === 0);
     })());
 
     await Promise.all(hooks);
@@ -125,7 +174,7 @@ describe("withSessionLock", () => {
     await fs.writeFile(lockOf(rollout), content);
     let ran = false;
 
-    expect(await withSessionLock(rollout, async () => { ran = true; }, { ...T, waitMs: 60 })).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => { ran = true; }, { ...T, waitMs: 0 })).toBeUndefined();
     expect(ran).toBe(false);
     expect(await fs.readFile(lockOf(rollout), "utf-8")).toBe(content);
   });
@@ -146,21 +195,29 @@ describe("withSessionLock", () => {
     const rollout = await rolloutPath();
     await leave(rollout);
 
-    expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 500 })).toBe("ran");
+    expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 0 })).toBe("ran");
     expect(await exists(lockOf(rollout))).toBe(false);
   });
 
-  it("keeps the lock of a holder that runs past the stale limit", async () => {
+  it("keeps the lock of a holder that runs past the stale limit, because it keeps touching it", async () => {
     const rollout = await rolloutPath();
-    const timings = { ...T, staleMs: 120, heartbeatMs: 20 };
+    const timings = { ...T, heartbeatMs: 10 };
     const { t, run } = tracker();
+    const started = deferred();
+    const gate = deferred();
 
-    const holder = withSessionLock(rollout, () => run(() => sleep(400)), timings);
-    await sleep(50);
-    await withSessionLock(rollout, () => run(async () => {}), { ...timings, waitMs: 1_000 });
+    const holder = withSessionLock(rollout, () => run(async () => { started.resolve(); await gate.promise; }), timings);
+    await started.promise;
+    // Age the lock as if the holder had run past the stale limit, then wait for its next touch.
+    const old = Date.now() - 120_000;
+    await fs.utimes(lockOf(rollout), old / 1000, old / 1000);
+    await until(async () => (await fs.stat(lockOf(rollout))).mtimeMs > old + 60_000, "the holder to touch its lock");
+
+    expect(await withSessionLock(rollout, () => run(async () => {}), { ...timings, waitMs: 0 })).toBeUndefined();
+    gate.resolve();
     await holder;
-
     expect(t.max).toBe(1);
+    expect(t.starts).toHaveLength(2); // the holder ran again for the hook that handed off
   });
 
   it("tells a holder whose lock was taken over that it no longer holds it, and leaves the new lock", async () => {
@@ -179,12 +236,17 @@ describe("withSessionLock", () => {
 
   it("leaves a handed-off run for the next hook once the holder has used its rerun budget", async () => {
     const rollout = await rolloutPath();
+    const started = deferred();
     const gate = deferred();
     let holderRuns = 0;
 
-    const holder = withSessionLock(rollout, async () => { holderRuns += 1; await gate.promise; }, { ...T, rerunBudgetMs: 0 });
-    await sleep(20);
-    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 30 })).toBeUndefined();
+    const holder = withSessionLock(rollout, async () => {
+      holderRuns += 1;
+      started.resolve();
+      await gate.promise;
+    }, { ...T, rerunBudgetMs: 0 });
+    await started.promise;
+    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 })).toBeUndefined();
     gate.resolve();
     await holder;
 
@@ -200,9 +262,10 @@ describe("withSessionLock", () => {
 
   it("does not hold up another session", async () => {
     const rollout = await rolloutPath();
+    const started = deferred();
     const gate = deferred();
-    const first = withSessionLock(rollout, () => gate.promise, T);
-    await sleep(20);
+    const first = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, T);
+    await started.promise;
 
     await expect(withSessionLock(`${rollout}.other`, async () => "ran", T)).resolves.toBe("ran");
     gate.resolve();
@@ -220,15 +283,20 @@ describe("dispatch under the session lock", () => {
     enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: true, captureImages: false,
   };
   const ROOT = makeSpanId("turn-1:root");
+  const NEXT_ROOT = makeSpanId("turn-2:root");
 
-  /** Exports succeed; an export waits for `gate` the first time. Every step is logged. */
+  /** Exports succeed; an export waits for `gate` the first time and calls `onExport` when it starts. Every step is logged. */
   class GatedExporter implements SpanExporter {
     private gated = true;
 
-    constructor(private readonly label: string, private readonly events: string[], private readonly gate?: Promise<void>) {}
+    constructor(
+      private readonly label: string, private readonly events: string[], private readonly gate?: Promise<void>,
+      private readonly onExport?: () => void,
+    ) {}
 
     export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
       this.events.push(`${this.label}:export ${ids(spans).includes(ROOT) ? "with root" : "without root"}`);
+      this.onExport?.();
       const wait = this.gated && this.gate ? this.gate : Promise.resolve();
       this.gated = false;
       void wait.then(() => {
@@ -240,15 +308,15 @@ describe("dispatch under the session lock", () => {
     async shutdown(): Promise<void> {}
   }
 
-  async function transcriptCopy(): Promise<string> {
+  async function transcriptCopy(fixture = "rollout-basic.jsonl"): Promise<string> {
     const transcript = await rolloutPath();
-    await fs.copyFile(path.join(here, "fixtures", "rollout-basic.jsonl"), transcript);
+    await fs.copyFile(path.join(here, "fixtures", fixture), transcript);
     return transcript;
   }
 
   const depsFor = (label: string, events: string[], exporter: SpanExporter, timings: LockTimings) => ({
     // A fresh exporter wrapper per run: each run builds and shuts down its own tracing.
-    buildTracing: (c: Config) => buildTracing(c, exporter),
+    buildTracing: (c: Config, stillHeld?: () => Promise<boolean>) => buildTracing(c, exporter, stillHeld),
     // getGit runs right after the rollout is read.
     getGit: async () => { events.push(`${label}:read`); return {}; },
     lockTimings: timings,
@@ -258,13 +326,15 @@ describe("dispatch under the session lock", () => {
     const transcript = await transcriptCopy();
     const events: string[] = [];
     const gate = deferred();
+    const exporting = deferred();
+    const waiting = deferred();
 
     const first = dispatch({ transcript_path: transcript, hook_event_name: "Stop" }, config,
-      depsFor("first", events, new GatedExporter("first", events, gate.promise), T));
-    await sleep(50);
+      depsFor("first", events, new GatedExporter("first", events, gate.promise, exporting.resolve), T));
+    await exporting.promise;
     const second = dispatch({ transcript_path: transcript, hook_event_name: "SubagentStop" }, config,
-      depsFor("second", events, new GatedExporter("second", events), T));
-    await sleep(50);
+      depsFor("second", events, new GatedExporter("second", events), waitingTimings(T, waiting)));
+    await waiting.promise; // the second hook found the lock held
     expect(events).toEqual(["first:read", "first:export with root"]);
 
     gate.resolve();
@@ -279,12 +349,13 @@ describe("dispatch under the session lock", () => {
     const transcript = await transcriptCopy();
     const events: string[] = [];
     const gate = deferred();
+    const exporting = deferred();
 
     const first = dispatch({ transcript_path: transcript, hook_event_name: "Stop" }, config,
-      depsFor("first", events, new GatedExporter("first", events, gate.promise), T));
-    await sleep(50);
+      depsFor("first", events, new GatedExporter("first", events, gate.promise, exporting.resolve), T));
+    await exporting.promise;
     const second = await dispatch({ transcript_path: transcript, hook_event_name: "SubagentStop" }, config,
-      depsFor("second", events, new GatedExporter("second", events), { ...T, waitMs: 50 }));
+      depsFor("second", events, new GatedExporter("second", events), { ...T, waitMs: 0 }));
     expect(second).toEqual({ emitted: 0 });
 
     gate.resolve();
@@ -294,6 +365,61 @@ describe("dispatch under the session lock", () => {
       "first:read", "first:export with root", "first:delivered",
     ]);
     expect(await exists(lockOf(transcript))).toBe(false);
+  });
+
+  it("ends the turn for a Stop whose wait ran out: the holder's next run sends the turn's root", async () => {
+    const transcript = await transcriptCopy("rollout-inprogress.jsonl");
+    const events: string[] = [];
+    const gate = deferred();
+    const exporting = deferred();
+
+    const first = dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config,
+      depsFor("first", events, new GatedExporter("first", events, gate.promise, exporting.resolve), T));
+    await exporting.promise;
+    expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop" }, config,
+      depsFor("second", events, new GatedExporter("second", events), { ...T, waitMs: 0 }))).toEqual({ emitted: 0 });
+
+    gate.resolve();
+    await first;
+    expect(events).toEqual([
+      "first:read", "first:export without root", "first:delivered",
+      "first:read", "first:export with root", "first:delivered",
+    ]);
+  });
+
+  it.each([
+    ["no newer turn has started", false],
+    ["a newer turn has started since", true],
+  ])("lets a Stop left for a later hook end its turn only if %s", async (_label, newerTurn) => {
+    const transcript = await transcriptCopy("rollout-inprogress.jsonl");
+    const events: string[] = [];
+    const gate = deferred();
+    const exporting = deferred();
+
+    const first = dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config,
+      depsFor("first", events, new GatedExporter("first", events, gate.promise, exporting.resolve), { ...T, rerunBudgetMs: 0 }));
+    await exporting.promise;
+    await dispatch({ transcript_path: transcript, hook_event_name: "Stop" }, config,
+      depsFor("second", events, new GatedExporter("second", events), { ...T, waitMs: 0 }));
+    gate.resolve();
+    await first;
+    expect(await exists(pendingOf(transcript))).toBe(true); // left for the session's next hook
+
+    if (newerTurn) {
+      const later = new Date(Date.now() + 60_000).toISOString();
+      await fs.appendFile(transcript, [
+        { timestamp: later, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } },
+        { timestamp: later, type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } },
+        { timestamp: later, type: "event_msg", payload: { type: "user_message", message: "and the hidden ones?" } },
+      ].map((line) => `${JSON.stringify(line)}\n`).join(""));
+    }
+    const next = new ScriptedExporter();
+    await dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config,
+      { buildTracing: (c: Config) => buildTracing(c, next), getGit: async () => ({}), lockTimings: T });
+
+    const sent = ids(next.calls.flat());
+    expect(sent).toContain(ROOT);
+    expect(sent.includes(NEXT_ROOT)).toBe(false);
   });
 
   it("sends nothing once the hook's lock was taken over before it exported", async () => {
@@ -309,5 +435,27 @@ describe("dispatch under the session lock", () => {
 
     expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop" }, config, deps)).toEqual({ emitted: 0 });
     expect(events).toEqual([]);
+  });
+
+  it("sends no further request once the hook's lock is taken over during export, and marks only what was sent", async () => {
+    const transcript = await transcriptCopy();
+    // A request per span; another hook takes the lock over while the first is being sent.
+    const exporter = new ScriptedExporter(() => {
+      writeFileSync(lockOf(transcript), `${process.pid} someone-else`);
+      return OK;
+    });
+    const deps = {
+      buildTracing: (c: Config, stillHeld?: () => Promise<boolean>) => buildTracing(c, exporter, stillHeld),
+      getGit: async () => ({}),
+      lockTimings: T,
+    };
+
+    // The requests held back fail the export, which surfaces from dispatch like any failed export.
+    const failure = await dispatch({ transcript_path: transcript, hook_event_name: "Stop" }, { ...config, maxRequestBytes: 1 }, deps)
+      .then(() => undefined, (error: unknown) => error);
+    expect(String(failure)).toContain("the session lock was taken over");
+    expect(exporter.calls).toHaveLength(1);
+    expect([...(await loadEmittedSpanIds(transcript))]).toEqual(ids(exporter.calls[0]!));
+    expect(await fs.readFile(lockOf(transcript), "utf-8")).toBe(`${process.pid} someone-else`);
   });
 });
