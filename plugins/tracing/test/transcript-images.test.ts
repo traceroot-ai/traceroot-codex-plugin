@@ -52,6 +52,18 @@ describe("prompt images", () => {
     expect(turn.userImages).toBeUndefined();
   });
 
+  it("keeps only PNG, JPEG, GIF and WebP base64 data URLs", () => {
+    const turn = turnOf([userMessage([
+      { type: "input_text", text: "look" },
+      { type: "input_image", image_url: "data:image/svg+xml;base64,PHN2Zy8+" },
+      { type: "input_image", image_url: PNG },
+      { type: "input_image", image_url: "data:image/png,%89PNG" },
+    ])]);
+    expect(turn.userImages).toEqual([PNG]);
+    const svgOnly = turnOf([userMessage([{ type: "input_image", image_url: "data:image/svg+xml;base64,PHN2Zy8+" }])]);
+    expect(svgOnly.userImages).toBeUndefined();
+  });
+
   it("does not add the field to a turn without images", async () => {
     const { turns } = await parseFixture("rollout-basic.jsonl");
     expect("userImages" in turns[0]!).toBe(false);

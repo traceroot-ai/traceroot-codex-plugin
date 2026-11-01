@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { isImageDataUrl } from "./images.js";
 import type {
   EventMsgPayload, ModelStep, ResponseItem, RolloutLine, SessionMeta, SubagentRef, ToolCall, Turn, TurnContextPayload,
 } from "./types.js";
@@ -56,11 +57,11 @@ function messageText(content: unknown): string | undefined {
   return parts.length ? parts.join("") : undefined;
 }
 
-/** Image data URLs among a message's `input_image` content parts. */
+/** Image data URLs, in the formats kept whole, among a message's `input_image` content parts. */
 function messageImages(content: unknown): string[] {
   if (!Array.isArray(content)) return [];
   return (content as Array<{ type?: string; image_url?: unknown }>)
-    .filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && c.image_url.startsWith("data:image/"))
+    .filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && isImageDataUrl(c.image_url))
     .map((c) => c.image_url as string);
 }
 

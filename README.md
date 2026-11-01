@@ -93,7 +93,7 @@ To check a headless setup, run `codex exec --skip-git-repo-check "echo hello" < 
 By default, tool output is cut at `max_chars`, which also cuts any screenshot in it, and images attached to a prompt are left out of the trace. Set `capture_images` to `true` in `~/.codex/traceroot.json` (or `TRACEROOT_CODEX_CAPTURE_IMAGES=true`) to keep them. A project's `.codex/traceroot.json` can't turn this on, so a repository you open can't start sending your screen content. With it on:
 
 - Tool output keeps PNG, JPEG, GIF and WebP images (`data:image/...;base64,` URLs) whole. `max_chars` applies to the text around them.
-- Images attached to a prompt appear in the first model call's input. The turn's input shows `[image: see first model call]` in their place, because the turn is sent again on every hook.
+- Images attached to a prompt, in the same four formats, appear in the first model call's input. The turn's input shows `[image: see first model call]` in their place, because the turn is sent again on every hook.
 - When a tool's output is fed to the next model call, each image in it shows there as `[image: see tool call <call id>]` instead of a second copy. The tool span's metadata carries the matching `call_id`.
 - An image larger than 5 MiB is replaced with `[image omitted: larger than 5 MiB]`. If a span would still be larger than 8 MiB, its largest images are replaced with `[image omitted: span larger than 8 MiB]` until it fits.
 

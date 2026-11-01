@@ -12,7 +12,7 @@ import { attributesBytes } from "../src/size.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
 import { parseRollout, readRollout } from "../src/transcript.js";
 import type { SessionMeta, Turn } from "../src/types.js";
-import { memTracing } from "./helpers.js";
+import { GOLDEN_CONTEXTS, memTracing, readGolden } from "./helpers.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const MiB = 1024 * 1024;
@@ -71,6 +71,17 @@ describe("image capture on: tool output", () => {
     expect(JSON.parse(next)[0].output[1]).toEqual({ type: "input_image", image_url: "[image: see tool call call-shot]" });
   });
 
+  it("keeps the placeholder in the next model call's input after tool text longer than maxChars", () => {
+    const output = [{ type: "input_text", text: "t".repeat(30000) }, { type: "input_image", image_url: imageOf(3000) }];
+    const turn = turnWith({}, output);
+    turn.steps.push({ index: 1, startTime: 3, endTime: 4, usage: { input_tokens: 1 }, toolCalls: [] });
+    const next = attr(planTurnSpans(sessionMeta, turn, { ...on, maxChars: 20000 }).filter((s) => s.kind === "LLM")[1], INPUT);
+    expect(next).not.toContain("data:image");
+    const fed = JSON.parse(next)[0].output;
+    expect(fed[0].text).toMatch(/^t{19986}…\[truncated \d+ chars\]$/);
+    expect(fed[1]).toEqual({ type: "input_image", image_url: "[image: see tool call call-big]" });
+  });
+
   it("cuts long tool text at maxChars but keeps the image after it", () => {
     const output = [{ type: "input_text", text: "t".repeat(30000) }, { type: "input_image", image_url: imageOf(3000) }];
     const tool = planTurnSpans(sessionMeta, turnWith({}, output), { ...on, maxChars: 20000 }).find((s) => s.kind === "TOOL");
@@ -112,6 +123,14 @@ describe("image capture on: prompt images", () => {
     expect(root).not.toContain("data:image");
   });
 
+  it("keeps the turn input's placeholder after a prompt longer than maxChars", () => {
+    const turn = turnWith({ userInput: "q".repeat(30000), userImages: [imageOf(30)] });
+    const [root] = planTurnSpans(sessionMeta, turn, { ...on, maxChars: 20000 });
+    const parsed = JSON.parse(attr(root, INPUT));
+    expect(parsed[0]).toEqual({ type: "input_text", text: `${"q".repeat(19990)}…[truncated 10010 chars]` });
+    expect(parsed[1]).toEqual({ type: "input_image", image_url: FIRST_CALL });
+  });
+
   it("sends an image-only prompt as the image alone", () => {
     const png = imageOf(30);
     const [root, step] = planTurnSpans(
@@ -139,27 +158,16 @@ describe("image capture on: prompt images", () => {
   });
 });
 
-describe("image capture off", () => {
-  const golden = JSON.parse(fs.readFileSync(path.join(fixtures, "spans-golden.json"), "utf-8")) as
-    Record<string, Record<string, unknown>>;
-  const contexts: Record<string, EmitCtx> = {
-    full: {
-      environment: "dev", userId: "user-1", git: { repo: "traceroot-ai/traceroot", ref: "a".repeat(40) },
-      maxChars: 20000, turnEnding: true,
-    },
-    tight: { maxChars: 64 },
-  };
-  const cases = Object.keys(golden).flatMap((f) => Object.keys(contexts).map((c) => [f, c] as const));
+// With capture off, every fixture's spans are pinned by span-output-golden.test.ts.
+describe("image capture on, fixtures without images", () => {
+  const golden = readGolden();
+  const cases = Object.keys(golden).filter((f) => !f.includes("image"))
+    .flatMap((f) => Object.keys(GOLDEN_CONTEXTS).map((c) => [f, c] as const));
 
-  it.each(cases)("%s (%s context) is byte-identical to the pinned output", async (fixture, context) => {
-    const spans = await plan(fixture, { ...contexts[context]!, captureImages: false });
-    expect(JSON.stringify(spans)).toBe(JSON.stringify(golden[fixture]![context]));
-  });
-
-  it.each(cases.filter(([f]) => !f.includes("image")))(
-    "%s (%s context) without images changes only by the tool call ids with capture on",
+  it.each(cases)(
+    "%s (%s context) changes only by the tool call ids",
     async (fixture, context) => {
-      const spans = await plan(fixture, { ...contexts[context]!, captureImages: true });
+      const spans = await plan(fixture, { ...GOLDEN_CONTEXTS[context]!, captureImages: true });
       for (const span of spans.filter((s) => s.kind === "TOOL")) {
         const { call_id, ...rest } = JSON.parse(String(span.attributes["traceroot.span.metadata"]));
         expect(makeSpanId(call_id)).toBe(span.spanId);

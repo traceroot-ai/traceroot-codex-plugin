@@ -1,7 +1,7 @@
 import { ROOT_CONTEXT, type SpanContext, SpanKind, TraceFlags, trace } from "@opentelemetry/api";
 import type { Tracing } from "./exporter.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
-import { capWithImages, fitSpanImages, replaceImages } from "./images.js";
+import { capWithImages, FIRST_CALL_IMAGE, fitSpanImages, replaceImages, toolCallImage } from "./images.js";
 import { SDK_NAME, SDK_VERSION } from "./sdk.js";
 import { mapUsage } from "./tokens.js";
 import type { ModelStep, SessionMeta, ToolCall, Turn } from "./types.js";
@@ -43,7 +43,7 @@ export type EmittableSpan = {
 const str = (v: unknown, max: number): string =>
   truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
 
-/** Span input/output capped at maxChars; with image capture on, images stay whole. */
+/** Span input/output capped at maxChars; with image capture on, images and their placeholders stay whole. */
 const io = (v: unknown, ctx: EmitCtx): string =>
   ctx.captureImages ? capWithImages(v, ctx.maxChars) : str(v, ctx.maxChars);
 
@@ -56,16 +56,12 @@ function promptOf(turn: Turn, ctx: EmitCtx): unknown {
   ];
 }
 
-// The turn span is re-sent on every hook, so it never carries image bytes: its
-// prompt images point at the first model call span, which is sent once.
-const FIRST_CALL_IMAGE = "[image: see first model call]";
-
 /**
  * A tool's output as the next model call is shown it. With image capture on, each
  * image points at the tool span that already holds it instead of being sent twice.
  */
 const fedBackOutput = (tc: ToolCall, ctx: EmitCtx): unknown =>
-  ctx.captureImages ? replaceImages(tc.output, `[image: see tool call ${tc.callId}]`) : tc.output;
+  ctx.captureImages ? replaceImages(tc.output, toolCallImage(tc.callId)) : tc.output;
 
 function commonTrace(attrs: SpanAttrs, sessionMeta: SessionMeta, ctx: EmitCtx): void {
   attrs["traceroot.sdk.name"] = SDK_NAME;
@@ -99,6 +95,8 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
   const rootAttrs: SpanAttrs = { "traceroot.span.type": "AGENT", "traceroot.span.path": [ROOT_NAME] };
   commonTrace(rootAttrs, sessionMeta, ctx);
   const prompt = promptOf(turn, ctx);
+  // The turn span is re-sent on every hook, so it never carries image bytes: its
+  // prompt images point at the first model call span, which is sent once.
   const rootInput = ctx.captureImages ? replaceImages(prompt, FIRST_CALL_IMAGE) : prompt;
   if (rootInput) rootAttrs["traceroot.span.input"] = io(rootInput, ctx);
   if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
@@ -149,8 +147,8 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
     out.push(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input));
     for (const tc of step.toolCalls) out.push(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx));
     if (step.toolCalls.length) {
-      prevToolResults = str(
-        step.toolCalls.map((tc) => ({ name: tc.name, output: fedBackOutput(tc, ctx) })), ctx.maxChars,
+      prevToolResults = io(
+        step.toolCalls.map((tc) => ({ name: tc.name, output: fedBackOutput(tc, ctx) })), ctx,
       );
     }
   }

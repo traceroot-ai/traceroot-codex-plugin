@@ -30017,10 +30017,19 @@ async function markSpanEmitted(rolloutFile, spanId) {
 //#endregion
 //#region src/images.ts
 const IMAGE_DATA_URL = /data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/]+={0,2}/g;
+const WHOLE_IMAGE_DATA_URL = /* @__PURE__ */ new RegExp(`^(?:${IMAGE_DATA_URL.source})$`);
+/** Stands in for a prompt image in the turn span, which is sent again on every hook. */
+const FIRST_CALL_IMAGE = "[image: see first model call]";
+/** Stands in for a tool's image in the next model call's input. */
+const toolCallImage = (callId) => `[image: see tool call ${callId}]`;
+const KEPT = new RegExp(`${IMAGE_DATA_URL.source}|\\[image: see (?:first model call|tool call [^\\]\\s]{1,200})\\]`, "g");
+const SPARE_CHARS_PER_IMAGE = 64;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_SPAN_BYTES = 8 * 1024 * 1024;
 const OVERSIZE_IMAGE = "[image omitted: larger than 5 MiB]";
 const SPAN_TOO_LARGE_IMAGE = "[image omitted: span larger than 8 MiB]";
+/** Whether `s` is exactly one base64 image data URL in a format kept whole. */
+const isImageDataUrl = (s) => WHOLE_IMAGE_DATA_URL.test(s);
 /** Decoded size of a base64 data URL's payload, in bytes. */
 function decodedBytes(dataUrl) {
 	const payload = dataUrl.slice(dataUrl.indexOf(",") + 1);
@@ -30034,18 +30043,28 @@ function mapStrings(value, fn) {
 	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mapStrings(v, fn)]));
 	return value;
 }
-/** Cuts `text` to what is left of the budget, unless the cut marker would be longer than the text it drops. */
+/**
+* Cuts `text` to what is left of the budget, unless the cut marker would be longer
+* than the text it drops. Once the budget is spent, that shorter form comes out of
+* the spare characters, and the text is emptied when they run out.
+*/
 function capText(text, budget) {
 	const cut = truncate(text, budget.left);
-	budget.left = Math.max(0, budget.left - text.length);
-	return cut.length < text.length ? cut : text;
+	const shorter = cut.length < text.length ? cut : text;
+	if (budget.left > 0) {
+		budget.left = Math.max(0, budget.left - text.length);
+		return shorter;
+	}
+	if (shorter.length > budget.spare) return "";
+	budget.spare -= shorter.length;
+	return shorter;
 }
 function capString(s, budget) {
 	let out = "";
 	let at = 0;
-	for (const m of s.matchAll(IMAGE_DATA_URL)) {
-		const image = decodedBytes(m[0]) > MAX_IMAGE_BYTES ? OVERSIZE_IMAGE : m[0];
-		out += capText(s.slice(at, m.index), budget) + image;
+	for (const m of s.matchAll(KEPT)) {
+		const oversize = m[0].startsWith("data:") && decodedBytes(m[0]) > MAX_IMAGE_BYTES;
+		out += capText(s.slice(at, m.index), budget) + (oversize ? OVERSIZE_IMAGE : m[0]);
 		at = m.index + m[0].length;
 	}
 	return out + capText(s.slice(at), budget);
@@ -30062,18 +30081,24 @@ function parseJsonContainer(text) {
 }
 /**
 * Serializes `value` for a span attribute and caps it at `max` characters like
-* the plain cut, but keeps image data URLs whole: only the text counts toward
-* `max`, and strings are cut one by one so JSON stays valid. An image over
-* 5 MiB decoded becomes a placeholder. A value without images is cut exactly
-* as the plain cut does.
+* the plain cut, but keeps image data URLs and the placeholders that point at
+* them whole: only the text counts toward `max`, and strings are cut one by one
+* so JSON stays valid. Once `max` is spent, the strings after it share 64
+* characters per image, so many short strings can't carry the text past `max`.
+* An image over 5 MiB decoded becomes a placeholder. A value without images or
+* placeholders is cut exactly as the plain cut does.
 */
 function capWithImages(value, max) {
 	const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-	if (text.search(IMAGE_DATA_URL) === -1) return truncate(text, max);
-	const budget = { left: max };
+	const kept = text.match(KEPT)?.length ?? 0;
+	if (kept === 0) return truncate(text, max);
+	const budget = {
+		left: max,
+		spare: kept * SPARE_CHARS_PER_IMAGE
+	};
 	const cap = (s) => capString(s, budget);
 	if (typeof value !== "string") return JSON.stringify(mapStrings(value, cap));
-	const parsed = text.replace(IMAGE_DATA_URL, "").length > max ? parseJsonContainer(text) : void 0;
+	const parsed = text.replace(KEPT, "").length > max ? parseJsonContainer(text) : void 0;
 	return parsed === void 0 ? cap(text) : JSON.stringify(mapStrings(parsed, cap));
 }
 /** `value` with every image data URL in it replaced by `placeholder`. */
@@ -30126,7 +30151,7 @@ function mapUsage(u) {
 init_esm$2();
 const ROOT_NAME = "Codex Turn";
 const str = (v, max) => truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
-/** Span input/output capped at maxChars; with image capture on, images stay whole. */
+/** Span input/output capped at maxChars; with image capture on, images and their placeholders stay whole. */
 const io = (v, ctx) => ctx.captureImages ? capWithImages(v, ctx.maxChars) : str(v, ctx.maxChars);
 /** The prompt as the model got it: its text, plus attached images when image capture is on. */
 function promptOf(turn, ctx) {
@@ -30139,12 +30164,11 @@ function promptOf(turn, ctx) {
 		image_url: url
 	}))];
 }
-const FIRST_CALL_IMAGE = "[image: see first model call]";
 /**
 * A tool's output as the next model call is shown it. With image capture on, each
 * image points at the tool span that already holds it instead of being sent twice.
 */
-const fedBackOutput = (tc, ctx) => ctx.captureImages ? replaceImages(tc.output, `[image: see tool call ${tc.callId}]`) : tc.output;
+const fedBackOutput = (tc, ctx) => ctx.captureImages ? replaceImages(tc.output, toolCallImage(tc.callId)) : tc.output;
 function commonTrace(attrs, sessionMeta, ctx) {
 	attrs["traceroot.sdk.name"] = SDK_NAME;
 	attrs["traceroot.sdk.version"] = SDK_VERSION;
@@ -30200,10 +30224,10 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		const input = step.index === 0 ? prompt : prevToolResults;
 		out.push(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input));
 		for (const tc of step.toolCalls) out.push(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx));
-		if (step.toolCalls.length) prevToolResults = str(step.toolCalls.map((tc) => ({
+		if (step.toolCalls.length) prevToolResults = io(step.toolCalls.map((tc) => ({
 			name: tc.name,
 			output: fedBackOutput(tc, ctx)
-		})), ctx.maxChars);
+		})), ctx);
 	}
 	if (ctx.captureImages) for (const span of out) fitSpanImages(span.attributes);
 	return out;
@@ -30399,10 +30423,10 @@ function messageText(content) {
 	const parts = content.filter((c) => typeof c?.text === "string").map((c) => c.text);
 	return parts.length ? parts.join("") : void 0;
 }
-/** Image data URLs among a message's `input_image` content parts. */
+/** Image data URLs, in the formats kept whole, among a message's `input_image` content parts. */
 function messageImages(content) {
 	if (!Array.isArray(content)) return [];
-	return content.filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && c.image_url.startsWith("data:image/")).map((c) => c.image_url);
+	return content.filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && isImageDataUrl(c.image_url)).map((c) => c.image_url);
 }
 const INJECTED_USER_MESSAGE_TAGS = new Set([
 	"environment_context",

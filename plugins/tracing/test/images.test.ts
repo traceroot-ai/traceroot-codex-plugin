@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  capWithImages, decodedBytes, fitSpanImages, MAX_SPAN_BYTES, OVERSIZE_IMAGE, replaceImages, SPAN_TOO_LARGE_IMAGE,
+  capWithImages, decodedBytes, FIRST_CALL_IMAGE, fitSpanImages, isImageDataUrl, MAX_SPAN_BYTES, OVERSIZE_IMAGE,
+  replaceImages, SPAN_TOO_LARGE_IMAGE, toolCallImage,
 } from "../src/images.js";
 import { attributesBytes } from "../src/size.js";
 import { truncate } from "../src/util.js";
@@ -63,6 +64,38 @@ describe("capWithImages", () => {
     expect(parsed[3]).toEqual({ type: "input_image", image_url: PNG });
   });
 
+  it("bounds the text when many short strings follow the spent budget", () => {
+    const value = [...Array.from({ length: 5000 }, () => "ab"), PNG];
+    const parsed = JSON.parse(capWithImages(value, 64)) as string[];
+    expect(parsed).toHaveLength(5001);
+    expect(parsed.at(-1)).toBe(PNG);
+    // 32 strings fill the budget, 32 more take the 64 spare characters of the one
+    // image, and every later string is emptied.
+    expect(parsed.slice(0, 64)).toEqual(Array(64).fill("ab"));
+    expect(parsed.slice(64, 5000).every((s) => s === "")).toBe(true);
+  });
+
+  it("empties strings past the spare characters but still keeps the image", () => {
+    const value = ["a", "b", "c", "d"].map((c) => c.repeat(100));
+    expect(JSON.parse(capWithImages([...value, PNG], 10))).toEqual([
+      `${"a".repeat(10)}…[truncated 90 chars]`,
+      "…[truncated 100 chars]", // 22 of the 64 spare characters
+      "…[truncated 100 chars]", // 44
+      "", // a third marker would pass 64
+      PNG,
+    ]);
+  });
+
+  it.each([
+    ["the first model call", FIRST_CALL_IMAGE],
+    ["a tool call", toolCallImage("call_9f2Kq")],
+  ])("keeps a placeholder pointing at %s whole when the text before it is cut", (_label, placeholder) => {
+    const parsed = JSON.parse(capWithImages(items("t".repeat(30000), placeholder), 20000));
+    expect(parsed[0].text).toBe(`${"t".repeat(19990)}…[truncated 10010 chars]`);
+    expect(parsed[1]).toEqual({ type: "input_image", image_url: placeholder });
+    expect(capWithImages(`${"x".repeat(100)} ${placeholder}`, 20)).toBe(`${"x".repeat(20)}…[truncated 81 chars]${placeholder}`);
+  });
+
   it("keeps the image item when content items arrive as serialized JSON and the text is cut", () => {
     const parsed = JSON.parse(capWithImages(JSON.stringify(items("t".repeat(21000))), 20000));
     expect(parsed).toHaveLength(2);
@@ -102,6 +135,22 @@ describe("capWithImages", () => {
       const url = imageOf(30, mime);
       expect(capWithImages(`${url} ${"z".repeat(50)}`, 10)).toBe(`${url} ${"z".repeat(9)}…[truncated 41 chars]`);
     }
+  });
+});
+
+describe("isImageDataUrl", () => {
+  it.each(["png", "jpeg", "jpg", "gif", "webp"])("accepts a whole base64 %s data URL", (mime) => {
+    expect(isImageDataUrl(imageOf(30, mime))).toBe(true);
+  });
+
+  it.each([
+    ["an SVG data URL", `data:image/svg+xml;base64,${"P".repeat(40)}`],
+    ["a data URL that is not base64", "data:image/png,%89PNG"],
+    ["a remote URL", "https://example.com/a.png"],
+    ["a data URL with text after it", `${PNG} trailing`],
+    ["a data URL with text before it", `see ${PNG}`],
+  ])("rejects %s", (_label, url) => {
+    expect(isImageDataUrl(url)).toBe(false);
   });
 });
 
