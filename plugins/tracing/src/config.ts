@@ -14,7 +14,7 @@ export type Config = {
   failOnError: boolean;
 };
 
-// Default upper bound on the estimated size of one export request. It leaves
+// Default target for the estimated size of one export request. It leaves
 // headroom under the ingest endpoint's request size limit.
 const DEFAULT_MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 

@@ -1,4 +1,4 @@
-import type { Attributes } from "@opentelemetry/api";
+import type { Attributes, TraceState } from "@opentelemetry/api";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 
 // Upper bounds on OTLP protobuf framing: the field tags, length prefixes and
@@ -26,14 +26,18 @@ export function attributesBytes(attributes: Attributes): number {
   return n;
 }
 
+const traceStateBytes = (state: TraceState | undefined): number => utf8Bytes(state?.serialize() ?? "");
+
 /** Estimated size `span` adds to an OTLP protobuf request, never below the real size. */
 export function estimateSpanBytes(span: ReadableSpan): number {
   let n = SPAN_OVERHEAD_BYTES + utf8Bytes(span.name) + utf8Bytes(span.status.message ?? "")
-    + attributesBytes(span.attributes);
+    + traceStateBytes(span.spanContext().traceState) + attributesBytes(span.attributes);
   for (const event of span.events) {
     n += SPAN_OVERHEAD_BYTES + utf8Bytes(event.name) + attributesBytes(event.attributes ?? {});
   }
-  for (const link of span.links) n += SPAN_OVERHEAD_BYTES + attributesBytes(link.attributes ?? {});
+  for (const link of span.links) {
+    n += SPAN_OVERHEAD_BYTES + traceStateBytes(link.context.traceState) + attributesBytes(link.attributes ?? {});
+  }
   return n;
 }
 

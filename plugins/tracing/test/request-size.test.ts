@@ -1,4 +1,5 @@
-import { type Attributes, SpanStatusCode } from "@opentelemetry/api";
+import { type Attributes, ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api";
+import { TraceState } from "@opentelemetry/core";
 import { type ReadableSpan, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
@@ -15,26 +16,38 @@ const { ProtobufTraceSerializer } = createRequire(require.resolve("@opentelemetr
 const requestBytes = (spans: ReadableSpan[]): number => ProtobufTraceSerializer.serializeRequest(spans).length;
 
 const MiB = 1024 * 1024;
+// The longest trace state the W3C format allows: 512 characters.
+const LONGEST_TRACE_STATE = `a=${"x".repeat(254)},b=${"y".repeat(253)}`;
 
 type SpanSpec = {
   name?: string;
   attributes?: Attributes;
   event?: { name: string; attributes: Attributes };
   link?: Attributes;
+  linkTraceState?: string;
   statusMessage?: string;
+  /** Trace state the span takes from its parent. */
+  traceState?: string;
 };
 
 /** Real ReadableSpans built from specs, through the plugin's own tracing setup. */
 async function makeSpans(specs: SpanSpec[]): Promise<ReadableSpan[]> {
   const sink = new ScriptedExporter();
   const tracing = buildTracingWith(new SimpleSpanProcessor(sink), new PrimedIdGenerator());
+  const traceState = (raw?: string) => (raw === undefined ? undefined : new TraceState(raw));
   for (const spec of specs) {
+    const parent = spec.traceState === undefined ? ROOT_CONTEXT : trace.setSpanContext(ROOT_CONTEXT, {
+      traceId: "c".repeat(32), spanId: "d".repeat(16), traceFlags: 1, traceState: traceState(spec.traceState),
+    });
     const span = tracing.tracer.startSpan(spec.name ?? "span", {
       attributes: spec.attributes,
       links: spec.link ? [{
-        context: { traceId: "a".repeat(32), spanId: "b".repeat(16), traceFlags: 1 }, attributes: spec.link,
+        context: {
+          traceId: "a".repeat(32), spanId: "b".repeat(16), traceFlags: 1, traceState: traceState(spec.linkTraceState),
+        },
+        attributes: spec.link,
       }] : [],
-    });
+    }, parent);
     if (spec.event) span.addEvent(spec.event.name, spec.event.attributes);
     if (spec.statusMessage) span.setStatus({ code: SpanStatusCode.ERROR, message: spec.statusMessage });
     span.end();
@@ -60,6 +73,8 @@ describe("estimateSpanBytes", () => {
     ["many small attributes", {
       attributes: Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`attr.${i}`, `value-${i}`])),
     }],
+    ["a trace state of the longest valid length", { traceState: LONGEST_TRACE_STATE }],
+    ["a link with a trace state of the longest valid length", { link: {}, linkTraceState: LONGEST_TRACE_STATE }],
   ];
 
   it.each(specs)("never underestimates the serialized size of %s", async (_label, spec) => {
@@ -78,6 +93,16 @@ describe("estimateSpanBytes", () => {
   it("counts attribute values by their UTF-8 size", () => {
     expect(attributesBytes({ k: "é" }) - attributesBytes({ k: "e" })).toBe(1);
     expect(attributesBytes({})).toBe(0);
+  });
+
+  it("counts the trace state of the span and of each link by its length", async () => {
+    const [bare, own, linkedBare, linked] = await makeSpans([
+      {}, { traceState: LONGEST_TRACE_STATE }, { link: {} }, { link: {}, linkTraceState: LONGEST_TRACE_STATE },
+    ]);
+    expect(own!.spanContext().traceState?.serialize()).toHaveLength(512);
+    expect(linked!.links[0]!.context.traceState?.serialize()).toHaveLength(512);
+    expect(estimateSpanBytes(own!) - estimateSpanBytes(bare!)).toBe(512);
+    expect(estimateSpanBytes(linked!) - estimateSpanBytes(linkedBare!)).toBe(512);
   });
 });
 

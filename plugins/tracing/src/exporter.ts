@@ -62,7 +62,8 @@ export class DeliveryTrackingExporter implements SpanExporter {
 
 /**
  * Sends each export call as sequential requests whose estimated size stays within
- * `maxBytes`, so no single request passes the ingest endpoint's size limit. Each
+ * `maxBytes`, to keep each request under the ingest endpoint's size limit. A span
+ * whose estimate alone passes `maxBytes` is still sent, in a request of its own. Each
  * request goes through `inner` on its own, so a failed request fails only its own
  * spans; the call as a whole reports the first failure, after trying every request.
  */
