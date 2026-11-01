@@ -1,7 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type LockTimings, withSessionLock } from "../src/lock.js";
+import { type HandOff, type LockTimings, type SessionLock, withSessionLock } from "../src/lock.js";
 import { setDebug } from "../src/util.js";
 
 type Op = "open" | "stat" | "readFile" | "writeFile" | "link" | "rename" | "rm";
@@ -40,6 +41,7 @@ afterEach(async () => {
   steps.after = undefined;
   setDebug(false);
   vi.restoreAllMocks();
+  vi.useRealTimers();
   if (dir) await real.rm(dir, { recursive: true, force: true });
 });
 
@@ -49,10 +51,11 @@ async function rolloutPath(): Promise<string> {
 }
 
 const lockOf = (rollout: string) => `${rollout}.traceroot.lock`;
-const pendingOf = (rollout: string) => `${rollout}.traceroot.pending`;
+const breakOf = (rollout: string) => `${lockOf(rollout)}.break`;
+const pendingOf = (rollout: string) => `${rollout}.traceroot.pending.d`;
 const exists = (p: string) => real.access(p).then(() => true, () => false);
 
-/** Another hook's lock, put in place the way the lock module does it: a new file renamed over the path. */
+/** Another hook's lock in place of the one there, as if that hook had removed it and created its own. */
 async function replaceLock(lockPath: string, content: string): Promise<void> {
   await real.writeFile(`${lockPath}.replacement`, content);
   await real.rename(`${lockPath}.replacement`, lockPath);
@@ -99,37 +102,35 @@ describe("withSessionLock under exact interleavings", () => {
     const other = `${process.pid} other`;
 
     await withSessionLock(rollout, async () => {
-      // The next time this hook moves or removes its lock, another hook takes it over just before.
+      // Right before this hook takes the right to remove its lock, another hook that
+      // held it judged the lock stale, removed it and created its own.
       let fired = false;
-      steps.before = async (op, [file]) => {
-        if (fired || (op !== "rm" && op !== "rename") || file !== lockOf(rollout)) return;
+      steps.before = async (op, [, to]) => {
+        if (fired || op !== "link" || to !== breakOf(rollout)) return;
         fired = true;
         await replaceLock(lockOf(rollout), other);
       };
     }, T);
 
     expect(await real.readFile(lockOf(rollout), "utf-8")).toBe(other);
+    expect(await exists(breakOf(rollout))).toBe(false);
   });
 
-  it("puts a lock it moved aside by mistake back over one taken while it was away, so its holder keeps it", async () => {
+  it("releases its lock once the hook holding the right to remove it lets go", async () => {
     const rollout = await rolloutPath();
-    const holder = `${process.pid} holder`;
-    let step = 0;
 
     await withSessionLock(rollout, async () => {
-      steps.before = async (op, [from, to]) => {
-        if (step === 0 && op === "rename" && from === lockOf(rollout)) {
-          step = 1; // taken over just before this hook moves its lock aside to release it
-          await replaceLock(lockOf(rollout), holder);
-        } else if (step === 1 && (op === "rename" || op === "link") && to === lockOf(rollout)) {
-          step = 2; // and a third hook takes the empty path before the lock is put back
-          await real.writeFile(lockOf(rollout), `${process.pid} newcomer`);
-        }
+      let tries = 0;
+      steps.before = async (op, [, to]) => {
+        if (op !== "link" || to !== breakOf(rollout)) return;
+        tries += 1;
+        if (tries === 1) await real.writeFile(breakOf(rollout), `${process.pid} other`); // held by another hook
+        if (tries === 2) await real.rm(breakOf(rollout)); // and let go
       };
     }, T);
 
-    expect(step).toBe(2);
-    expect(await real.readFile(lockOf(rollout), "utf-8")).toBe(holder);
+    expect(await exists(lockOf(rollout))).toBe(false);
+    expect(await exists(breakOf(rollout))).toBe(false);
   });
 
   it("does not remove a live lock that replaced a stale one while this hook was looking at it", async () => {
@@ -144,13 +145,13 @@ describe("withSessionLock under exact interleavings", () => {
     expect(await real.readFile(lockOf(rollout), "utf-8")).toBe(live);
   });
 
-  it("keeps a stale lock whose holder touched it again after this hook judged it stale and before it moved it", async () => {
+  it("keeps a stale lock whose holder touched it again after this hook judged it stale and before it removed it", async () => {
     const rollout = await rolloutPath();
     const holder = `${process.pid} resumed`;
     await staleLock(lockOf(rollout), holder);
     let touched = false;
-    steps.before = async (op, [file]) => {
-      if (touched || op !== "rename" || file !== lockOf(rollout)) return;
+    steps.before = async (op, [, to]) => {
+      if (touched || op !== "link" || to !== breakOf(rollout)) return;
       touched = true;
       await real.utimes(lockOf(rollout), new Date(), new Date());
     };
@@ -161,47 +162,22 @@ describe("withSessionLock under exact interleavings", () => {
     expect(await real.readFile(lockOf(rollout), "utf-8")).toBe(holder);
   });
 
-  it("runs again when its lock was away for a moment, moved aside by a hook that judged an older lock stale", async () => {
+  it("runs again when it could not read its lock for a moment during its run", async () => {
     const rollout = await rolloutPath();
-    await staleLock(lockOf(rollout), `${process.pid} frozen`);
-    const atMove = deferred();
-    const letMove = deferred();
-    const moved = deferred();
-    const checked = deferred();
-    const movedBack = deferred();
-    let movedTo: string | undefined;
-    // The first hook to move the stale lock aside is held back until the second has
-    // broken it, taken the lock and started its run; it then moves the new lock aside.
-    steps.before = async (op, [from, to]) => {
-      if (movedTo !== undefined || op !== "rename" || from !== lockOf(rollout)) return;
-      movedTo = String(to);
-      atMove.resolve();
-      await letMove.promise;
-    };
-    steps.after = async (op, [from, to]) => {
-      if (op !== "rename") return;
-      if (to === movedTo) { moved.resolve(); await checked.promise; }
-      if (from === movedTo && to === lockOf(rollout)) movedBack.resolve();
-    };
-
-    const breaker = withSessionLock(rollout, async () => {}, T);
-    await atMove.promise;
     const held: boolean[] = [];
-    const holder = withSessionLock(rollout, async (lock) => {
-      if (held.length === 0) {
-        letMove.resolve();
-        await moved.promise;
-        held.push(await lock.held()); // the run sees its lock gone and sends nothing
-        checked.resolve();
-        await movedBack.promise;
-        return;
-      }
-      held.push(await lock.held());
-    }, T);
-    await Promise.all([breaker, holder]);
 
-    expect(held[0]).toBe(false);
-    expect(held.slice(1)).toContain(true); // ran again holding its lock
+    await withSessionLock(rollout, async (lock) => {
+      if (held.length === 0) {
+        steps.before = (op, [file]) => {
+          if (op !== "readFile" || file !== lockOf(rollout)) return;
+          steps.before = undefined;
+          throw Object.assign(new Error("EIO"), { code: "EIO" });
+        };
+      }
+      held.push(await lock.held()); // a run that finds its lock gone sends nothing
+    }, T);
+
+    expect(held).toEqual([false, true]);
     expect(await exists(pendingOf(rollout))).toBe(false);
     expect(await exists(lockOf(rollout))).toBe(false);
   });
@@ -246,5 +222,144 @@ describe("withSessionLock under exact interleavings", () => {
     const lines = log.mock.calls.map((args) => args.join(" "));
     expect(lines.some((line) => line.includes("could not ask"))).toBe(true);
     expect(lines.some((line) => line.includes("runs again for this one"))).toBe(false);
+  });
+});
+
+// Which hook a file operation belongs to, so a test can step one hook at every
+// operation it makes while the others run freely.
+const actor = new AsyncLocalStorage<string>();
+const as = <R>(name: string, fn: () => Promise<R>) => actor.run(name, fn);
+
+describe("withSessionLock with one hook stepped at every file operation", () => {
+  it("never lets a newcomer take a live lock while another hook recovers the stale lock it replaced", async () => {
+    const rollout = await rolloutPath();
+    await staleLock(lockOf(rollout), `${process.pid} frozen`);
+    const looked = deferred();
+    const resume = deferred();
+    const running = deferred();
+    const finish = deferred();
+    let inRun = 0;
+    let most = 0;
+    const counted = async (body: () => Promise<void> = async () => {}) => {
+      most = Math.max(most, ++inRun);
+      try { await body(); } finally { inRun -= 1; }
+    };
+    let holderLock: SessionLock | undefined;
+    const heldByHolder: boolean[] = [];
+    let judged = false;
+    let stepping = false;
+    // The breaker looks at the stale lock and pauses while the holder breaks it and
+    // takes the lock. After every later operation of the breaker, the holder must
+    // still hold its lock and a newcomer must not get it.
+    steps.after = async (op, [file]) => {
+      if (actor.getStore() !== "breaker" || stepping) return;
+      if (!judged) {
+        if (op !== "open" || file !== lockOf(rollout)) return;
+        judged = true;
+        looked.resolve();
+        await resume.promise;
+        return;
+      }
+      stepping = true;
+      heldByHolder.push(await as("check", () => holderLock!.held()));
+      await as("newcomer", () => withSessionLock(rollout, () => counted(), T));
+      stepping = false;
+    };
+
+    const breaker = as("breaker", () => withSessionLock(rollout, () => counted(), T));
+    await looked.promise;
+    const holder = as("holder", () => withSessionLock(rollout, (lock) => counted(async () => {
+      if (holderLock) return;
+      holderLock = lock;
+      running.resolve();
+      await finish.promise;
+    }), T));
+    await running.promise;
+    resume.resolve();
+    await breaker;
+    finish.resolve();
+    await holder;
+
+    expect(heldByHolder.length).toBeGreaterThan(0);
+    expect(heldByHolder).not.toContain(false);
+    expect(most).toBe(1);
+    expect(await exists(lockOf(rollout))).toBe(false);
+  });
+
+  it("never removes the lock of a hook that broke the same stale lock first, wherever this one pauses", async () => {
+    for (let pauseAt = 1; ; pauseAt++) {
+      const rollout = await rolloutPath();
+      await staleLock(lockOf(rollout), `${process.pid} frozen`);
+      let inRun = 0;
+      let most = 0;
+      const counted = async (body: () => Promise<void> = async () => {}) => {
+        most = Math.max(most, ++inRun);
+        try { await body(); } finally { inRun -= 1; }
+      };
+      const running = deferred();
+      const finish = deferred();
+      let otherLock: SessionLock | undefined;
+      let other: Promise<unknown> | undefined;
+
+      // Right before this hook's operation number `pauseAt`, another hook breaks the
+      // same stale lock, takes the lock and starts its run, or finds it busy and hands off.
+      let ops = 0;
+      steps.before = async () => {
+        if (actor.getStore() !== "slow" || ++ops !== pauseAt) return;
+        other = as("fast", () => withSessionLock(rollout, (lock) => counted(async () => {
+          if (otherLock) return;
+          otherLock = lock;
+          running.resolve();
+          await finish.promise;
+        }), T));
+        await Promise.race([running.promise, other]);
+      };
+      const slow = as("slow", () => withSessionLock(rollout, () => counted(), T));
+      await slow;
+      steps.before = undefined;
+      const heldAfter = otherLock ? await otherLock.held() : true;
+      finish.resolve();
+      await other;
+      await real.rm(dir, { recursive: true, force: true });
+
+      if (other === undefined) break; // this hook made fewer operations: every point was tried
+      expect(heldAfter, `other hook lost its lock when this one paused before operation ${pauseAt}`).toBe(true);
+      expect(most, `two runs at once when this one paused before operation ${pauseAt}`).toBe(1);
+    }
+  });
+
+  it("serves the latest of two Stops handing off at once, wherever the older one pauses", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    for (let pauseAt = 1; ; pauseAt++) {
+      vi.setSystemTime(performance.timeOrigin + performance.now());
+      const rollout = await rolloutPath();
+      const started = deferred();
+      const gate = deferred();
+      const served: HandOff[] = [];
+      const holder = as("holder", () => withSessionLock(rollout, async (_lock, handOff) => {
+        served.push(handOff);
+        if (served.length === 1) { started.resolve(); await gate.promise; }
+      }, T));
+      await started.promise;
+
+      // Right before the older Stop's operation number `pauseAt`, a newer Stop hands off in full.
+      let ops = 0;
+      let newer: number | undefined;
+      steps.before = async () => {
+        if (actor.getStore() !== "older" || ++ops !== pauseAt) return;
+        vi.setSystemTime(Date.now() + 1_000);
+        newer = Date.now();
+        expect(await as("newer", () => withSessionLock(rollout, async () => {}, T, true))).toBeUndefined();
+      };
+      expect(await as("older", () => withSessionLock(rollout, async () => {}, T, true))).toBeUndefined();
+      steps.before = undefined;
+      gate.resolve();
+      await holder;
+      await real.rm(dir, { recursive: true, force: true });
+
+      if (newer === undefined) break; // the older Stop made fewer operations: every point was tried
+      const turnEnds = served.map((handOff) => handOff.turnEndedAt ?? 0);
+      expect(Math.max(...turnEnds), `newer Stop handed off before the older one's operation ${pauseAt}`).toBe(newer);
+    }
   });
 });

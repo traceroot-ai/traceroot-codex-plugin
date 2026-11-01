@@ -30,8 +30,15 @@ async function rolloutPath(): Promise<string> {
 }
 
 const lockOf = (rollout: string) => `${rollout}.traceroot.lock`;
-const pendingOf = (rollout: string) => `${rollout}.traceroot.pending`;
+const breakOf = (rollout: string) => `${lockOf(rollout)}.break`;
+const pendingOf = (rollout: string) => `${rollout}.traceroot.pending.d`;
 const exists = (p: string) => fs.access(p).then(() => true, () => false);
+/** The requests waiting for a run: their turn ends, or NaN for one that names none. */
+const requestsOf = async (rollout: string) => {
+  const names = await fs.readdir(pendingOf(rollout)).catch(() => []);
+  return Promise.all(names.map(async (name) => Number((await fs.readFile(path.join(pendingOf(rollout), name), "utf-8")) || NaN)));
+};
+const hasRequest = async (rollout: string) => (await requestsOf(rollout)).length > 0;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -116,13 +123,13 @@ describe("withSessionLock", () => {
 
     expect(waiter).toBeUndefined();
     expect(waiterRan).toBe(false);
-    expect(await exists(pendingOf(rollout))).toBe(true);
+    expect(await hasRequest(rollout)).toBe(true);
 
     gate.resolve();
     expect(await holder).toBe(2); // ran again for the hook that handed off
     expect(t.max).toBe(1);
     expect(t.starts[1]).toBeGreaterThan(arrived);
-    expect(await exists(pendingOf(rollout))).toBe(false);
+    expect(await hasRequest(rollout)).toBe(false);
     expect(await exists(lockOf(rollout))).toBe(false);
   });
 
@@ -170,6 +177,7 @@ describe("withSessionLock", () => {
     expect(t.max).toBe(1);
     for (const at of arrivals) expect(t.starts.some((s) => s >= at)).toBe(true);
     expect(await exists(lockOf(rollout))).toBe(false);
+    expect(await exists(breakOf(rollout))).toBe(false);
   });
 
   it.each(["", "partly written"])("does not take over a fresh lock whose content is %j", async (content) => {
@@ -200,6 +208,33 @@ describe("withSessionLock", () => {
 
     expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 0 })).toBe("ran");
     expect(await exists(lockOf(rollout))).toBe(false);
+  });
+
+  it.each<[string, (rollout: string) => Promise<void>]>([
+    ["a hook that exited", async (r) => fs.writeFile(breakOf(r), `${await deadPid()} x`)],
+    ["a live hook past its few seconds", async (r) => {
+      await fs.writeFile(breakOf(r), `${process.pid} frozen`);
+      const old = new Date(Date.now() - 120_000);
+      await fs.utimes(breakOf(r), old, old);
+    }],
+  ])("takes over a stale lock when the right to remove it was left by %s", async (_label, leave) => {
+    const rollout = await rolloutPath();
+    await fs.writeFile(lockOf(rollout), `${await deadPid()} x`);
+    await leave(rollout);
+
+    expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 0 })).toBe("ran");
+    expect(await exists(lockOf(rollout))).toBe(false);
+    expect(await exists(breakOf(rollout))).toBe(false);
+  });
+
+  it("does not remove a stale lock while a live hook holds the right to remove it", async () => {
+    const rollout = await rolloutPath();
+    await fs.writeFile(lockOf(rollout), `${await deadPid()} x`);
+    await fs.writeFile(breakOf(rollout), `${process.pid} removing`);
+
+    expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 0 })).toBeUndefined();
+    expect(await exists(lockOf(rollout))).toBe(true);
+    expect(await fs.readFile(breakOf(rollout), "utf-8")).toBe(`${process.pid} removing`);
   });
 
   it("keeps the lock of a holder that runs past the stale limit, because it keeps touching it", async () => {
@@ -254,7 +289,7 @@ describe("withSessionLock", () => {
     await holder;
 
     expect(served).toHaveLength(2);
-    expect(Number(await fs.readFile(pendingOf(rollout), "utf-8"))).toBe(served[1]!.turnEndedAt);
+    expect(await requestsOf(rollout)).toEqual([served[1]!.turnEndedAt]);
   });
 
   it("asks again for its own turn end when it is a Stop whose lock is taken over", async () => {
@@ -265,17 +300,29 @@ describe("withSessionLock", () => {
       await fs.writeFile(lockOf(rollout), `${process.pid} someone-else`);
     }, T, true);
 
-    expect(Number(await fs.readFile(pendingOf(rollout), "utf-8"))).toBeGreaterThanOrEqual(arrived);
+    const [request] = await requestsOf(rollout);
+    expect(request).toBeGreaterThanOrEqual(arrived);
   });
 
-  it("keeps a waiting request that names a later turn end than the Stop handing off", async () => {
+  it("leaves a waiting request in place when a Stop hands off, and the run claiming both gets the later turn end", async () => {
     const rollout = await rolloutPath();
-    await fs.writeFile(lockOf(rollout), `${process.pid} holder`);
-    const later = String(Date.now() + 60_000);
-    await fs.writeFile(pendingOf(rollout), later);
+    const started = deferred();
+    const gate = deferred();
+    const served: HandOff[] = [];
+    const holder = withSessionLock(rollout, async (_lock, handOff) => {
+      served.push(handOff);
+      if (served.length === 1) { started.resolve(); await gate.promise; }
+    }, T);
+    await started.promise;
+    const later = Date.now() + 60_000;
+    await fs.mkdir(pendingOf(rollout));
+    await fs.writeFile(path.join(pendingOf(rollout), "waiting"), String(later));
 
     expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true)).toBeUndefined();
-    expect(await fs.readFile(pendingOf(rollout), "utf-8")).toBe(later);
+    expect(await requestsOf(rollout)).toHaveLength(2);
+    gate.resolve();
+    await holder;
+    expect(served.map((handOff) => handOff.turnEndedAt)).toEqual([undefined, later]);
   });
 
   it("leaves a handed-off run for the next hook once the holder has used its rerun budget", async () => {
@@ -295,7 +342,7 @@ describe("withSessionLock", () => {
     await holder;
 
     expect(holderRuns).toBe(1);
-    expect(await exists(pendingOf(rollout))).toBe(true);
+    expect(await hasRequest(rollout)).toBe(true);
   });
 
   it("counts the time it waited for the lock against its rerun budget", async () => {
@@ -319,7 +366,7 @@ describe("withSessionLock", () => {
     });
 
     expect(runs).toBe(1);
-    expect(await exists(pendingOf(rollout))).toBe(true); // left for the session's next hook
+    expect(await hasRequest(rollout)).toBe(true); // left for the session's next hook
   });
 
   it("releases the lock when the run throws, and passes the error on", async () => {
@@ -471,7 +518,7 @@ describe("dispatch under the session lock", () => {
       depsFor("second", events, new GatedExporter("second", events), { ...T, waitMs: 0 }));
     gate.resolve();
     await first;
-    expect(await exists(pendingOf(transcript))).toBe(true); // left for the session's next hook
+    expect(await hasRequest(transcript)).toBe(true); // left for the session's next hook
 
     if (newerTurn) {
       const later = new Date(Date.now() + 60_000).toISOString();
@@ -525,6 +572,6 @@ describe("dispatch under the session lock", () => {
     expect(exporter.calls).toHaveLength(1);
     expect([...(await loadEmittedSpanIds(transcript))]).toEqual(ids(exporter.calls[0]!));
     expect(await fs.readFile(lockOf(transcript), "utf-8")).toBe(`${process.pid} someone-else`);
-    expect(await exists(pendingOf(transcript))).toBe(true); // the rest is sent by a run of the hook holding the lock
+    expect(await hasRequest(transcript)).toBe(true); // the rest is sent by a run of the hook holding the lock
   });
 });
