@@ -12,6 +12,7 @@ export type Config = {
   maxRequestBytes: number;
   debug: boolean;
   failOnError: boolean;
+  captureImages: boolean;
 };
 
 // Default target for the estimated size of one export request. It leaves
@@ -68,6 +69,9 @@ export async function getConfig(cwd: string = process.cwd()): Promise<Config> {
     ),
     debug: truthy(envFirst("TRACEROOT_CODEX_DEBUG") ?? j.debug),
     failOnError: truthy(envFirst("TRACEROOT_CODEX_FAIL_ON_ERROR") ?? j.fail_on_error),
+    // Like the credential, only env or the GLOBAL config can turn this on: a
+    // checked-in project config must not start uploading screenshots.
+    captureImages: truthy(envFirst("TRACEROOT_CODEX_CAPTURE_IMAGES") ?? globalJson.capture_images),
     enabled: false,
   };
   config.enabled = truthy(enabledFlag) && Boolean(apiKey);

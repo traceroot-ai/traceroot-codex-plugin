@@ -17,7 +17,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.join(here, "fixtures");
 
 const config: Config = {
-  enabled: true, apiKey: "tr-x", hostUrl: "http://x", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: true,
+  enabled: true, apiKey: "tr-x", hostUrl: "http://x", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: true, captureImages: false,
 };
 
 let tmpDir: string;

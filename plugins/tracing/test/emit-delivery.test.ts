@@ -14,7 +14,7 @@ import { ids, OK, ScriptedExporter } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const config: Config = {
-  enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: true,
+  enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: true, captureImages: false,
 };
 
 // rollout-basic.jsonl plans one completed turn: root AGENT, one LLM step, one TOOL.

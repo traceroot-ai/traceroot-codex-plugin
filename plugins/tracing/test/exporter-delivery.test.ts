@@ -7,7 +7,7 @@ import { PrimedIdGenerator } from "../src/ids.js";
 import { failed, ids, OK, ScriptedExporter } from "./helpers.js";
 
 const config: Config = {
-  enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: false,
+  enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: false, captureImages: false,
 };
 
 /** Ends one span per id through `tracing`, with the id primed like emitSpan does. */

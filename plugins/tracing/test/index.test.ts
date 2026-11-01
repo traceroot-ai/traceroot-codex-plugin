@@ -27,6 +27,7 @@ const baseConfig: Config = {
   maxRequestBytes: 12 * 1024 * 1024,
   debug: false,
   failOnError: false,
+  captureImages: false,
 };
 const disabledConfig: Config = { ...baseConfig, enabled: false };
 const enabledConfig: Config = { ...baseConfig, enabled: true };

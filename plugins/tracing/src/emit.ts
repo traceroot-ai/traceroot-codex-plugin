@@ -137,6 +137,7 @@ export async function dispatch(
   const git = await getGit(cwd).catch(() => ({}));
   const ctx: EmitCtx = {
     environment: config.environment, userId: config.userId, git, maxChars: config.maxChars, turnEnding,
+    captureImages: config.captureImages,
   };
 
   const already = await loadEmittedSpanIds(transcript);
