@@ -1,7 +1,7 @@
 import type { ExportResult } from "@opentelemetry/core";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,8 +29,22 @@ async function rolloutPath(): Promise<string> {
   return path.join(dir, "rollout.jsonl");
 }
 
-const lockOf = (rollout: string) => `${rollout}.traceroot.lock`;
-const breakOf = (rollout: string) => `${lockOf(rollout)}.break`;
+const lockOf = (rollout: string) => `${rollout}.traceroot.lock.d`;
+/** The owners in the lock: the names in its directory. */
+const ownersOf = async (rollout: string) => fs.readdir(lockOf(rollout)).catch(() => []);
+/** Leaves a lock whose only owner is `owner`, last touched `ageMs` ago. */
+async function leaveLock(rollout: string, owner: string, ageMs = 0): Promise<void> {
+  await fs.mkdir(lockOf(rollout), { recursive: true });
+  await fs.writeFile(path.join(lockOf(rollout), owner), owner);
+  const at = new Date(Date.now() - ageMs);
+  await fs.utimes(path.join(lockOf(rollout), owner), at, at);
+}
+/** Another hook takes the lock over: the current owner's entry is gone and `owner` is in its place. */
+function takeOver(rollout: string, owner: string): void {
+  mkdirSync(lockOf(rollout), { recursive: true });
+  for (const name of readdirSync(lockOf(rollout))) rmSync(path.join(lockOf(rollout), name), { force: true });
+  writeFileSync(path.join(lockOf(rollout), owner), owner);
+}
 const pendingOf = (rollout: string) => `${rollout}.traceroot.pending.d`;
 const exists = (p: string) => fs.access(p).then(() => true, () => false);
 /** The requests waiting for a run: their turn ends, or NaN for one that names none. */
@@ -177,64 +191,32 @@ describe("withSessionLock", () => {
     expect(t.max).toBe(1);
     for (const at of arrivals) expect(t.starts.some((s) => s >= at)).toBe(true);
     expect(await exists(lockOf(rollout))).toBe(false);
-    expect(await exists(breakOf(rollout))).toBe(false);
   });
 
-  it.each(["", "partly written"])("does not take over a fresh lock whose content is %j", async (content) => {
+  it.each([
+    ["names no process", "partly-written"],
+    ["names a live process", `${process.pid}.other`],
+  ])("does not take over a fresh lock whose owner %s", async (_label, owner) => {
     const rollout = await rolloutPath();
-    await fs.writeFile(lockOf(rollout), content);
+    await leaveLock(rollout, owner);
     let ran = false;
 
     expect(await withSessionLock(rollout, async () => { ran = true; }, { ...T, waitMs: 0 })).toBeUndefined();
     expect(ran).toBe(false);
-    expect(await fs.readFile(lockOf(rollout), "utf-8")).toBe(content);
+    expect(await ownersOf(rollout)).toEqual([owner]);
   });
 
   it.each<[string, (rollout: string) => Promise<void>]>([
-    ["an exited holder", async (r) => fs.writeFile(lockOf(r), `${await deadPid()} x`)],
-    ["unreadable content older than the stale limit", async (r) => {
-      await fs.writeFile(lockOf(r), "");
-      const old = new Date(Date.now() - 120_000);
-      await fs.utimes(lockOf(r), old, old);
-    }],
-    ["a live holder silent past the stale limit", async (r) => {
-      await fs.writeFile(lockOf(r), `${process.pid} frozen`);
-      const old = new Date(Date.now() - 120_000);
-      await fs.utimes(lockOf(r), old, old);
-    }],
+    ["an exited holder", async (r) => leaveLock(r, `${await deadPid()}.x`)],
+    ["an owner naming no process, older than the stale limit", async (r) => leaveLock(r, "partly-written", 120_000)],
+    ["a live holder silent past the stale limit", async (r) => leaveLock(r, `${process.pid}.frozen`, 120_000)],
+    ["a hook that died while releasing it, emptied", async (r) => { await fs.mkdir(lockOf(r)); }],
   ])("takes over a lock left by %s", async (_label, leave) => {
     const rollout = await rolloutPath();
     await leave(rollout);
 
     expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 0 })).toBe("ran");
     expect(await exists(lockOf(rollout))).toBe(false);
-  });
-
-  it.each<[string, (rollout: string) => Promise<void>]>([
-    ["a hook that exited", async (r) => fs.writeFile(breakOf(r), `${await deadPid()} x`)],
-    ["a live hook past its few seconds", async (r) => {
-      await fs.writeFile(breakOf(r), `${process.pid} frozen`);
-      const old = new Date(Date.now() - 120_000);
-      await fs.utimes(breakOf(r), old, old);
-    }],
-  ])("takes over a stale lock when the right to remove it was left by %s", async (_label, leave) => {
-    const rollout = await rolloutPath();
-    await fs.writeFile(lockOf(rollout), `${await deadPid()} x`);
-    await leave(rollout);
-
-    expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 0 })).toBe("ran");
-    expect(await exists(lockOf(rollout))).toBe(false);
-    expect(await exists(breakOf(rollout))).toBe(false);
-  });
-
-  it("does not remove a stale lock while a live hook holds the right to remove it", async () => {
-    const rollout = await rolloutPath();
-    await fs.writeFile(lockOf(rollout), `${await deadPid()} x`);
-    await fs.writeFile(breakOf(rollout), `${process.pid} removing`);
-
-    expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 0 })).toBeUndefined();
-    expect(await exists(lockOf(rollout))).toBe(true);
-    expect(await fs.readFile(breakOf(rollout), "utf-8")).toBe(`${process.pid} removing`);
   });
 
   it("keeps the lock of a holder that runs past the stale limit, because it keeps touching it", async () => {
@@ -247,9 +229,11 @@ describe("withSessionLock", () => {
     const holder = withSessionLock(rollout, () => run(async () => { started.resolve(); await gate.promise; }), timings);
     await started.promise;
     // Age the lock as if the holder had run past the stale limit, then wait for its next touch.
+    const [owner] = await ownersOf(rollout);
+    const entry = path.join(lockOf(rollout), owner!);
     const old = Date.now() - 120_000;
-    await fs.utimes(lockOf(rollout), old / 1000, old / 1000);
-    await until(async () => (await fs.stat(lockOf(rollout))).mtimeMs > old + 60_000, "the holder to touch its lock");
+    await fs.utimes(entry, old / 1000, old / 1000);
+    await until(async () => (await fs.stat(entry)).mtimeMs > old + 60_000, "the holder to touch its lock");
 
     expect(await withSessionLock(rollout, () => run(async () => {}), { ...timings, waitMs: 0 })).toBeUndefined();
     gate.resolve();
@@ -264,12 +248,12 @@ describe("withSessionLock", () => {
 
     await withSessionLock(rollout, async (lock) => {
       seen.push(await lock.held());
-      await fs.writeFile(lockOf(rollout), `${process.pid} someone-else`);
+      takeOver(rollout, `${process.pid}.someone-else`);
       seen.push(await lock.held());
     }, T);
 
     expect(seen).toEqual([true, false]);
-    expect(await fs.readFile(lockOf(rollout), "utf-8")).toBe(`${process.pid} someone-else`);
+    expect(await ownersOf(rollout)).toEqual([`${process.pid}.someone-else`]);
   });
 
   it("asks again for the turn end it was serving when its lock is taken over during the run", async () => {
@@ -281,7 +265,7 @@ describe("withSessionLock", () => {
     const holder = withSessionLock(rollout, async (_lock, handOff) => {
       served.push(handOff);
       if (served.length === 1) { started.resolve(); await gate.promise; return; }
-      await fs.writeFile(lockOf(rollout), `${process.pid} someone-else`); // taken over while serving the Stop
+      takeOver(rollout, `${process.pid}.someone-else`); // taken over while serving the Stop
     }, T);
     await started.promise;
     expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true)).toBeUndefined();
@@ -297,7 +281,7 @@ describe("withSessionLock", () => {
     const arrived = Date.now();
 
     await withSessionLock(rollout, async () => {
-      await fs.writeFile(lockOf(rollout), `${process.pid} someone-else`);
+      takeOver(rollout, `${process.pid}.someone-else`);
     }, T, true);
 
     const [request] = await requestsOf(rollout);
@@ -543,7 +527,7 @@ describe("dispatch under the session lock", () => {
     const deps = {
       ...depsFor("first", events, new GatedExporter("first", events), T),
       getGit: async () => {
-        await fs.writeFile(lockOf(transcript), `${process.pid} someone-else`);
+        takeOver(transcript, `${process.pid}.someone-else`);
         return {};
       },
     };
@@ -556,7 +540,7 @@ describe("dispatch under the session lock", () => {
     const transcript = await transcriptCopy();
     // A request per span; another hook takes the lock over while the first is being sent.
     const exporter = new ScriptedExporter(() => {
-      writeFileSync(lockOf(transcript), `${process.pid} someone-else`);
+      takeOver(transcript, `${process.pid}.someone-else`);
       return OK;
     });
     const deps = {
@@ -571,7 +555,7 @@ describe("dispatch under the session lock", () => {
     expect(String(failure)).toContain("the session lock was taken over");
     expect(exporter.calls).toHaveLength(1);
     expect([...(await loadEmittedSpanIds(transcript))]).toEqual(ids(exporter.calls[0]!));
-    expect(await fs.readFile(lockOf(transcript), "utf-8")).toBe(`${process.pid} someone-else`);
+    expect(await ownersOf(transcript)).toEqual([`${process.pid}.someone-else`]);
     expect(await hasRequest(transcript)).toBe(true); // the rest is sent by a run of the hook holding the lock
   });
 });

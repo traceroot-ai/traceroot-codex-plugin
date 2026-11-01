@@ -6,9 +6,9 @@ import { debugLog } from "./util.js";
 export type LockTimings = {
   /** How long a hook waits for the session's lock before handing its run to the holder. */
   waitMs: number;
-  /** A lock file untouched for this long was left by a hook that died or froze. */
+  /** A lock untouched for this long was left by a hook that died or froze. */
   staleMs: number;
-  /** How often the holder touches its lock file; well under staleMs. */
+  /** How often the holder touches its lock; well under staleMs. */
   heartbeatMs: number;
   /** The holder runs again for hooks that handed it their run only while it has run less than this. */
   rerunBudgetMs: number;
@@ -23,13 +23,6 @@ export type LockTimings = {
 const DEFAULT_TIMINGS: LockTimings = {
   waitMs: 10_000, staleMs: 30_000, heartbeatMs: 5_000, rerunBudgetMs: 15_000, pollMs: 50,
 };
-
-// The right to remove the lock file is held for a few file operations only, so one
-// held this long was left by a hook that died or froze holding it.
-const BREAKER_STALE_MS = 5_000;
-const BREAKER_POLL_MS = 5;
-// A holder waits up to about a second for that right to release its lock.
-const RELEASE_WAITS = 200;
 
 export type SessionLock = {
   /** Whether this hook still holds the session's lock. Check it right before exporting. */
@@ -54,105 +47,81 @@ function isAlive(pid: number): boolean {
   }
 }
 
-type LockFile = { content: string; mtimeMs: number; dev: number; ino: number };
+/*
+ * The lock is a directory next to the rollout holding one entry, its owner, named
+ * for that one acquisition (`<pid>.<uuid>`). It is filled under a temporary name
+ * and renamed into place, so it never exists without its owner. Nothing ever
+ * deletes a name another live hook could own:
+ *   - an owner entry is removed by its unique name, by its holder on release or by
+ *     a hook that found its holder gone, so it can never remove a later holder's;
+ *   - the directory is removed only with rmdir, which the system refuses while
+ *     the directory holds an owner, and a new lock replaces it only while empty.
+ */
 
-/** A lock file's content, age and identity, all read through one handle so they come from the same file. */
-async function inspect(file: string): Promise<LockFile | undefined> {
-  let handle: fs.FileHandle | undefined;
-  try {
-    handle = await fs.open(file, "r");
-    const { mtimeMs, dev, ino } = await handle.stat();
-    return { content: await handle.readFile("utf-8"), mtimeMs, dev, ino };
-  } catch {
-    return undefined;
-  } finally {
-    await handle?.close().catch(() => {});
-  }
-}
+type Owner = { name: string; mtimeMs: number };
 
-/** Whether the lock's holder is gone: exited, or silent past staleMs. */
-function isStale(lock: LockFile, staleMs: number): boolean {
-  // A live holder touches the file every heartbeat, so only an old file is judged
-  // by age; content that doesn't parse is judged by age alone.
-  if (Date.now() - lock.mtimeMs > staleMs) return true;
-  const pid = Number(lock.content.split(" ")[0]);
+const newOwner = () => `${process.pid}.${randomUUID()}`;
+
+/** Whether an owner is gone: its process exited, or it has been silent past staleMs. */
+function isStale(owner: Owner, staleMs: number): boolean {
+  // A live holder touches its entry every heartbeat, so only an old entry is judged
+  // by age; a name that carries no pid is judged by age alone.
+  if (Date.now() - owner.mtimeMs > staleMs) return true;
+  const pid = Number(owner.name.split(".")[0]);
   return Number.isInteger(pid) && pid > 0 && !isAlive(pid);
 }
 
-/** Creates the lock holding `token`. It is written in full first, so a lock file is never seen empty. */
-async function tryCreate(lockPath: string, token: string): Promise<"created" | "exists" | Error> {
-  const tmp = `${lockPath}.${randomUUID()}.tmp`;
+async function ownerAt(lockDir: string, name: string): Promise<Owner | undefined> {
+  const stat = await fs.stat(path.join(lockDir, name)).catch(() => undefined);
+  return stat && { name, mtimeMs: stat.mtimeMs };
+}
+
+/** The owners in the lock directory, or undefined if it can't be read. */
+async function ownersOf(lockDir: string): Promise<Owner[] | undefined> {
+  const names = await fs.readdir(lockDir).catch(() => undefined);
+  if (!names) return undefined;
+  const owners: Owner[] = [];
+  for (const name of names) {
+    const owner = await ownerAt(lockDir, name);
+    if (owner) owners.push(owner); // gone meanwhile: nothing to judge
+  }
+  return owners;
+}
+
+/** Creates the lock with `owner` in it, in one rename. */
+async function tryCreate(lockDir: string, owner: string): Promise<"created" | "exists" | Error> {
+  const staging = `${lockDir}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(tmp, token);
-    await fs.link(tmp, lockPath); // fails with EEXIST if the lock is there
+    await fs.mkdir(staging);
+    await fs.writeFile(path.join(staging, owner), owner);
+    await fs.rename(staging, lockDir); // fails while another lock is there; replaces an empty one
     return "created";
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EEXIST" ? "exists" : (error as Error);
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOTEMPTY" || code === "EEXIST") return "exists";
+    // Some systems refuse to rename over any directory: what counts is whether a lock is there.
+    return (await fs.lstat(lockDir).then(() => true, () => false)) ? "exists" : (error as Error);
   } finally {
-    await fs.rm(tmp, { force: true });
+    await fs.rm(staging, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-const sameFile = (a: LockFile, b: LockFile) => a.dev === b.dev && a.ino === b.ino && a.content === b.content;
-
-/**
- * Takes `breakPath`, the right to remove the lock file, created whole like the
- * lock itself, waiting for it up to `waits` times. One left by a hook that exited,
- * or held past BREAKER_STALE_MS, is removed and taken.
- */
-async function takeBreaker(breakPath: string, token: string, waits: number): Promise<boolean> {
-  for (let attempt = 0; attempt <= waits; attempt++) {
-    if (attempt > 0) await sleep(BREAKER_POLL_MS);
-    const created = await tryCreate(breakPath, token);
-    if (created === "created") return true;
-    if (created instanceof Error) return false;
-    const seen = await inspect(breakPath);
-    if (seen && isStale(seen, BREAKER_STALE_MS)) {
-      await fs.rm(breakPath, { force: true }).catch(() => {});
-      if ((await tryCreate(breakPath, token)) === "created") return true;
-    }
-  }
-  return false;
-}
-
-async function dropBreaker(breakPath: string, token: string): Promise<void> {
-  if ((await fs.readFile(breakPath, "utf-8").catch(() => "")) !== token) return;
-  await fs.rm(breakPath, { force: true }).catch(() => {}); // left behind, it is stale once this hook exits
-}
-
-/**
- * Removes the lock file only if `isIt` holds for it, checked and removed in place
- * while holding `<lock>.break`. Every removal of the lock, a stale one's or a
- * holder's own, holds it, and a new lock is only ever created where none is, so
- * the file checked is the file removed: no other hook can remove it and create
- * its own in between. The lock path is never empty while a live hook holds it.
- */
-async function removeLockIf(
-  lockPath: string, token: string, isIt: (lock: LockFile) => boolean, waits: number,
-): Promise<boolean> {
-  const breakPath = `${lockPath}.break`;
-  if (!(await takeBreaker(breakPath, token, waits))) return false;
-  try {
-    const lock = await inspect(lockPath);
-    if (!lock || !isIt(lock)) return false;
-    return await fs.rm(lockPath, { force: true }).then(() => true, () => false);
-  } finally {
-    await dropBreaker(breakPath, token);
-  }
-}
-
-/** One attempt to take the lock, breaking a stale one on the way. */
-async function tryLock(lockPath: string, token: string, staleMs: number): Promise<"held" | "busy" | Error> {
+/** One attempt to take the lock as `owner`, removing one whose holder is gone on the way. */
+async function tryLock(lockDir: string, owner: string, staleMs: number): Promise<"held" | "busy" | Error> {
   for (;;) {
-    const created = await tryCreate(lockPath, token);
-    if (created === "created") return "held";
-    if (created instanceof Error) return created;
-    const seen = await inspect(lockPath);
-    if (!seen || !isStale(seen, staleMs)) return "busy";
-    // Judged again before removal: the file may have been replaced, or touched by
-    // a holder that resumed, since it was first looked at.
-    const broken = await removeLockIf(lockPath, token, (lock) => sameFile(lock, seen) && isStale(lock, staleMs), 0);
-    if (!broken) return "busy";
+    const created = await tryCreate(lockDir, owner);
+    if (created !== "exists") return created === "created" ? "held" : created;
+    const owners = await ownersOf(lockDir);
+    if (!owners || owners.some((seen) => !isStale(seen, staleMs))) return "busy";
+    // Each entry is judged again right before it goes: a holder that resumed may
+    // have touched it since. A directory left empty is removed the same way.
+    for (const { name } of owners) {
+      const now = await ownerAt(lockDir, name);
+      if (now && !isStale(now, staleMs)) return "busy";
+      await fs.rm(path.join(lockDir, name), { recursive: true, force: true }).catch(() => {});
+    }
+    // Refused if another hook has taken the lock since: then it is busy.
+    if (!(await fs.rmdir(lockDir).then(() => true, () => false))) return "busy";
   }
 }
 
@@ -225,14 +194,14 @@ async function claimRequests(pendingDir: string): Promise<HandOff> {
 type Acquired = "held" | "handed-off" | "not-handed-off" | "unlocked";
 
 async function acquire(
-  lockPath: string, pendingDir: string, token: string, turnEndedAt: number | undefined, t: LockTimings,
+  lockDir: string, pendingDir: string, owner: string, turnEndedAt: number | undefined, t: LockTimings,
 ): Promise<Acquired> {
   const deadline = Date.now() + t.waitMs;
   // Failing open is for a lock that can't be created at all: once another hook was
   // seen holding it, an error creating it is no reason to run alongside that hook.
   let seenHeld = false;
   const attemptLock = async () => {
-    const attempt = await tryLock(lockPath, token, t.staleMs);
+    const attempt = await tryLock(lockDir, owner, t.staleMs);
     seenHeld ||= attempt === "busy";
     return attempt instanceof Error && seenHeld ? "busy" : attempt;
   };
@@ -256,16 +225,16 @@ async function acquire(
 }
 
 /**
- * Runs `run` while holding the session's lock, a file next to the rollout, so
+ * Runs `run` while holding the session's lock, a directory next to the rollout, so
  * hooks of one session (a subagent's SubagentStop beside the parent's own hooks,
  * say) read the rollout, export and record what they sent one at a time.
  *
  * A hook that can't get the lock within `waitMs` never runs on its own: it leaves
  * a request and returns undefined, and the holder runs again, reading the rollout
  * as it is then. A hook that `endsTurn` says so in its request, and the run that
- * serves it is told when it arrived. The holder keeps its lock file fresh while it
- * runs, so it is taken over only if it exits or freezes, and `run` checks `held()`
- * before exporting so a frozen holder that resumes sends nothing.
+ * serves it is told when it arrived. The holder keeps its entry in the lock fresh
+ * while it runs, so it is taken over only if it exits or freezes, and `run` checks
+ * `held()` before exporting so a frozen holder that resumes sends nothing.
  */
 export async function withSessionLock<T>(
   rolloutFile: string,
@@ -275,11 +244,13 @@ export async function withSessionLock<T>(
 ): Promise<T | undefined> {
   // The rerun budget counts from here, so the time spent waiting for the lock is part of it.
   const started = Date.now();
-  const lockPath = `${rolloutFile}.traceroot.lock`;
+  const lockDir = `${rolloutFile}.traceroot.lock.d`;
   const pendingDir = `${rolloutFile}.traceroot.pending.d`;
-  const token = `${process.pid} ${randomUUID()}`;
+  // A new name for every time this hook takes the lock, so a hook that judged an
+  // earlier holding stale can never remove a later one.
+  let owner = newOwner();
   const turnEndedAt = endsTurn ? started : undefined;
-  const acquired = await acquire(lockPath, pendingDir, token, turnEndedAt, timings);
+  const acquired = await acquire(lockDir, pendingDir, owner, turnEndedAt, timings);
   if (acquired === "handed-off") {
     debugLog("another hook of this session holds the lock; it runs again for this one");
     return undefined;
@@ -290,21 +261,23 @@ export async function withSessionLock<T>(
   }
   if (acquired === "unlocked") return run({ held: async () => true }, {});
 
+  const ownerPath = () => path.join(lockDir, owner);
   // Whether the lock was found gone, or unreadable, at any point of the current run.
   let lostInRun = false;
   const lock: SessionLock = {
     held: async () => {
-      const mine = (await fs.readFile(lockPath, "utf-8").catch(() => "")) === token;
+      const mine = (await fs.readFile(ownerPath(), "utf-8").catch(() => "")) === owner;
       lostInRun ||= !mine;
       return mine;
     },
   };
   const release = async () => {
-    if (await lock.held()) await removeLockIf(lockPath, token, (mine) => mine.content === token, RELEASE_WAITS);
+    await fs.rm(ownerPath(), { force: true }).catch(() => {});
+    await fs.rmdir(lockDir).catch(() => {}); // refused once another hook holds it
   };
   const heartbeat = setInterval(() => {
     void lock.held().then((mine) => {
-      if (mine) return fs.utimes(lockPath, new Date(), new Date());
+      if (mine) return fs.utimes(ownerPath(), new Date(), new Date());
     }).catch(() => {});
   }, timings.heartbeatMs);
   heartbeat.unref();
@@ -334,7 +307,8 @@ export async function withSessionLock<T>(
       // release. Then either it takes the lock itself, or this hook takes it back.
       await release();
       if (!(await hasRequests(pendingDir)) || !budgetLeft()) return result;
-      if ((await tryLock(lockPath, token, timings.staleMs)) !== "held") return result;
+      owner = newOwner();
+      if ((await tryLock(lockDir, owner, timings.staleMs)) !== "held") return result;
       debugLog("running again for a hook that asked while this one released");
     }
   } finally {
