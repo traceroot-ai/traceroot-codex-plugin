@@ -11,6 +11,7 @@ import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import type { Config } from "./config.js";
 import { PrimedIdGenerator } from "./ids.js";
 import { SDK_NAME, SDK_VERSION } from "./sdk.js";
+import { splitBySize } from "./size.js";
 
 export type Tracing = {
   tracer: Tracer;
@@ -19,6 +20,17 @@ export type Tracing = {
   delivered: ReadonlySet<string>;
   shutdown: () => Promise<void>;
 };
+
+/** One export call; a throwing exporter is reported as a failed export. */
+function exportSafely(
+  exporter: SpanExporter, spans: ReadableSpan[], resultCallback: (result: ExportResult) => void,
+): void {
+  try {
+    exporter.export(spans, resultCallback);
+  } catch (error) {
+    resultCallback({ code: ExportResultCode.FAILED, error: error instanceof Error ? error : new Error(String(error)) });
+  }
+}
 
 /**
  * Passes spans through to `inner` and records the ids of every span whose export
@@ -31,17 +43,12 @@ export class DeliveryTrackingExporter implements SpanExporter {
   constructor(private readonly inner: SpanExporter) {}
 
   export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    const done = (result: ExportResult): void => {
+    exportSafely(this.inner, spans, (result) => {
       if (result.code === ExportResultCode.SUCCESS) {
         for (const span of spans) this.delivered.add(span.spanContext().spanId);
       }
       resultCallback(result);
-    };
-    try {
-      this.inner.export(spans, done);
-    } catch (error) {
-      done({ code: ExportResultCode.FAILED, error: error instanceof Error ? error : new Error(String(error)) });
-    }
+    });
   }
 
   shutdown(): Promise<void> {
@@ -50,6 +57,47 @@ export class DeliveryTrackingExporter implements SpanExporter {
 
   forceFlush(): Promise<void> {
     return this.inner.forceFlush?.() ?? Promise.resolve();
+  }
+}
+
+/**
+ * Sends each export call as sequential requests whose estimated size stays within
+ * `maxBytes`, to keep each request under the ingest endpoint's size limit. A span
+ * whose estimate alone passes `maxBytes` is still sent, in a request of its own. Each
+ * request goes through `inner` on its own, so a failed request fails only its own
+ * spans; the call as a whole reports the first failure, after trying every request.
+ */
+export class SizeLimitedExporter implements SpanExporter {
+  // Export calls whose requests are still being sent. The batch processor exports
+  // a full batch as soon as it fills, outside its final flush, so shutdown and
+  // forceFlush wait for these before reaching `inner`.
+  private readonly inFlight = new Set<Promise<void>>();
+
+  constructor(private readonly inner: SpanExporter, private readonly maxBytes: number) {}
+
+  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
+    const call = this.exportInRequests(spans).then(resultCallback);
+    this.inFlight.add(call);
+    void call.finally(() => this.inFlight.delete(call));
+  }
+
+  private async exportInRequests(spans: ReadableSpan[]): Promise<ExportResult> {
+    let firstFailure: ExportResult | undefined;
+    for (const request of splitBySize(spans, this.maxBytes)) {
+      const result = await new Promise<ExportResult>((resolve) => exportSafely(this.inner, request, resolve));
+      if (result.code !== ExportResultCode.SUCCESS) firstFailure ??= result;
+    }
+    return firstFailure ?? { code: ExportResultCode.SUCCESS };
+  }
+
+  async shutdown(): Promise<void> {
+    await Promise.all(this.inFlight);
+    await this.inner.shutdown();
+  }
+
+  async forceFlush(): Promise<void> {
+    await Promise.all(this.inFlight);
+    await this.inner.forceFlush?.();
   }
 }
 
@@ -95,7 +143,10 @@ export function buildTracing(config: Config, exporter: SpanExporter = otlpExport
   // per span, and a burst loses the tail before this short-lived process exits.
   // Batch coalesces them into few large OTLP POSTs that forceFlush ships reliably.
   // Liveness is unchanged: each hook invocation still flushes its spans on shutdown.
-  const processor = new BatchSpanProcessor(tracked, {
+  // Batches are split by size before they reach delivery tracking, so each
+  // request's result is recorded on its own: a failed request leaves only its
+  // spans unmarked.
+  const processor = new BatchSpanProcessor(new SizeLimitedExporter(tracked, config.maxRequestBytes), {
     maxQueueSize: 4096,
     maxExportBatchSize: 1024,
     scheduledDelayMillis: 30000, // won't auto-fire in a short hook; we forceFlush on shutdown

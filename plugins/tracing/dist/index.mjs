@@ -53,6 +53,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 //#endregion
 //#region src/config.ts
+const DEFAULT_MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 async function readJson(file) {
 	try {
 		return JSON.parse(await fs.readFile(file, "utf-8"));
@@ -83,6 +84,7 @@ async function getConfig(cwd = process.cwd()) {
 		environment: envFirst("TRACEROOT_ENVIRONMENT") ?? j.environment,
 		userId: envFirst("TRACEROOT_CODEX_USER_ID") ?? j.user_id,
 		maxChars: ((n) => Number.isFinite(n) ? n : 2e4)(Number(envFirst("TRACEROOT_CODEX_MAX_CHARS") ?? j.max_chars ?? 2e4)),
+		maxRequestBytes: ((n) => Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_REQUEST_BYTES)(Number(envFirst("TRACEROOT_CODEX_MAX_REQUEST_BYTES") ?? j.max_request_bytes ?? DEFAULT_MAX_REQUEST_BYTES)),
 		debug: truthy(envFirst("TRACEROOT_CODEX_DEBUG") ?? j.debug),
 		failOnError: truthy(envFirst("TRACEROOT_CODEX_FAIL_ON_ERROR") ?? j.fail_on_error),
 		enabled: false
@@ -29798,8 +29800,65 @@ const SDK_NAME = "traceroot-codex-plugin";
 const SDK_VERSION = "0.1.1";
 
 //#endregion
+//#region src/size.ts
+const SPAN_OVERHEAD_BYTES = 256;
+const ATTRIBUTE_OVERHEAD_BYTES = 32;
+const utf8Bytes = (s) => Buffer.byteLength(s, "utf8");
+function valueBytes(value) {
+	if (typeof value === "string") return utf8Bytes(value);
+	if (Array.isArray(value)) return value.reduce((n, v) => n + ATTRIBUTE_OVERHEAD_BYTES + valueBytes(v), 0);
+	return 10;
+}
+/** Estimated serialized size of span attributes, never below the real size. */
+function attributesBytes(attributes) {
+	let n = 0;
+	for (const [key, value] of Object.entries(attributes)) n += ATTRIBUTE_OVERHEAD_BYTES + utf8Bytes(key) + valueBytes(value);
+	return n;
+}
+const traceStateBytes = (state) => utf8Bytes(state?.serialize() ?? "");
+/** Estimated size `span` adds to an OTLP protobuf request, never below the real size. */
+function estimateSpanBytes(span) {
+	let n = SPAN_OVERHEAD_BYTES + utf8Bytes(span.name) + utf8Bytes(span.status.message ?? "") + traceStateBytes(span.spanContext().traceState) + attributesBytes(span.attributes);
+	for (const event of span.events) n += SPAN_OVERHEAD_BYTES + utf8Bytes(event.name) + attributesBytes(event.attributes ?? {});
+	for (const link of span.links) n += SPAN_OVERHEAD_BYTES + traceStateBytes(link.context.traceState) + attributesBytes(link.attributes ?? {});
+	return n;
+}
+/**
+* Splits `spans`, keeping their order, into groups whose estimated size stays
+* within `maxBytes`. A span larger than `maxBytes` on its own forms its own group.
+*/
+function splitBySize(spans, maxBytes) {
+	const groups = [];
+	let group = [];
+	let size = 0;
+	for (const span of spans) {
+		const bytes = estimateSpanBytes(span);
+		if (group.length > 0 && size + bytes > maxBytes) {
+			groups.push(group);
+			group = [];
+			size = 0;
+		}
+		group.push(span);
+		size += bytes;
+	}
+	if (group.length > 0) groups.push(group);
+	return groups;
+}
+
+//#endregion
 //#region src/exporter.ts
 var import_src = require_src$7();
+/** One export call; a throwing exporter is reported as a failed export. */
+function exportSafely(exporter, spans, resultCallback) {
+	try {
+		exporter.export(spans, resultCallback);
+	} catch (error) {
+		resultCallback({
+			code: import_src.ExportResultCode.FAILED,
+			error: error instanceof Error ? error : new Error(String(error))
+		});
+	}
+}
 /**
 * Passes spans through to `inner` and records the ids of every span whose export
 * call succeeded, so a span is only treated as sent once the backend accepted it.
@@ -29811,24 +29870,51 @@ var DeliveryTrackingExporter = class {
 		this.inner = inner;
 	}
 	export(spans, resultCallback) {
-		const done = (result) => {
+		exportSafely(this.inner, spans, (result) => {
 			if (result.code === import_src.ExportResultCode.SUCCESS) for (const span of spans) this.delivered.add(span.spanContext().spanId);
 			resultCallback(result);
-		};
-		try {
-			this.inner.export(spans, done);
-		} catch (error) {
-			done({
-				code: import_src.ExportResultCode.FAILED,
-				error: error instanceof Error ? error : new Error(String(error))
-			});
-		}
+		});
 	}
 	shutdown() {
 		return this.inner.shutdown();
 	}
 	forceFlush() {
 		return this.inner.forceFlush?.() ?? Promise.resolve();
+	}
+};
+/**
+* Sends each export call as sequential requests whose estimated size stays within
+* `maxBytes`, to keep each request under the ingest endpoint's size limit. A span
+* whose estimate alone passes `maxBytes` is still sent, in a request of its own. Each
+* request goes through `inner` on its own, so a failed request fails only its own
+* spans; the call as a whole reports the first failure, after trying every request.
+*/
+var SizeLimitedExporter = class {
+	inFlight = /* @__PURE__ */ new Set();
+	constructor(inner, maxBytes) {
+		this.inner = inner;
+		this.maxBytes = maxBytes;
+	}
+	export(spans, resultCallback) {
+		const call = this.exportInRequests(spans).then(resultCallback);
+		this.inFlight.add(call);
+		call.finally(() => this.inFlight.delete(call));
+	}
+	async exportInRequests(spans) {
+		let firstFailure;
+		for (const request of splitBySize(spans, this.maxBytes)) {
+			const result = await new Promise((resolve) => exportSafely(this.inner, request, resolve));
+			if (result.code !== import_src.ExportResultCode.SUCCESS) firstFailure ??= result;
+		}
+		return firstFailure ?? { code: import_src.ExportResultCode.SUCCESS };
+	}
+	async shutdown() {
+		await Promise.all(this.inFlight);
+		await this.inner.shutdown();
+	}
+	async forceFlush() {
+		await Promise.all(this.inFlight);
+		await this.inner.forceFlush?.();
 	}
 };
 function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set()) {
@@ -29862,7 +29948,7 @@ function otlpExporter(config) {
 }
 function buildTracing(config, exporter = otlpExporter(config)) {
 	const tracked = new DeliveryTrackingExporter(exporter);
-	return buildTracingWith(new import_index_shim.BatchSpanProcessor(tracked, {
+	return buildTracingWith(new import_index_shim.BatchSpanProcessor(new SizeLimitedExporter(tracked, config.maxRequestBytes), {
 		maxQueueSize: 4096,
 		maxExportBatchSize: 1024,
 		scheduledDelayMillis: 3e4
