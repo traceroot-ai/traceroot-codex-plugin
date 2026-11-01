@@ -181,4 +181,22 @@ describe("dispatch with more spans than one export batch", () => {
     await dispatch({ transcript_path: transcript }, config, deps(retry));
     expect(ids(retry.calls.flat()).sort()).toEqual([...finalBatch, makeSpanId("big:root")].sort());
   });
+
+  it("a final batch that fails while the first is still in flight does not cause the first to be re-sent", async () => {
+    const transcript = await writeBigRollout();
+    // The final batch is rejected at once; the full first batch is accepted later.
+    const exporter = new ScriptedExporter(
+      (spans) => (spans.length === 1024 ? OK : httpError("Request Entity Too Large", 413)),
+      (spans) => (spans.length === 1024 ? 50 : 0),
+    );
+
+    await expect(dispatch({ transcript_path: transcript }, config, deps(exporter))).rejects.toBeDefined();
+    expect(exporter.calls.map((c) => c.length)).toEqual([1024, TOOL_CALLS + 2 - 1024]);
+    const [firstBatch, finalBatch] = [ids(exporter.calls[0]!), ids(exporter.calls[1]!)];
+    expect(await sidecar(transcript)).toEqual([...firstBatch].sort());
+
+    const retry = new ScriptedExporter();
+    await dispatch({ transcript_path: transcript }, config, deps(retry));
+    expect(ids(retry.calls.flat()).sort()).toEqual([...finalBatch, makeSpanId("big:root")].sort());
+  });
 });

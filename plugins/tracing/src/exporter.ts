@@ -63,9 +63,15 @@ export function buildTracingWith(
     delivered,
     // Both needed: forceFlush drains pending spans, shutdown awaits in-flight
     // OTLP HTTP delivery so this short-lived process delivers spans before exit.
+    // forceFlush rejects on the first failed batch while other exports may still
+    // be in flight, so shutdown runs either way: `delivered` is complete only
+    // once every export has been answered.
     shutdown: async () => {
-      await provider.forceFlush();
-      await provider.shutdown();
+      try {
+        await provider.forceFlush();
+      } finally {
+        await provider.shutdown();
+      }
     },
   };
 }
