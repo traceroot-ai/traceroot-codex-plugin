@@ -125,17 +125,34 @@ async function tryLock(lockPath: string, token: string, staleMs: number): Promis
   }
 }
 
+/** The turn end a request names, if any. */
+function turnEndOf(request: string): number | undefined {
+  const at = Number(request);
+  return request && Number.isFinite(at) ? at : undefined;
+}
+
+function laterTurnEnd(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b;
+  return b === undefined ? a : Math.max(a, b);
+}
+
+/** Whether the request waiting at `pendingPath` names a turn end later than `at`. */
+async function waitsForLaterTurnEnd(pendingPath: string, at: number): Promise<boolean> {
+  const waiting = await fs.readFile(pendingPath, "utf-8").then(turnEndOf, () => undefined);
+  return waiting !== undefined && waiting > at;
+}
+
 /**
  * Asks the holder to run again for this hook, written in full before it appears.
  * A hook that ended its turn replaces any request already waiting with one that
- * says when it arrived; any other leaves a waiting request in place, since that
- * one already gets a run.
+ * says when it arrived, unless that one names a later turn end; any other leaves
+ * a waiting request in place, since that one already gets a run.
  */
 async function requestRun(pendingPath: string, turnEndedAt: number | undefined): Promise<boolean> {
   const tmp = `${pendingPath}.${randomUUID()}.tmp`;
   try {
     await fs.writeFile(tmp, turnEndedAt === undefined ? "" : String(turnEndedAt));
-    if (turnEndedAt !== undefined) {
+    if (turnEndedAt !== undefined && !(await waitsForLaterTurnEnd(pendingPath, turnEndedAt))) {
       await fs.rename(tmp, pendingPath);
     } else {
       await fs.link(tmp, pendingPath).catch((error: NodeJS.ErrnoException) => {
@@ -161,8 +178,8 @@ async function claimRequests(pendingPath: string): Promise<HandOff> {
   }
   const request = await fs.readFile(claimed, "utf-8").catch(() => "");
   await fs.rm(claimed, { force: true });
-  const turnEndedAt = Number(request);
-  return request && Number.isFinite(turnEndedAt) ? { turnEndedAt } : {};
+  const turnEndedAt = turnEndOf(request);
+  return turnEndedAt === undefined ? {} : { turnEndedAt };
 }
 
 type Acquired = "held" | "handed-off" | "not-handed-off" | "unlocked";
@@ -171,13 +188,21 @@ async function acquire(
   lockPath: string, pendingPath: string, token: string, turnEndedAt: number | undefined, t: LockTimings,
 ): Promise<Acquired> {
   const deadline = Date.now() + t.waitMs;
+  // Failing open is for a lock that can't be created at all: once another hook was
+  // seen holding it, an error creating it is no reason to run alongside that hook.
+  let seenHeld = false;
+  const attemptLock = async () => {
+    const attempt = await tryLock(lockPath, token, t.staleMs);
+    seenHeld ||= attempt === "busy";
+    return attempt instanceof Error && seenHeld ? "busy" : attempt;
+  };
   for (;;) {
-    let attempt = await tryLock(lockPath, token, t.staleMs);
+    let attempt = await attemptLock();
     if (attempt === "busy" && Date.now() >= deadline) {
       // Ask the holder to run again for this hook, then look once more: the holder
       // may have released after it last looked for requests.
       const asked = await requestRun(pendingPath, turnEndedAt);
-      attempt = await tryLock(lockPath, token, t.staleMs);
+      attempt = await attemptLock();
       if (attempt === "busy") return asked ? "handed-off" : "not-handed-off";
     }
     if (attempt === "held") return "held";
@@ -208,10 +233,13 @@ export async function withSessionLock<T>(
   timings: LockTimings = DEFAULT_TIMINGS,
   endsTurn = false,
 ): Promise<T | undefined> {
+  // The rerun budget counts from here, so the time spent waiting for the lock is part of it.
+  const started = Date.now();
   const lockPath = `${rolloutFile}.traceroot.lock`;
   const pendingPath = `${rolloutFile}.traceroot.pending`;
   const token = `${process.pid} ${randomUUID()}`;
-  const acquired = await acquire(lockPath, pendingPath, token, endsTurn ? Date.now() : undefined, timings);
+  const turnEndedAt = endsTurn ? started : undefined;
+  const acquired = await acquire(lockPath, pendingPath, token, turnEndedAt, timings);
   if (acquired === "handed-off") {
     debugLog("another hook of this session holds the lock; it runs again for this one");
     return undefined;
@@ -222,8 +250,14 @@ export async function withSessionLock<T>(
   }
   if (acquired === "unlocked") return run({ held: async () => true }, {});
 
+  // Whether the lock was found gone during the current run, even if only for a moment.
+  let lostInRun = false;
   const lock: SessionLock = {
-    held: async () => (await fs.readFile(lockPath, "utf-8").catch(() => "")) === token,
+    held: async () => {
+      const mine = (await fs.readFile(lockPath, "utf-8").catch(() => "")) === token;
+      lostInRun ||= !mine;
+      return mine;
+    },
   };
   const release = async () => {
     if (await lock.held()) await removeLockIf(lockPath, (mine) => mine.content === token);
@@ -234,14 +268,20 @@ export async function withSessionLock<T>(
     }).catch(() => {});
   }, timings.heartbeatMs);
   heartbeat.unref();
-  const started = Date.now();
   const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
+  // A run that found the lock gone may not have sent what it read, nor ended the turn
+  // it was told of, so it asks again: the hook holding the lock now, the session's
+  // next hook, or this one once its lock is back runs for it.
+  const askAgainIfLost = async (handOff: HandOff) => {
+    if (!(await lock.held()) || lostInRun) await requestRun(pendingPath, laterTurnEnd(turnEndedAt, handOff.turnEndedAt));
+  };
   try {
     for (;;) {
       // Claimed before reading the rollout: a request made after this point is
       // for a newer rollout, so it gets a run of its own.
       const handOff = await claimRequests(pendingPath);
-      const result = await run(lock, handOff);
+      lostInRun = false;
+      const result = await run(lock, handOff).finally(() => askAgainIfLost(handOff));
       if (await exists(pendingPath)) {
         if (budgetLeft() && (await lock.held())) {
           debugLog("running again for a hook that handed its run to this one");

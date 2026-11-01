@@ -64,6 +64,12 @@ async function staleLock(lockPath: string, content: string): Promise<void> {
   await real.utimes(lockPath, old, old);
 }
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
 /**
  * Runs `step` once, right after this hook first looks at the lock file. Any read
  * of the lock that this look started at the same time waits for the step, so the
@@ -153,6 +159,75 @@ describe("withSessionLock under exact interleavings", () => {
     expect(await withSessionLock(rollout, async () => { ran = true; }, T)).toBeUndefined();
     expect(ran).toBe(false);
     expect(await real.readFile(lockOf(rollout), "utf-8")).toBe(holder);
+  });
+
+  it("runs again when its lock was away for a moment, moved aside by a hook that judged an older lock stale", async () => {
+    const rollout = await rolloutPath();
+    await staleLock(lockOf(rollout), `${process.pid} frozen`);
+    const atMove = deferred();
+    const letMove = deferred();
+    const moved = deferred();
+    const checked = deferred();
+    const movedBack = deferred();
+    let movedTo: string | undefined;
+    // The first hook to move the stale lock aside is held back until the second has
+    // broken it, taken the lock and started its run; it then moves the new lock aside.
+    steps.before = async (op, [from, to]) => {
+      if (movedTo !== undefined || op !== "rename" || from !== lockOf(rollout)) return;
+      movedTo = String(to);
+      atMove.resolve();
+      await letMove.promise;
+    };
+    steps.after = async (op, [from, to]) => {
+      if (op !== "rename") return;
+      if (to === movedTo) { moved.resolve(); await checked.promise; }
+      if (from === movedTo && to === lockOf(rollout)) movedBack.resolve();
+    };
+
+    const breaker = withSessionLock(rollout, async () => {}, T);
+    await atMove.promise;
+    const held: boolean[] = [];
+    const holder = withSessionLock(rollout, async (lock) => {
+      if (held.length === 0) {
+        letMove.resolve();
+        await moved.promise;
+        held.push(await lock.held()); // the run sees its lock gone and sends nothing
+        checked.resolve();
+        await movedBack.promise;
+        return;
+      }
+      held.push(await lock.held());
+    }, T);
+    await Promise.all([breaker, holder]);
+
+    expect(held[0]).toBe(false);
+    expect(held.slice(1)).toContain(true); // ran again holding its lock
+    expect(await exists(pendingOf(rollout))).toBe(false);
+    expect(await exists(lockOf(rollout))).toBe(false);
+  });
+
+  it.each([
+    ["while it waits", 60_000],
+    ["on its last try after asking the holder to run again", 0],
+  ])("does not run unlocked when it cannot create its lock %s for a lock it found held", async (_when, waitMs) => {
+    const rollout = await rolloutPath();
+    const holder = `${process.pid} holder`;
+    await real.writeFile(lockOf(rollout), holder);
+    let tries = 0;
+    steps.before = (op, [, to]) => {
+      if (op === "link" && to === lockOf(rollout) && ++tries === 2) throw Object.assign(new Error("EIO"), { code: "EIO" });
+    };
+    // The holder releases only after the failed try.
+    let sleeps = 0;
+    const sleep = async () => { if (++sleeps === 2) await real.rm(lockOf(rollout), { force: true }); };
+    const alongside: boolean[] = [];
+
+    await withSessionLock(rollout, async () => {
+      alongside.push((await real.readFile(lockOf(rollout), "utf-8").catch(() => "")) === holder);
+    }, { ...T, waitMs, sleep });
+
+    expect(tries).toBeGreaterThanOrEqual(2);
+    expect(alongside).not.toContain(true);
   });
 
   it("does not report a hand-off when it could not leave its request", async () => {

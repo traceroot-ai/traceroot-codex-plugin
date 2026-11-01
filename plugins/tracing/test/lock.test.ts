@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
 import { dispatch } from "../src/emit.js";
 import { buildTracing } from "../src/exporter.js";
@@ -19,7 +19,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const T: LockTimings = { waitMs: 2_000, staleMs: 60_000, heartbeatMs: 1_000, rerunBudgetMs: 60_000, pollMs: 5 };
 
 let dir: string;
-afterEach(async () => { if (dir) await fs.rm(dir, { recursive: true, force: true }); });
+afterEach(async () => {
+  vi.useRealTimers();
+  if (dir) await fs.rm(dir, { recursive: true, force: true });
+});
 
 async function rolloutPath(): Promise<string> {
   dir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-lock-"));
@@ -234,6 +237,47 @@ describe("withSessionLock", () => {
     expect(await fs.readFile(lockOf(rollout), "utf-8")).toBe(`${process.pid} someone-else`);
   });
 
+  it("asks again for the turn end it was serving when its lock is taken over during the run", async () => {
+    const rollout = await rolloutPath();
+    const started = deferred();
+    const gate = deferred();
+    const served: HandOff[] = [];
+
+    const holder = withSessionLock(rollout, async (_lock, handOff) => {
+      served.push(handOff);
+      if (served.length === 1) { started.resolve(); await gate.promise; return; }
+      await fs.writeFile(lockOf(rollout), `${process.pid} someone-else`); // taken over while serving the Stop
+    }, T);
+    await started.promise;
+    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true)).toBeUndefined();
+    gate.resolve();
+    await holder;
+
+    expect(served).toHaveLength(2);
+    expect(Number(await fs.readFile(pendingOf(rollout), "utf-8"))).toBe(served[1]!.turnEndedAt);
+  });
+
+  it("asks again for its own turn end when it is a Stop whose lock is taken over", async () => {
+    const rollout = await rolloutPath();
+    const arrived = Date.now();
+
+    await withSessionLock(rollout, async () => {
+      await fs.writeFile(lockOf(rollout), `${process.pid} someone-else`);
+    }, T, true);
+
+    expect(Number(await fs.readFile(pendingOf(rollout), "utf-8"))).toBeGreaterThanOrEqual(arrived);
+  });
+
+  it("keeps a waiting request that names a later turn end than the Stop handing off", async () => {
+    const rollout = await rolloutPath();
+    await fs.writeFile(lockOf(rollout), `${process.pid} holder`);
+    const later = String(Date.now() + 60_000);
+    await fs.writeFile(pendingOf(rollout), later);
+
+    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true)).toBeUndefined();
+    expect(await fs.readFile(pendingOf(rollout), "utf-8")).toBe(later);
+  });
+
   it("leaves a handed-off run for the next hook once the holder has used its rerun budget", async () => {
     const rollout = await rolloutPath();
     const started = deferred();
@@ -252,6 +296,30 @@ describe("withSessionLock", () => {
 
     expect(holderRuns).toBe(1);
     expect(await exists(pendingOf(rollout))).toBe(true);
+  });
+
+  it("counts the time it waited for the lock against its rerun budget", async () => {
+    const rollout = await rolloutPath();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const started = deferred();
+    const gate = deferred();
+    const first = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, T);
+    await started.promise;
+    let runs = 0;
+
+    // Waits 10 s for the first hook, then runs for 6 s while another hook hands its run to it.
+    await withSessionLock(rollout, async () => {
+      runs += 1;
+      if (runs > 1) return;
+      expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 })).toBeUndefined();
+      vi.setSystemTime(Date.now() + 6_000);
+    }, {
+      ...T, waitMs: 60_000, rerunBudgetMs: 15_000,
+      sleep: async () => { vi.setSystemTime(Date.now() + 10_000); gate.resolve(); await first; },
+    });
+
+    expect(runs).toBe(1);
+    expect(await exists(pendingOf(rollout))).toBe(true); // left for the session's next hook
   });
 
   it("releases the lock when the run throws, and passes the error on", async () => {
@@ -457,5 +525,6 @@ describe("dispatch under the session lock", () => {
     expect(exporter.calls).toHaveLength(1);
     expect([...(await loadEmittedSpanIds(transcript))]).toEqual(ids(exporter.calls[0]!));
     expect(await fs.readFile(lockOf(transcript), "utf-8")).toBe(`${process.pid} someone-else`);
+    expect(await exists(pendingOf(transcript))).toBe(true); // the rest is sent by a run of the hook holding the lock
   });
 });
