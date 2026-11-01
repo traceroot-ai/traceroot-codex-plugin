@@ -4,7 +4,7 @@ import * as os$1 from "node:os";
 import * as path from "node:path";
 import * as zlib from "zlib";
 import { Readable } from "stream";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -29916,6 +29916,32 @@ var SizeLimitedExporter = class {
 		await this.inner.forceFlush?.();
 	}
 };
+/**
+* Sends a request only if `stillHeld()` says this hook still holds the session's
+* lock, checked right before each request. A request held back is reported as
+* failed, so its spans are not recorded as delivered and the next hook sends them.
+*/
+var LockGuardedExporter = class {
+	constructor(inner, stillHeld) {
+		this.inner = inner;
+		this.stillHeld = stillHeld;
+	}
+	export(spans, resultCallback) {
+		this.stillHeld().catch(() => false).then((held) => {
+			if (held) exportSafely(this.inner, spans, resultCallback);
+			else resultCallback({
+				code: import_src.ExportResultCode.FAILED,
+				error: /* @__PURE__ */ new Error("not sent: the session lock was taken over")
+			});
+		});
+	}
+	shutdown() {
+		return this.inner.shutdown();
+	}
+	forceFlush() {
+		return this.inner.forceFlush?.() ?? Promise.resolve();
+	}
+};
 function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set()) {
 	const provider = new import_src$2.NodeTracerProvider({
 		idGenerator: idGen,
@@ -29942,8 +29968,8 @@ function otlpExporter(config) {
 		compression: "gzip"
 	});
 }
-function buildTracing(config, exporter = otlpExporter(config)) {
-	const tracked = new DeliveryTrackingExporter(exporter);
+function buildTracing(config, exporter = otlpExporter(config), stillHeld) {
+	const tracked = new DeliveryTrackingExporter(stillHeld ? new LockGuardedExporter(exporter, stillHeld) : exporter);
 	return buildTracingWith(new import_index_shim.BatchSpanProcessor(new SizeLimitedExporter(tracked, config.maxRequestBytes), {
 		maxQueueSize: 4096,
 		maxExportBatchSize: 1024,
@@ -29994,6 +30020,246 @@ async function readStdin() {
 function truncate(s, max) {
 	if (s.length <= max) return s;
 	return `${s.slice(0, max)}…[truncated ${s.length - max} chars]`;
+}
+
+//#endregion
+//#region src/lock.ts
+const DEFAULT_TIMINGS = {
+	waitMs: 1e4,
+	staleMs: 3e4,
+	heartbeatMs: 5e3,
+	rerunBudgetMs: 15e3,
+	pollMs: 50
+};
+const sleep = (ms$1) => new Promise((resolve) => setTimeout(resolve, ms$1));
+function isAlive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error.code === "EPERM";
+	}
+}
+const newOwner = () => `${process.pid}.${randomUUID()}`;
+/** Whether an owner is gone: its process exited, or it has been silent past staleMs. */
+function isStale(owner, staleMs) {
+	if (Date.now() - owner.mtimeMs > staleMs) return true;
+	const pid = Number(owner.name.split(".")[0]);
+	return Number.isInteger(pid) && pid > 0 && !isAlive(pid);
+}
+async function ownerAt(lockDir, name) {
+	const stat = await fs.stat(path.join(lockDir, name)).catch(() => void 0);
+	return stat && {
+		name,
+		mtimeMs: stat.mtimeMs
+	};
+}
+/** The owners in the lock directory, or undefined if it can't be read. */
+async function ownersOf(lockDir) {
+	const names = await fs.readdir(lockDir).catch(() => void 0);
+	if (!names) return void 0;
+	const owners = [];
+	for (const name of names) {
+		const owner = await ownerAt(lockDir, name);
+		if (owner) owners.push(owner);
+	}
+	return owners;
+}
+/** Creates the lock with `owner` in it, in one rename. */
+async function tryCreate(lockDir, owner) {
+	const staging = `${lockDir}.${randomUUID()}.tmp`;
+	try {
+		await fs.mkdir(staging);
+		await fs.writeFile(path.join(staging, owner), owner);
+		await fs.rename(staging, lockDir);
+		return "created";
+	} catch (error) {
+		const code = error.code;
+		if (code === "ENOTEMPTY" || code === "EEXIST") return "exists";
+		return await fs.lstat(lockDir).then(() => true, () => false) ? "exists" : error;
+	} finally {
+		await fs.rm(staging, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+	}
+}
+/** One attempt to take the lock as `owner`, removing one whose holder is gone on the way. */
+async function tryLock(lockDir, owner, staleMs) {
+	for (;;) {
+		const created = await tryCreate(lockDir, owner);
+		if (created !== "exists") return created === "created" ? "held" : created;
+		const owners = await ownersOf(lockDir);
+		if (!owners || owners.some((seen) => !isStale(seen, staleMs))) return "busy";
+		for (const { name } of owners) {
+			const now = await ownerAt(lockDir, name);
+			if (now && !isStale(now, staleMs)) return "busy";
+			await fs.rm(path.join(lockDir, name), {
+				recursive: true,
+				force: true
+			}).catch(() => {});
+		}
+		if (!await fs.rmdir(lockDir).then(() => true, () => false)) return "busy";
+	}
+}
+/** The turn end a request names, if any. */
+function turnEndOf(request) {
+	const at = Number(request);
+	return request && Number.isFinite(at) ? at : void 0;
+}
+function laterTurnEnd(a, b) {
+	if (a === void 0) return b;
+	return b === void 0 ? a : Math.max(a, b);
+}
+/**
+* Asks the holder to run again for this hook: a request file of its own in
+* `pendingDir`, written in full before it appears. A hook that ended its turn
+* writes when it arrived. No request ever replaces another, so the run that
+* claims them sees every turn end.
+*/
+async function requestRun(pendingDir, turnEndedAt) {
+	const tmp = `${pendingDir}.${randomUUID()}.tmp`;
+	const request = path.join(pendingDir, randomUUID());
+	try {
+		await fs.writeFile(tmp, turnEndedAt === void 0 ? "" : String(turnEndedAt));
+		for (let attempt = 1;; attempt++) {
+			await fs.mkdir(pendingDir, { recursive: true });
+			try {
+				await fs.rename(tmp, request);
+				return true;
+			} catch (error) {
+				if (error.code !== "ENOENT" || attempt >= 3) throw error;
+			}
+		}
+	} catch {
+		return false;
+	} finally {
+		await fs.rm(tmp, { force: true });
+	}
+}
+const hasRequests = (pendingDir) => fs.readdir(pendingDir).then((names) => names.length > 0, () => false);
+/**
+* Takes every request waiting for a run, by moving their directory away, so that
+* requests made after this get a run of their own. The latest turn end among them
+* is passed on.
+*/
+async function claimRequests(pendingDir) {
+	const claimed = `${pendingDir}.${randomUUID()}.claimed`;
+	try {
+		await fs.rename(pendingDir, claimed);
+	} catch (error) {
+		if (error.code === "ENOENT") return {};
+		throw error;
+	}
+	let turnEndedAt;
+	try {
+		for (const name of await fs.readdir(claimed).catch(() => [])) {
+			const request = await fs.readFile(path.join(claimed, name), "utf-8").catch(() => "");
+			turnEndedAt = laterTurnEnd(turnEndedAt, turnEndOf(request));
+		}
+	} finally {
+		await fs.rm(claimed, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+	}
+	return turnEndedAt === void 0 ? {} : { turnEndedAt };
+}
+async function acquire(lockDir, pendingDir, owner, turnEndedAt, t) {
+	const deadline = Date.now() + t.waitMs;
+	let seenHeld = false;
+	const attemptLock = async () => {
+		const attempt = await tryLock(lockDir, owner, t.staleMs);
+		seenHeld ||= attempt === "busy";
+		return attempt instanceof Error && seenHeld ? "busy" : attempt;
+	};
+	for (;;) {
+		let attempt = await attemptLock();
+		if (attempt === "busy" && Date.now() >= deadline) {
+			const asked = await requestRun(pendingDir, turnEndedAt);
+			attempt = await attemptLock();
+			if (attempt === "busy") return asked ? "handed-off" : "not-handed-off";
+		}
+		if (attempt === "held") return "held";
+		if (attempt instanceof Error) {
+			debugLog("session lock unavailable; continuing without it:", attempt);
+			return "unlocked";
+		}
+		await (t.sleep ?? sleep)(t.pollMs);
+	}
+}
+/**
+* Runs `run` while holding the session's lock, a directory next to the rollout, so
+* hooks of one session (a subagent's SubagentStop beside the parent's own hooks,
+* say) read the rollout, export and record what they sent one at a time.
+*
+* A hook that can't get the lock within `waitMs` never runs on its own: it leaves
+* a request and returns undefined, and the holder runs again, reading the rollout
+* as it is then. A hook that `endsTurn` says so in its request, and the run that
+* serves it is told when it arrived. The holder keeps its entry in the lock fresh
+* while it runs, so it is taken over only if it exits or freezes, and `run` checks
+* `held()` before exporting so a frozen holder that resumes sends nothing.
+*/
+async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS, endsTurn = false) {
+	const started = Date.now();
+	const lockDir = `${rolloutFile}.traceroot.lock.d`;
+	const pendingDir = `${rolloutFile}.traceroot.pending.d`;
+	let owner = newOwner();
+	const turnEndedAt = endsTurn ? started : void 0;
+	const acquired = await acquire(lockDir, pendingDir, owner, turnEndedAt, timings);
+	if (acquired === "handed-off") {
+		debugLog("another hook of this session holds the lock; it runs again for this one");
+		return;
+	}
+	if (acquired === "not-handed-off") {
+		debugLog("another hook of this session holds the lock, and this one could not ask it to run again; sending nothing");
+		return;
+	}
+	if (acquired === "unlocked") return run$1({ held: async () => true }, {});
+	const ownerPath = () => path.join(lockDir, owner);
+	let lostInRun = false;
+	const lock = { held: async () => {
+		const mine = await fs.readFile(ownerPath(), "utf-8").catch(() => "") === owner;
+		lostInRun ||= !mine;
+		return mine;
+	} };
+	const release = async () => {
+		await fs.rm(ownerPath(), { force: true }).catch(() => {});
+		await fs.rmdir(lockDir).catch(() => {});
+	};
+	const heartbeat = setInterval(() => {
+		lock.held().then((mine) => {
+			if (mine) return fs.utimes(ownerPath(), /* @__PURE__ */ new Date(), /* @__PURE__ */ new Date());
+		}).catch(() => {});
+	}, timings.heartbeatMs);
+	heartbeat.unref();
+	const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
+	const askAgainIfLost = async (handOff) => {
+		if (!await lock.held() || lostInRun) await requestRun(pendingDir, laterTurnEnd(turnEndedAt, handOff.turnEndedAt));
+	};
+	try {
+		for (;;) {
+			const handOff = await claimRequests(pendingDir);
+			lostInRun = false;
+			const result = await run$1(lock, handOff).finally(() => askAgainIfLost(handOff));
+			if (await hasRequests(pendingDir)) {
+				if (budgetLeft() && await lock.held()) {
+					debugLog("running again for a hook that handed its run to this one");
+					continue;
+				}
+				debugLog("leaving a handed-off run for the session's next hook");
+				return result;
+			}
+			await release();
+			if (!await hasRequests(pendingDir) || !budgetLeft()) return result;
+			owner = newOwner();
+			if (await tryLock(lockDir, owner, timings.staleMs) !== "held") return result;
+			debugLog("running again for a hook that asked while this one released");
+		}
+	} finally {
+		clearInterval(heartbeat);
+		await release();
+	}
 }
 
 //#endregion
@@ -30649,6 +30915,7 @@ function parseRollout(lines) {
 //#endregion
 //#region src/emit.ts
 const STACK_GUARD = 32;
+const buildLockedTracing = (c, stillHeld) => buildTracing(c, void 0, stillHeld);
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
 async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, emittedIds, findSubagent) {
 	let n = 0;
@@ -30696,11 +30963,16 @@ async function dispatch(hook, config, deps) {
 		debugLog("no transcript_path; skipping");
 		return { emitted: 0 };
 	}
-	const buildTracingFn = deps?.buildTracing ?? buildTracing;
+	return await withSessionLock(transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), deps?.lockTimings, hook.hook_event_name === "Stop") ?? { emitted: 0 };
+}
+async function emitSession(hook, transcript, config, lock, handOff, deps) {
+	const buildTracingFn = deps?.buildTracing ?? buildLockedTracing;
 	const getGit = deps?.getGit ?? getGitContext;
 	const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
 	const turnEnding = hook.hook_event_name === "Stop";
 	const { sessionMeta, turns } = parseRollout(await readRollout(transcript));
+	const latest = turns.at(-1);
+	const handedOffStop = handOff.turnEndedAt !== void 0 && !!latest && latest.startTime <= handOff.turnEndedAt;
 	if (sessionMeta.threadSource === "subagent" || sessionMeta.parentThreadId) {
 		debugLog(`subagent session ${sessionMeta.sessionId}; skipping standalone emit (nested under parent)`);
 		return { emitted: 0 };
@@ -30711,11 +30983,15 @@ async function dispatch(hook, config, deps) {
 		userId: config.userId,
 		git,
 		maxChars: config.maxChars,
-		turnEnding,
+		turnEnding: turnEnding || handedOffStop,
 		captureImages: config.captureImages
 	};
 	const already = await loadEmittedSpanIds(transcript);
-	const tracing = buildTracingFn(config);
+	if (!await lock.held()) {
+		debugLog("session lock lost before export; skipping");
+		return { emitted: 0 };
+	}
+	const tracing = buildTracingFn(config, lock.held);
 	let emitted = 0;
 	const emittedIds = [];
 	const visited = /* @__PURE__ */ new Set();

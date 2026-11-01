@@ -100,6 +100,30 @@ export class SizeLimitedExporter implements SpanExporter {
   }
 }
 
+/**
+ * Sends a request only if `stillHeld()` says this hook still holds the session's
+ * lock, checked right before each request. A request held back is reported as
+ * failed, so its spans are not recorded as delivered and the next hook sends them.
+ */
+export class LockGuardedExporter implements SpanExporter {
+  constructor(private readonly inner: SpanExporter, private readonly stillHeld: () => Promise<boolean>) {}
+
+  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
+    void this.stillHeld().catch(() => false).then((held) => {
+      if (held) exportSafely(this.inner, spans, resultCallback);
+      else resultCallback({ code: ExportResultCode.FAILED, error: new Error("not sent: the session lock was taken over") });
+    });
+  }
+
+  shutdown(): Promise<void> {
+    return this.inner.shutdown();
+  }
+
+  forceFlush(): Promise<void> {
+    return this.inner.forceFlush?.() ?? Promise.resolve();
+  }
+}
+
 export function buildTracingWith(
   processor: SpanProcessor, idGen: PrimedIdGenerator, delivered: ReadonlySet<string> = new Set(),
 ): Tracing {
@@ -129,8 +153,10 @@ function otlpExporter(config: Config): SpanExporter {
   });
 }
 
-export function buildTracing(config: Config, exporter: SpanExporter = otlpExporter(config)): Tracing {
-  const tracked = new DeliveryTrackingExporter(exporter);
+export function buildTracing(
+  config: Config, exporter: SpanExporter = otlpExporter(config), stillHeld?: () => Promise<boolean>,
+): Tracing {
+  const tracked = new DeliveryTrackingExporter(stillHeld ? new LockGuardedExporter(exporter, stillHeld) : exporter);
   // Batch (not Simple): a hook invocation can complete many spans at once (a turn
   // with many tools, or a subagent's whole subtree). Simple sends one HTTP POST
   // per span, and a burst loses the tail before this short-lived process exits.

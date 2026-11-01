@@ -2,6 +2,7 @@ import type { Config } from "./config.js";
 import { buildTracing as defaultBuildTracing, type Tracing } from "./exporter.js";
 import { getGitContext } from "./git.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
+import { type HandOff, type LockTimings, type SessionLock, withSessionLock } from "./lock.js";
 import { loadEmittedSpanIds, markSpanEmitted } from "./sidecar.js";
 import { emitSpan, planTurnSpans, type EmitCtx, type PlanOpts } from "./spans.js";
 import { locateSubagentRollout } from "./subagents.js";
@@ -13,7 +14,8 @@ import { debugLog } from "./util.js";
 const STACK_GUARD = 32;
 
 export type Deps = {
-  buildTracing: (c: Config) => Tracing;
+  /** `stillHeld` says whether this hook still holds the session's lock; each request is sent only while it does. */
+  buildTracing: (c: Config, stillHeld?: () => Promise<boolean>) => Tracing;
   getGit: (cwd: string) => Promise<{ repo?: string; ref?: string }>;
   /**
    * Resolve a subagent's child rollout path by thread id.
@@ -21,7 +23,10 @@ export type Deps = {
    * NOT assume it — the per-subagent resolve/read/parse is wrapped in try/catch.
    */
   findSubagent: (threadId: string) => Promise<string | undefined>;
+  lockTimings: LockTimings;
 };
+
+const buildLockedTracing: Deps["buildTracing"] = (c, stillHeld) => defaultBuildTracing(c, undefined, stillHeld);
 
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
 async function emitTurnTree(
@@ -105,8 +110,20 @@ export async function dispatch(
 ): Promise<{ emitted: number }> {
   const transcript = hook.transcript_path;
   if (!transcript) { debugLog("no transcript_path; skipping"); return { emitted: 0 }; }
+  // Reading the rollout, exporting and recording what was sent run under the
+  // session's lock, so concurrent hooks of one session deliver in the order they read.
+  const result = await withSessionLock(
+    transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), deps?.lockTimings,
+    hook.hook_event_name === "Stop",
+  );
+  // undefined: the hook holding the lock runs again for this one, or this one couldn't ask it to.
+  return result ?? { emitted: 0 };
+}
 
-  const buildTracingFn = deps?.buildTracing ?? defaultBuildTracing;
+async function emitSession(
+  hook: HookInput, transcript: string, config: Config, lock: SessionLock, handOff: HandOff, deps?: Partial<Deps>,
+): Promise<{ emitted: number }> {
+  const buildTracingFn = deps?.buildTracing ?? buildLockedTracing;
   const getGit = deps?.getGit ?? getGitContext;
   const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
 
@@ -121,6 +138,10 @@ export async function dispatch(
   const turnEnding = hook.hook_event_name === "Stop";
 
   const { sessionMeta, turns } = parseRollout(await readRollout(transcript));
+  // A Stop that handed its run to this one ends the turn as well, unless a newer
+  // turn has started since it arrived: that turn is still running.
+  const latest = turns.at(-1);
+  const handedOffStop = handOff.turnEndedAt !== undefined && !!latest && latest.startTime <= handOff.turnEndedAt;
 
   // A subagent session is emitted NESTED under its parent's trace (via the
   // parent's spawn_agent tool). Codex fires PostToolUse/Stop on the subagent
@@ -136,12 +157,15 @@ export async function dispatch(
   const cwd = sessionMeta.cwd ?? hook.cwd ?? process.cwd();
   const git = await getGit(cwd).catch(() => ({}));
   const ctx: EmitCtx = {
-    environment: config.environment, userId: config.userId, git, maxChars: config.maxChars, turnEnding,
+    environment: config.environment, userId: config.userId, git, maxChars: config.maxChars,
+    turnEnding: turnEnding || handedOffStop,
     captureImages: config.captureImages,
   };
 
   const already = await loadEmittedSpanIds(transcript);
-  const tracing = buildTracingFn(config);
+  // A hook that froze past the stale limit and lost the lock must not send what it read.
+  if (!(await lock.held())) { debugLog("session lock lost before export; skipping"); return { emitted: 0 }; }
+  const tracing = buildTracingFn(config, lock.held);
   let emitted = 0;
   const emittedIds: string[] = [];
 
