@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type HandOff, type LockTimings, type SessionLock, withSessionLock } from "../src/lock.js";
+import { drainSession, type HandOff, type LockTimings, type SessionLock, withSessionLock } from "../src/lock.js";
 import { setDebug } from "../src/util.js";
 
 type Op =
@@ -59,8 +59,10 @@ async function rolloutPath(): Promise<string> {
 
 const lockOf = (rollout: string) => `${rollout}.traceroot.lock.d`;
 const pendingOf = (rollout: string) => `${rollout}.traceroot.pending.d`;
+const drainerOf = (rollout: string) => `${rollout}.traceroot.drainer.d`;
 const exists = (p: string) => real.access(p).then(() => true, () => false);
 const ownersOf = (rollout: string) => real.readdir(lockOf(rollout)).catch(() => []);
+const requestsOf = (rollout: string) => real.readdir(pendingOf(rollout)).catch(() => []);
 const isEntryOf = (rollout: string, file: unknown) => String(file).startsWith(`${lockOf(rollout)}${path.sep}`);
 const eio = () => Object.assign(new Error("EIO"), { code: "EIO" });
 
@@ -157,7 +159,7 @@ describe("withSessionLock under exact interleavings", () => {
     }, T);
 
     expect(held).toEqual([false, true]);
-    expect(await exists(pendingOf(rollout))).toBe(false);
+    expect(await requestsOf(rollout)).toEqual([]);
     expect(await exists(lockOf(rollout))).toBe(false);
   });
 
@@ -191,14 +193,29 @@ describe("withSessionLock under exact interleavings", () => {
     const rollout = await rolloutPath();
     await real.mkdir(pendingOf(rollout));
     await real.writeFile(path.join(pendingOf(rollout), "waiting"), "");
-    steps.before = (op, [from]) => {
-      if (op === "rename" && from === pendingOf(rollout)) throw eio();
+    steps.before = (op, [dir]) => {
+      if (op === "readdir" && dir === pendingOf(rollout)) throw eio();
     };
     let ran = false;
 
     await expect(withSessionLock(rollout, async () => { ran = true; }, T)).rejects.toThrow("EIO");
     expect(ran).toBe(false);
     expect(await exists(lockOf(rollout))).toBe(false);
+  });
+
+  it("never runs a drainer without the lock when the lock cannot be created", async () => {
+    const rollout = await rolloutPath();
+    await real.mkdir(pendingOf(rollout));
+    await real.writeFile(path.join(pendingOf(rollout), "waiting"), "");
+    steps.before = (op, [file]) => {
+      if (op === "mkdir" && String(file).startsWith(`${lockOf(rollout)}.`)) throw eio();
+    };
+    let ran = false;
+
+    await drainSession(rollout, async () => { ran = true; }, { ...T, waitMs: 20, rerunBudgetMs: 40 });
+    expect(ran).toBe(false);
+    expect(await requestsOf(rollout)).toEqual(["waiting"]);
+    expect(await exists(drainerOf(rollout))).toBe(false);
   });
 
   it("does not report a hand-off when it could not leave its request", async () => {
@@ -210,9 +227,11 @@ describe("withSessionLock under exact interleavings", () => {
     setDebug(true);
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     let ran = false;
+    let drainers = 0;
 
-    expect(await withSessionLock(rollout, async () => { ran = true; }, T)).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => { ran = true; }, T, false, () => { drainers += 1; })).toBeUndefined();
     expect(ran).toBe(false);
+    expect(drainers).toBe(0); // it left nothing to serve
     expect(await exists(pendingOf(rollout))).toBe(false);
     const lines = log.mock.calls.map((args) => args.join(" "));
     expect(lines.some((line) => line.includes("could not ask"))).toBe(true);
@@ -453,6 +472,64 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
     }
     expect(tried).toBeGreaterThan(100);
   }, 120_000);
+
+  type Arrival = (rollout: string, stop: () => Promise<void>, startDrainer: () => void, runs: ReturnType<typeof inFlight>) => Promise<unknown>;
+
+  it.each<[string, Arrival, number]>([
+    ["the turn's last Stop arrives", (_rollout, stop) => stop(), 1],
+    // The Stop hands off to a hook that took the lock as the drainer let go of it,
+    // and that hook exits past its budget: both may find the drainer still serving.
+    ["a hook takes the lock, and the Stop hands off to it and exits", (rollout, stop, startDrainer, runs) =>
+      as("holder", () => withSessionLock(rollout, () => runs.run(stop), { ...T, rerunBudgetMs: 0 }, false, startDrainer)), 2],
+  ])("leaves no run unserved when, wherever a drainer pauses, %s", async (_label, arrive, hooks) => {
+    // Drainers wait for the lock as they would for a hook's run.
+    const D: LockTimings = { ...T, waitMs: 2_000 };
+    for (let pauseAt = 1; ; pauseAt++) {
+      const rollout = await rolloutPath();
+      await real.mkdir(pendingOf(rollout));
+      await real.writeFile(path.join(pendingOf(rollout), "left"), "");
+      const runs = inFlight();
+      const served: HandOff[] = [];
+      const run = (_lock: SessionLock, handOff: HandOff) => runs.run(async () => { served.push(handOff); });
+      const drainers: Promise<void>[] = [];
+      const startDrainer = () => { drainers.push(as("another drainer", () => drainSession(rollout, run, D))); };
+      let reached = false;
+      let stopRan = false;
+      let stopAt: number | undefined;
+      const stop = async () => {
+        stopAt = Date.now();
+        await as("stop", () => withSessionLock(rollout, () => runs.run(async () => { stopRan = true; }), T, true, startDrainer));
+      };
+
+      // Right before the drainer's operation number `pauseAt`, the hooks arrive. A
+      // Stop runs if the lock is free, else hands off; a hook leaving a run starts a
+      // drainer unless it finds one serving the session.
+      let ops = 0;
+      steps.before = async () => {
+        if (actor.getStore() !== "drainer" || ++ops !== pauseAt) return;
+        reached = true;
+        await arrive(rollout, stop, startDrainer, runs);
+      };
+      await as("drainer", () => drainSession(rollout, run, D));
+      steps.before = undefined;
+      await Promise.all(drainers);
+      const left = await requestsOf(rollout);
+      const drainerLeft = await exists(drainerOf(rollout));
+      const lockLeft = await exists(lockOf(rollout));
+      await real.rm(dir, { recursive: true, force: true });
+
+      if (!reached) break; // the drainer made fewer operations: every point was tried
+      const at = `paused before the drainer's operation ${pauseAt}`;
+      expect(left, `a run left unserved: ${at}`).toEqual([]);
+      if (stopAt !== undefined) {
+        expect(stopRan || served.some((handOff) => (handOff.turnEndedAt ?? -1) >= stopAt!), `the Stop's turn never ended: ${at}`).toBe(true);
+      }
+      expect(runs.most, `two runs at once: ${at}`).toBeLessThanOrEqual(1);
+      // A drainer started before the first takes the drainer directory finds it held and exits.
+      expect(drainers.length, `more drainers than hooks that left a run: ${at}`).toBeLessThanOrEqual(hooks);
+      expect(drainerLeft || lockLeft, `left the lock or the drainer directory behind: ${at}`).toBe(false);
+    }
+  });
 
   it("serves the latest of two Stops handing off at once, wherever the older one pauses", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });

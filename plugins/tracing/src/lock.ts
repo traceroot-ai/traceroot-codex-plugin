@@ -24,6 +24,16 @@ const DEFAULT_TIMINGS: LockTimings = {
   waitMs: 10_000, staleMs: 30_000, heartbeatMs: 5_000, rerunBudgetMs: 15_000, pollMs: 50,
 };
 
+/** A drainer exits this long after it starts, whatever it is doing. */
+export const DRAIN_LIFETIME_MS = 120_000;
+
+// A drainer runs outside Codex's 30 s, after the hooks that left it work have
+// exited. A live holder lets go within 30 s and a frozen one goes stale after
+// 30 s, so a minute's wait is enough; it starts runs only in its first 90 s.
+export const DRAIN_TIMINGS: LockTimings = {
+  waitMs: 60_000, staleMs: 30_000, heartbeatMs: 5_000, rerunBudgetMs: 90_000, pollMs: 200,
+};
+
 export type SessionLock = {
   /** Whether this hook still holds the session's lock. Check it right before exporting. */
   held: () => Promise<boolean>;
@@ -144,19 +154,11 @@ function laterTurnEnd(a: number | undefined, b: number | undefined): number | un
  */
 async function requestRun(pendingDir: string, turnEndedAt: number | undefined): Promise<boolean> {
   const tmp = `${pendingDir}.${randomUUID()}.tmp`;
-  const request = path.join(pendingDir, randomUUID());
   try {
     await fs.writeFile(tmp, turnEndedAt === undefined ? "" : String(turnEndedAt));
-    // A holder claiming the requests moves the directory away; then it is made again.
-    for (let attempt = 1; ; attempt++) {
-      await fs.mkdir(pendingDir, { recursive: true });
-      try {
-        await fs.rename(tmp, request);
-        return true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || attempt >= 3) throw error;
-      }
-    }
+    await fs.mkdir(pendingDir, { recursive: true });
+    await fs.rename(tmp, path.join(pendingDir, randomUUID()));
+    return true;
   } catch {
     return false;
   } finally {
@@ -166,48 +168,54 @@ async function requestRun(pendingDir: string, turnEndedAt: number | undefined): 
 
 const hasRequests = (pendingDir: string) => fs.readdir(pendingDir).then((names) => names.length > 0, () => false);
 
+/** The requests one run serves, and the latest turn end among them. */
+type Claim = { handOff: HandOff; requests: string[] };
+
 /**
- * Takes every request waiting for a run, by moving their directory away, so that
- * requests made after this get a run of their own. The latest turn end among them
- * is passed on.
+ * Takes the requests waiting for a run. Requests made after this are not among
+ * them, so they get a run of their own. They stay in place until the run that
+ * claimed them has finished, so a hook killed during that run leaves them for the
+ * next one.
  */
-async function claimRequests(pendingDir: string): Promise<HandOff> {
-  const claimed = `${pendingDir}.${randomUUID()}.claimed`;
+async function claimRequests(pendingDir: string): Promise<Claim> {
+  let requests: string[];
   try {
-    await fs.rename(pendingDir, claimed);
+    requests = await fs.readdir(pendingDir);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { handOff: {}, requests: [] };
     throw error;
   }
   let turnEndedAt: number | undefined;
-  try {
-    for (const name of await fs.readdir(claimed).catch(() => [])) {
-      const request = await fs.readFile(path.join(claimed, name), "utf-8").catch(() => "");
-      turnEndedAt = laterTurnEnd(turnEndedAt, turnEndOf(request));
-    }
-  } finally {
-    await fs.rm(claimed, { recursive: true, force: true }).catch(() => {});
+  for (const name of requests) {
+    const request = await fs.readFile(path.join(pendingDir, name), "utf-8").catch(() => "");
+    turnEndedAt = laterTurnEnd(turnEndedAt, turnEndOf(request));
   }
-  return turnEndedAt === undefined ? {} : { turnEndedAt };
+  return { handOff: turnEndedAt === undefined ? {} : { turnEndedAt }, requests };
 }
 
-type Acquired = "held" | "handed-off" | "not-handed-off" | "unlocked";
+async function removeRequests(pendingDir: string, requests: string[]): Promise<void> {
+  for (const name of requests) await fs.rm(path.join(pendingDir, name), { force: true }).catch(() => {});
+}
+
+type Acquired = "held" | "handed-off" | "not-handed-off" | "unlocked" | "timed-out";
 
 async function acquire(
-  lockDir: string, pendingDir: string, owner: string, turnEndedAt: number | undefined, t: LockTimings,
+  lockDir: string, pendingDir: string, owner: string, turnEndedAt: number | undefined, t: LockTimings, drainer: boolean,
 ): Promise<Acquired> {
   const deadline = Date.now() + t.waitMs;
   // Failing open is for a lock that can't be created at all: once another hook was
   // seen holding it, an error creating it is no reason to run alongside that hook.
+  // A drainer never fails open: no hook waits on it, so it keeps trying instead.
   let seenHeld = false;
   const attemptLock = async () => {
     const attempt = await tryLock(lockDir, owner, t.staleMs);
     seenHeld ||= attempt === "busy";
-    return attempt instanceof Error && seenHeld ? "busy" : attempt;
+    return attempt instanceof Error && (seenHeld || drainer) ? "busy" : attempt;
   };
   for (;;) {
     let attempt = await attemptLock();
     if (attempt === "busy" && Date.now() >= deadline) {
+      if (drainer) return "timed-out";
       // Ask the holder to run again for this hook, then look once more: the holder
       // may have released after it last looked for requests.
       const asked = await requestRun(pendingDir, turnEndedAt);
@@ -224,39 +232,66 @@ async function acquire(
   }
 }
 
+const pathsOf = (rolloutFile: string) => ({
+  lockDir: `${rolloutFile}.traceroot.lock.d`,
+  pendingDir: `${rolloutFile}.traceroot.pending.d`,
+  drainerDir: `${rolloutFile}.traceroot.drainer.d`,
+});
+
+/** Removes `owner`'s entry, then the directory if that left it empty. */
+async function releaseOwner(dir: string, owner: string): Promise<void> {
+  await fs.rm(path.join(dir, owner), { force: true }).catch(() => {});
+  await fs.rmdir(dir).catch(() => {}); // refused once another hook holds it
+}
+
 /**
- * Runs `run` while holding the session's lock, a directory next to the rollout, so
- * hooks of one session (a subagent's SubagentStop beside the parent's own hooks,
- * say) read the rollout, export and record what they sent one at a time.
- *
- * A hook that can't get the lock within `waitMs` never runs on its own: it leaves
- * a request and returns undefined, and the holder runs again, reading the rollout
- * as it is then. A hook that `endsTurn` says so in its request, and the run that
- * serves it is told when it arrived. The holder keeps its entry in the lock fresh
- * while it runs, so it is taken over only if it exits or freezes, and `run` checks
- * `held()` before exporting so a frozen holder that resumes sends nothing.
+ * Whether a drainer is serving the session: the drainer directory, made like the
+ * lock, names a live owner. A drainer exits within DRAIN_LIFETIME_MS, so an older
+ * entry is one whose drainer died.
  */
-export async function withSessionLock<T>(
-  rolloutFile: string,
-  run: (lock: SessionLock, handOff: HandOff) => Promise<T>,
-  timings: LockTimings = DEFAULT_TIMINGS,
-  endsTurn = false,
+async function drainerRunning(drainerDir: string): Promise<boolean> {
+  const owners = await ownersOf(drainerDir);
+  return !!owners && owners.some((owner) => !isStale(owner, DRAIN_LIFETIME_MS));
+}
+
+type Role = {
+  endsTurn: boolean;
+  /** Never hands off nor runs unlocked, and runs only for requests. */
+  drainer: boolean;
+  /** Called when this hook exits leaving requests and no drainer is serving the session. */
+  startDrainer?: () => void;
+};
+
+async function serve<T>(
+  rolloutFile: string, run: (lock: SessionLock, handOff: HandOff) => Promise<T>, timings: LockTimings, role: Role,
 ): Promise<T | undefined> {
   // The rerun budget counts from here, so the time spent waiting for the lock is part of it.
   const started = Date.now();
-  const lockDir = `${rolloutFile}.traceroot.lock.d`;
-  const pendingDir = `${rolloutFile}.traceroot.pending.d`;
+  const { lockDir, pendingDir, drainerDir } = pathsOf(rolloutFile);
   // A new name for every time this hook takes the lock, so a hook that judged an
   // earlier holding stale can never remove a later one.
   let owner = newOwner();
-  const turnEndedAt = endsTurn ? started : undefined;
-  const acquired = await acquire(lockDir, pendingDir, owner, turnEndedAt, timings);
+  const turnEndedAt = role.endsTurn ? started : undefined;
+  // Requests this hook leaves may have no run left to serve them: the holder it
+  // handed off to may be past its budget or be killed at Codex's deadline, and
+  // after a turn's last Stop no later hook may come. A drainer serves them.
+  const leaveToDrainer = async () => {
+    if (!role.startDrainer || !(await hasRequests(pendingDir)) || (await drainerRunning(drainerDir))) return;
+    debugLog("starting a drainer for the runs this session's hooks left");
+    role.startDrainer();
+  };
+  const acquired = await acquire(lockDir, pendingDir, owner, turnEndedAt, timings, role.drainer);
   if (acquired === "handed-off") {
     debugLog("another hook of this session holds the lock; it runs again for this one");
+    await leaveToDrainer();
     return undefined;
   }
   if (acquired === "not-handed-off") {
     debugLog("another hook of this session holds the lock, and this one could not ask it to run again; sending nothing");
+    return undefined;
+  }
+  if (acquired === "timed-out") {
+    debugLog("the session lock stayed held; leaving its runs for the session's next hook");
     return undefined;
   }
   if (acquired === "unlocked") return run({ held: async () => true }, {});
@@ -270,10 +305,6 @@ export async function withSessionLock<T>(
       lostInRun ||= !mine;
       return mine;
     },
-  };
-  const release = async () => {
-    await fs.rm(ownerPath(), { force: true }).catch(() => {});
-    await fs.rmdir(lockDir).catch(() => {}); // refused once another hook holds it
   };
   const heartbeat = setInterval(() => {
     void lock.held().then((mine) => {
@@ -292,20 +323,27 @@ export async function withSessionLock<T>(
     for (;;) {
       // Claimed before reading the rollout: a request made after this point is
       // for a newer rollout, so it gets a run of its own.
-      const handOff = await claimRequests(pendingDir);
+      const claim = await claimRequests(pendingDir);
+      if (role.drainer && claim.requests.length === 0) {
+        debugLog("nothing left to run for; the hooks served it");
+        return undefined;
+      }
       lostInRun = false;
-      const result = await run(lock, handOff).finally(() => askAgainIfLost(handOff));
+      const result = await run(lock, claim.handOff).finally(async () => {
+        await askAgainIfLost(claim.handOff);
+        await removeRequests(pendingDir, claim.requests);
+      });
       if (await hasRequests(pendingDir)) {
         if (budgetLeft() && (await lock.held())) {
           debugLog("running again for a hook that handed its run to this one");
           continue;
         }
-        debugLog("leaving a handed-off run for the session's next hook");
+        debugLog("leaving a handed-off run for a drainer or the session's next hook");
         return result;
       }
       // Release, then look again: a hook may have asked between that look and the
       // release. Then either it takes the lock itself, or this hook takes it back.
-      await release();
+      await releaseOwner(lockDir, owner);
       if (!(await hasRequests(pendingDir)) || !budgetLeft()) return result;
       owner = newOwner();
       if ((await tryLock(lockDir, owner, timings.staleMs)) !== "held") return result;
@@ -313,6 +351,66 @@ export async function withSessionLock<T>(
     }
   } finally {
     clearInterval(heartbeat);
-    await release();
+    await releaseOwner(lockDir, owner);
+    await leaveToDrainer();
+  }
+}
+
+/**
+ * Runs `run` while holding the session's lock, a directory next to the rollout, so
+ * hooks of one session (a subagent's SubagentStop beside the parent's own hooks,
+ * say) read the rollout, export and record what they sent one at a time.
+ *
+ * A hook that can't get the lock within `waitMs` never runs on its own: it leaves
+ * a request and returns undefined, and the holder runs again, reading the rollout
+ * as it is then. A hook that `endsTurn` says so in its request, and the run that
+ * serves it is told when it arrived. The holder keeps its entry in the lock fresh
+ * while it runs, so it is taken over only if it exits or freezes, and `run` checks
+ * `held()` before exporting so a frozen holder that resumes sends nothing.
+ *
+ * A hook that exits while requests are still waiting, after handing off or as a
+ * holder past its rerun budget, calls `startDrainer` unless a drainer is already
+ * serving the session (see drainSession).
+ */
+export async function withSessionLock<T>(
+  rolloutFile: string,
+  run: (lock: SessionLock, handOff: HandOff) => Promise<T>,
+  timings: LockTimings = DEFAULT_TIMINGS,
+  endsTurn = false,
+  startDrainer?: () => void,
+): Promise<T | undefined> {
+  return serve(rolloutFile, run, timings, { endsTurn, drainer: false, startDrainer });
+}
+
+/**
+ * Serves the requests the session's hooks left, from a process that outlives them:
+ * a drainer. It waits for the lock like a hook, but it never hands off, never runs
+ * unlocked, and runs only for requests still waiting, so it adds no run when the
+ * hooks served them. It starts no run after `rerunBudgetMs`.
+ *
+ * At most one drainer serves a session: it holds the drainer directory, made and
+ * removed like the lock, while it works, and one that finds it held exits. After
+ * letting go it looks again, since a hook that left a request meanwhile saw it
+ * running and started no drainer of its own.
+ */
+export async function drainSession<T>(
+  rolloutFile: string,
+  run: (lock: SessionLock, handOff: HandOff) => Promise<T>,
+  timings: LockTimings = DRAIN_TIMINGS,
+): Promise<void> {
+  const started = Date.now();
+  const { pendingDir, drainerDir } = pathsOf(rolloutFile);
+  for (;;) {
+    const left = timings.rerunBudgetMs - (Date.now() - started);
+    if (left <= 0 || !(await hasRequests(pendingDir))) return;
+    const owner = newOwner();
+    if ((await tryLock(drainerDir, owner, DRAIN_LIFETIME_MS)) !== "held") return; // another drainer serves them
+    try {
+      await serve(rolloutFile, run, { ...timings, waitMs: Math.min(timings.waitMs, left), rerunBudgetMs: left }, {
+        endsTurn: false, drainer: true,
+      });
+    } finally {
+      await releaseOwner(drainerDir, owner);
+    }
   }
 }

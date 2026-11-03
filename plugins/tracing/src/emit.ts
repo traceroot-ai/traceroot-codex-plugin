@@ -1,8 +1,9 @@
 import type { Config } from "./config.js";
+import { spawnDrainer } from "./drainer.js";
 import { buildTracing as defaultBuildTracing, type Tracing } from "./exporter.js";
 import { getGitContext } from "./git.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
-import { type HandOff, type LockTimings, type SessionLock, withSessionLock } from "./lock.js";
+import { drainSession, type HandOff, type LockTimings, type SessionLock, withSessionLock } from "./lock.js";
 import { loadEmittedSpanIds, markSpanEmitted } from "./sidecar.js";
 import { emitSpan, planTurnSpans, type EmitCtx, type PlanOpts } from "./spans.js";
 import { locateSubagentRollout } from "./subagents.js";
@@ -24,6 +25,9 @@ export type Deps = {
    */
   findSubagent: (threadId: string) => Promise<string | undefined>;
   lockTimings: LockTimings;
+  drainTimings: LockTimings;
+  /** Starts a drainer for the hook's session (see drainSession). */
+  startDrainer: (hook: HookInput) => void;
 };
 
 const buildLockedTracing: Deps["buildTracing"] = (c, stillHeld) => defaultBuildTracing(c, undefined, stillHeld);
@@ -114,10 +118,21 @@ export async function dispatch(
   // session's lock, so concurrent hooks of one session deliver in the order they read.
   const result = await withSessionLock(
     transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), deps?.lockTimings,
-    hook.hook_event_name === "Stop",
+    hook.hook_event_name === "Stop", () => (deps?.startDrainer ?? spawnDrainer)(hook),
   );
   // undefined: the hook holding the lock runs again for this one, or this one couldn't ask it to.
   return result ?? { emitted: 0 };
+}
+
+/** Serves, as a drainer, the runs the session's hooks left behind (see drainSession). */
+export async function drain(hook: HookInput, config: Config, deps?: Partial<Deps>): Promise<void> {
+  const transcript = hook.transcript_path;
+  if (!transcript) return;
+  // No hook event of its own: it ends a turn only for a Stop among the runs it serves.
+  const session: HookInput = { transcript_path: transcript, cwd: hook.cwd };
+  await drainSession(
+    transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), deps?.drainTimings,
+  );
 }
 
 async function emitSession(

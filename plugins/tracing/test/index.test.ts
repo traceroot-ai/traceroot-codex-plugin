@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
 
 // Hoisted mocks with benign DISABLED defaults so the module-load self-invoke
@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   readStdinMock: vi.fn(async () => ({}) as Record<string, unknown>),
   getConfigMock: vi.fn(async () => ({ enabled: false, debug: false, failOnError: false }) as Config),
   dispatchMock: vi.fn(async () => ({ emitted: 0 })),
+  drainMock: vi.fn(async () => {}),
 }));
 
 vi.mock("../src/util.js", async (orig) => {
@@ -15,10 +16,11 @@ vi.mock("../src/util.js", async (orig) => {
   return { ...actual, readStdin: mocks.readStdinMock };
 });
 vi.mock("../src/config.js", () => ({ getConfig: mocks.getConfigMock }));
-vi.mock("../src/emit.js", () => ({ dispatch: mocks.dispatchMock }));
+vi.mock("../src/emit.js", () => ({ dispatch: mocks.dispatchMock, drain: mocks.drainMock }));
 
 // Import once. The self-invoke runs here with the disabled defaults above.
-const { runHook } = await import("../src/index.js");
+const { runDrainer, runHook } = await import("../src/index.js");
+const { DRAIN_LIFETIME_MS } = await import("../src/lock.js");
 
 const baseConfig: Config = {
   enabled: false,
@@ -38,7 +40,9 @@ beforeEach(() => {
   mocks.readStdinMock.mockReset().mockResolvedValue({});
   mocks.getConfigMock.mockReset().mockResolvedValue(disabledConfig);
   mocks.dispatchMock.mockReset().mockResolvedValue({ emitted: 0 });
+  mocks.drainMock.mockReset().mockResolvedValue(undefined);
 });
+afterEach(() => { vi.useRealTimers(); });
 
 describe("runHook", () => {
   it("returns without throwing when disabled", async () => {
@@ -97,5 +101,46 @@ describe("runHook", () => {
     } finally {
       process.exitCode = prev;
     }
+  });
+});
+
+describe("runDrainer", () => {
+  const session = JSON.stringify({ transcript_path: "/x/rollout.jsonl", cwd: "/x" });
+
+  it("drains the session it was started for when tracing is enabled", async () => {
+    mocks.getConfigMock.mockResolvedValue(enabledConfig);
+    await runDrainer(session, () => {});
+    expect(mocks.getConfigMock).toHaveBeenCalledWith("/x");
+    expect(mocks.drainMock).toHaveBeenCalledWith({ transcript_path: "/x/rollout.jsonl", cwd: "/x" }, enabledConfig);
+  });
+
+  it.each([
+    ["tracing is disabled", session, disabledConfig],
+    ["it names no rollout", JSON.stringify({ cwd: "/x" }), enabledConfig],
+    ["its session can't be read", "{", enabledConfig],
+    ["it was given no session", undefined, enabledConfig],
+  ])("does nothing when %s", async (_label, given, config) => {
+    mocks.getConfigMock.mockResolvedValue(config);
+    await expect(runDrainer(given, () => {})).resolves.toBeUndefined();
+    expect(mocks.drainMock).not.toHaveBeenCalled();
+  });
+
+  it("swallows drain errors: nothing reads a drainer's output or exit code", async () => {
+    mocks.getConfigMock.mockResolvedValue(enabledConfig);
+    mocks.drainMock.mockRejectedValue(new Error("boom"));
+    await expect(runDrainer(session, () => {})).resolves.toBeUndefined();
+  });
+
+  it("stops the drainer once its lifetime is up, whatever it is doing", async () => {
+    vi.useFakeTimers();
+    mocks.getConfigMock.mockResolvedValue(enabledConfig);
+    mocks.drainMock.mockReturnValue(new Promise(() => {})); // a run that never finishes
+    const exit = vi.fn();
+
+    void runDrainer(session, exit);
+    await vi.advanceTimersByTimeAsync(DRAIN_LIFETIME_MS - 1);
+    expect(exit).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(exit).toHaveBeenCalledTimes(1);
   });
 });

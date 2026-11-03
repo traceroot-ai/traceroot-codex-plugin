@@ -1,6 +1,7 @@
 import type { ExportResult } from "@opentelemetry/core";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -8,11 +9,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
-import { dispatch } from "../src/emit.js";
+import { dispatch, drain } from "../src/emit.js";
 import { buildTracing } from "../src/exporter.js";
 import { makeSpanId } from "../src/ids.js";
-import { type HandOff, type LockTimings, withSessionLock } from "../src/lock.js";
+import { drainSession, type HandOff, type LockTimings, withSessionLock } from "../src/lock.js";
 import { loadEmittedSpanIds } from "../src/sidecar.js";
+import type { HookInput } from "../src/types.js";
 import { ids, OK, ScriptedExporter } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -53,6 +55,33 @@ const requestsOf = async (rollout: string) => {
   return Promise.all(names.map(async (name) => Number((await fs.readFile(path.join(pendingOf(rollout), name), "utf-8")) || NaN)));
 };
 const hasRequest = async (rollout: string) => (await requestsOf(rollout)).length > 0;
+/** Leaves a request for a run, as a hook that handed off does; a Stop's names when it arrived. */
+async function leaveRequest(rollout: string, turnEndedAt?: number): Promise<void> {
+  await fs.mkdir(pendingOf(rollout), { recursive: true });
+  await fs.writeFile(path.join(pendingOf(rollout), randomUUID()), turnEndedAt === undefined ? "" : String(turnEndedAt));
+}
+const drainerOf = (rollout: string) => `${rollout}.traceroot.drainer.d`;
+/** Leaves the drainer directory naming `owner`, as a drainer serving the session does. */
+async function leaveDrainer(rollout: string, owner: string): Promise<void> {
+  await fs.mkdir(drainerOf(rollout));
+  await fs.writeFile(path.join(drainerOf(rollout), owner), owner);
+}
+/** Nothing is left next to the rollout but an empty request directory. */
+async function settled(rollout: string): Promise<void> {
+  expect(await requestsOf(rollout)).toEqual([]);
+  expect(await exists(lockOf(rollout))).toBe(false);
+  expect(await exists(drainerOf(rollout))).toBe(false);
+}
+/** What a hook or drainer killed now leaves: its entries in `dirs` name a process that is gone. */
+function die(pid: number, ...dirs: string[]): void {
+  for (const dir of dirs) {
+    for (const name of readdirSync(dir)) {
+      rmSync(path.join(dir, name), { force: true });
+      writeFileSync(path.join(dir, `${pid}.${name.split(".")[1]}`), "");
+    }
+  }
+}
+const never = new Promise<void>(() => {});
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -377,6 +406,180 @@ describe("withSessionLock", () => {
   });
 });
 
+describe("drainers", () => {
+  it("are started by a hook that hands off, and not by a holder that served it", async () => {
+    const rollout = await rolloutPath();
+    const started = deferred();
+    const gate = deferred();
+    let starts = 0;
+    const startDrainer = () => { starts += 1; };
+
+    const holder = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, T, false, startDrainer);
+    await started.promise;
+    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, startDrainer)).toBeUndefined();
+    expect(starts).toBe(1);
+    gate.resolve();
+    await holder;
+    expect(starts).toBe(1);
+    await settled(rollout);
+  });
+
+  it.each<[string, ((rollout: string) => Promise<void>) | undefined, number]>([
+    ["no drainer is serving the session", undefined, 1],
+    ["the drainer that was serving it died", async (r) => leaveDrainer(r, `${await deadPid()}.x`), 1],
+    ["a drainer is serving it", async (r) => leaveDrainer(r, `${process.pid}.x`), 0],
+  ])("are started by a holder that exits past its budget with a run left when %s", async (_label, before, starts) => {
+    const rollout = await rolloutPath();
+    await before?.(rollout);
+    let started = 0;
+
+    await withSessionLock(rollout, () => leaveRequest(rollout), { ...T, rerunBudgetMs: 0 }, false, () => { started += 1; });
+    expect(started).toBe(starts);
+    expect(await hasRequest(rollout)).toBe(true);
+  });
+
+  it("serve the Stop a holder past its budget left, once the holder lets go", async () => {
+    const rollout = await rolloutPath();
+    const { t, run } = tracker();
+    const started = deferred();
+    const gate = deferred();
+    const drainers: Promise<void>[] = [];
+    const served: HandOff[] = [];
+    const startDrainer = () => {
+      drainers.push(drainSession(rollout, (_lock, handOff) => run(async () => { served.push(handOff); }), T));
+    };
+
+    const holder = withSessionLock(rollout, () => run(async () => { started.resolve(); await gate.promise; }),
+      { ...T, rerunBudgetMs: 0 }, false, startDrainer);
+    await started.promise;
+    const arrived = Date.now();
+    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, startDrainer)).toBeUndefined();
+    gate.resolve();
+    await holder;
+    await Promise.all(drainers);
+
+    expect(drainers).toHaveLength(1); // the holder found it serving the session
+    expect(served).toHaveLength(1);
+    expect(served[0]!.turnEndedAt).toBeGreaterThanOrEqual(arrived);
+    expect(t.max).toBe(1);
+    await settled(rollout);
+  });
+
+  it("do not run when the holder served the hook they were started for", async () => {
+    const rollout = await rolloutPath();
+    const started = deferred();
+    const gate = deferred();
+    const runs: string[] = [];
+    const drainers: Promise<void>[] = [];
+
+    const holder = withSessionLock(rollout, async () => {
+      runs.push("holder");
+      if (runs.length === 1) { started.resolve(); await gate.promise; }
+    }, T);
+    await started.promise;
+    await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, () => {
+      drainers.push(drainSession(rollout, async () => { runs.push("drainer"); }, T));
+    });
+    gate.resolve();
+    await holder;
+    await Promise.all(drainers);
+
+    expect(drainers).toHaveLength(1);
+    expect(runs).toEqual(["holder", "holder"]);
+    await settled(rollout);
+  });
+
+  it("serve a Stop the holder claimed and was killed while running for", async () => {
+    const rollout = await rolloutPath();
+    const started = deferred();
+    const gate = deferred();
+    const claimed = deferred();
+    const drainers: Promise<void>[] = [];
+    const served: HandOff[] = [];
+    let holderRuns = 0;
+    const killed = await deadPid();
+
+    void withSessionLock(rollout, async () => {
+      holderRuns += 1;
+      if (holderRuns === 1) { started.resolve(); await gate.promise; return; }
+      die(killed, lockOf(rollout)); // killed while running for the Stop it claimed
+      claimed.resolve();
+      await never;
+    }, T);
+    await started.promise;
+    const arrived = Date.now();
+    await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, () => {
+      drainers.push(drainSession(rollout, async (_lock, handOff) => { served.push(handOff); }, T));
+    });
+    gate.resolve();
+    await claimed.promise;
+    await Promise.all(drainers);
+
+    expect(served).toHaveLength(1);
+    expect(served[0]!.turnEndedAt).toBeGreaterThanOrEqual(arrived);
+    await settled(rollout);
+  });
+
+  it("take over from a drainer that died, and serve what it was serving", async () => {
+    const rollout = await rolloutPath();
+    await leaveRequest(rollout, 1234);
+    const running = deferred();
+    const killed = await deadPid();
+    void drainSession(rollout, async () => {
+      die(killed, lockOf(rollout), drainerOf(rollout));
+      running.resolve();
+      await never;
+    }, T);
+    await running.promise; // it died in its run, holding the lock and the drainer directory
+    const served: HandOff[] = [];
+
+    await drainSession(rollout, async (_lock, handOff) => { served.push(handOff); }, T);
+    expect(served).toEqual([{ turnEndedAt: 1234 }]);
+    await settled(rollout);
+  });
+
+  it("let only one of them serve a session; another exits at once", async () => {
+    const rollout = await rolloutPath();
+    await leaveLock(rollout, `${process.pid}.holder`);
+    await leaveRequest(rollout, 1234);
+    const served: HandOff[] = [];
+    const run = async (_lock: unknown, handOff: HandOff) => { served.push(handOff); };
+    const waiting = deferred();
+
+    const first = drainSession(rollout, run, waitingTimings(T, waiting));
+    await waiting.promise; // it holds the drainer directory and waits for the lock
+    await drainSession(rollout, run, { ...T, sleep: async () => { throw new Error("waited for the lock"); } });
+    expect(served).toEqual([]);
+    await fs.rm(lockOf(rollout), { recursive: true }); // the holder lets go without running for it
+    await first;
+
+    expect(served).toEqual([{ turnEndedAt: 1234 }]);
+    await settled(rollout);
+  });
+
+  it("neither run, hand off nor keep trying past their budget while the lock stays held", async () => {
+    const rollout = await rolloutPath();
+    await leaveLock(rollout, `${process.pid}.holder`);
+    await leaveRequest(rollout);
+    let ran = false;
+
+    await drainSession(rollout, async () => { ran = true; }, { ...T, waitMs: 20, rerunBudgetMs: 50 });
+    expect(ran).toBe(false);
+    expect(await requestsOf(rollout)).toHaveLength(1);
+    expect(await exists(drainerOf(rollout))).toBe(false);
+  });
+
+  it("exit at once when no run is waiting", async () => {
+    const rollout = await rolloutPath();
+    let ran = false;
+
+    await drainSession(rollout, async () => { ran = true; }, { ...T, sleep: async () => { throw new Error("waited"); } });
+    expect(ran).toBe(false);
+    expect(await exists(drainerOf(rollout))).toBe(false);
+    expect(await exists(lockOf(rollout))).toBe(false);
+  });
+});
+
 describe("dispatch under the session lock", () => {
   const config: Config = {
     enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: true, captureImages: false,
@@ -419,6 +622,8 @@ describe("dispatch under the session lock", () => {
     // getGit runs right after the rollout is read.
     getGit: async () => { events.push(`${label}:read`); return {}; },
     lockTimings: timings,
+    drainTimings: timings,
+    startDrainer: () => {},
   });
 
   it("lets a hook that started later read the rollout only after the earlier hook delivered", async () => {
@@ -484,6 +689,38 @@ describe("dispatch under the session lock", () => {
       "first:read", "first:export without root", "first:delivered",
       "first:read", "first:export with root", "first:delivered",
     ]);
+  });
+
+  it("sends the rest of the turn for its last Stop with no later hook, when the holder runs past its budget", async () => {
+    const transcript = await transcriptCopy("rollout-inprogress.jsonl");
+    const events: string[] = [];
+    const gate = deferred();
+    const exporting = deferred();
+    const drainers: Promise<void>[] = [];
+    // What a hook starts runs on its own, in the drainer the real hook would spawn.
+    const startDrainer = (hook: HookInput) => {
+      events.push("drainer:started");
+      drainers.push(drain(hook, config, depsFor("drainer", events, new GatedExporter("drainer", events), T)));
+    };
+
+    // The holder's export is slow: by the time it is delivered, the holder's rerun budget is spent.
+    const holder = dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config,
+      { ...depsFor("holder", events, new GatedExporter("holder", events, gate.promise, exporting.resolve), { ...T, rerunBudgetMs: 0 }), startDrainer });
+    await exporting.promise;
+    // The turn's last Stop hands off and exits. No hook runs after it.
+    expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop", cwd: dir }, config,
+      { ...depsFor("stop", events, new GatedExporter("stop", events), { ...T, waitMs: 0 }), startDrainer })).toEqual({ emitted: 0 });
+    gate.resolve();
+    await holder;
+    await Promise.all(drainers);
+
+    expect(events).toEqual([
+      "holder:read", "holder:export without root", "drainer:started", "holder:delivered",
+      "drainer:read", "drainer:export with root", "drainer:delivered",
+    ]);
+    expect(await requestsOf(transcript)).toEqual([]);
+    expect(await exists(lockOf(transcript))).toBe(false);
+    expect(await exists(`${transcript}.traceroot.drainer.d`)).toBe(false);
   });
 
   it.each([

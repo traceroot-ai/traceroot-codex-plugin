@@ -2,10 +2,11 @@ import { createRequire } from "node:module";
 import * as fs from "node:fs/promises";
 import * as os$1 from "node:os";
 import * as path from "node:path";
+import { execFile, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import * as zlib from "zlib";
 import { Readable } from "stream";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 //#region rolldown:runtime
@@ -92,6 +93,60 @@ async function getConfig(cwd = process.cwd()) {
 	};
 	config.enabled = truthy(enabledFlag) && Boolean(apiKey);
 	return config;
+}
+
+//#endregion
+//#region src/util.ts
+let DEBUG = false;
+function setDebug(b) {
+	DEBUG = b;
+}
+function debugLog(...args) {
+	if (DEBUG) console.error("[traceroot-codex]", ...args);
+}
+async function readStdin() {
+	const chunks = [];
+	for await (const c of process.stdin) chunks.push(c);
+	const raw = Buffer.concat(chunks).toString("utf-8").trim();
+	return JSON.parse(raw || "{}");
+}
+function truncate(s, max) {
+	if (s.length <= max) return s;
+	return `${s.slice(0, max)}…[truncated ${s.length - max} chars]`;
+}
+
+//#endregion
+//#region src/drainer.ts
+/** The argument that makes the bundle drain a session instead of handling a hook. */
+const DRAIN_ARG = "--drain";
+/**
+* Starts a drainer for the hook's session (see drainSession): this bundle again, in
+* a process that keeps running after the hook exits. Codex reads a hook's output
+* until it closes and, when a hook times out, kills the hook's process group, so
+* the drainer shares neither: it has no stdio and, outside Windows, a session of
+* its own. On Windows it stays in the hook's job, which Codex keeps once the hook
+* exits normally, as a hook does right after starting it.
+*/
+function spawnDrainer(hook, entry = fileURLToPath(import.meta.url)) {
+	const session = JSON.stringify({
+		transcript_path: hook.transcript_path,
+		cwd: hook.cwd
+	});
+	try {
+		const child = spawn(process.execPath, [
+			entry,
+			DRAIN_ARG,
+			session
+		], {
+			detached: true,
+			stdio: "ignore",
+			windowsHide: true
+		});
+		child.on("error", (error) => debugLog("could not start a drainer:", error));
+		child.unref();
+	} catch (error) {
+		debugLog("could not start a drainer:", error);
+	}
 }
 
 //#endregion
@@ -30003,26 +30058,6 @@ async function getGitContext(cwd) {
 }
 
 //#endregion
-//#region src/util.ts
-let DEBUG = false;
-function setDebug(b) {
-	DEBUG = b;
-}
-function debugLog(...args) {
-	if (DEBUG) console.error("[traceroot-codex]", ...args);
-}
-async function readStdin() {
-	const chunks = [];
-	for await (const c of process.stdin) chunks.push(c);
-	const raw = Buffer.concat(chunks).toString("utf-8").trim();
-	return JSON.parse(raw || "{}");
-}
-function truncate(s, max) {
-	if (s.length <= max) return s;
-	return `${s.slice(0, max)}…[truncated ${s.length - max} chars]`;
-}
-
-//#endregion
 //#region src/lock.ts
 const DEFAULT_TIMINGS = {
 	waitMs: 1e4,
@@ -30030,6 +30065,15 @@ const DEFAULT_TIMINGS = {
 	heartbeatMs: 5e3,
 	rerunBudgetMs: 15e3,
 	pollMs: 50
+};
+/** A drainer exits this long after it starts, whatever it is doing. */
+const DRAIN_LIFETIME_MS = 12e4;
+const DRAIN_TIMINGS = {
+	waitMs: 6e4,
+	staleMs: 3e4,
+	heartbeatMs: 5e3,
+	rerunBudgetMs: 9e4,
+	pollMs: 200
 };
 const sleep = (ms$1) => new Promise((resolve) => setTimeout(resolve, ms$1));
 function isAlive(pid) {
@@ -30119,18 +30163,11 @@ function laterTurnEnd(a, b) {
 */
 async function requestRun(pendingDir, turnEndedAt) {
 	const tmp = `${pendingDir}.${randomUUID()}.tmp`;
-	const request = path.join(pendingDir, randomUUID());
 	try {
 		await fs.writeFile(tmp, turnEndedAt === void 0 ? "" : String(turnEndedAt));
-		for (let attempt = 1;; attempt++) {
-			await fs.mkdir(pendingDir, { recursive: true });
-			try {
-				await fs.rename(tmp, request);
-				return true;
-			} catch (error) {
-				if (error.code !== "ENOENT" || attempt >= 3) throw error;
-			}
-		}
+		await fs.mkdir(pendingDir, { recursive: true });
+		await fs.rename(tmp, path.join(pendingDir, randomUUID()));
+		return true;
 	} catch {
 		return false;
 	} finally {
@@ -30139,43 +30176,47 @@ async function requestRun(pendingDir, turnEndedAt) {
 }
 const hasRequests = (pendingDir) => fs.readdir(pendingDir).then((names) => names.length > 0, () => false);
 /**
-* Takes every request waiting for a run, by moving their directory away, so that
-* requests made after this get a run of their own. The latest turn end among them
-* is passed on.
+* Takes the requests waiting for a run. Requests made after this are not among
+* them, so they get a run of their own. They stay in place until the run that
+* claimed them has finished, so a hook killed during that run leaves them for the
+* next one.
 */
 async function claimRequests(pendingDir) {
-	const claimed = `${pendingDir}.${randomUUID()}.claimed`;
+	let requests;
 	try {
-		await fs.rename(pendingDir, claimed);
+		requests = await fs.readdir(pendingDir);
 	} catch (error) {
-		if (error.code === "ENOENT") return {};
+		if (error.code === "ENOENT") return {
+			handOff: {},
+			requests: []
+		};
 		throw error;
 	}
 	let turnEndedAt;
-	try {
-		for (const name of await fs.readdir(claimed).catch(() => [])) {
-			const request = await fs.readFile(path.join(claimed, name), "utf-8").catch(() => "");
-			turnEndedAt = laterTurnEnd(turnEndedAt, turnEndOf(request));
-		}
-	} finally {
-		await fs.rm(claimed, {
-			recursive: true,
-			force: true
-		}).catch(() => {});
+	for (const name of requests) {
+		const request = await fs.readFile(path.join(pendingDir, name), "utf-8").catch(() => "");
+		turnEndedAt = laterTurnEnd(turnEndedAt, turnEndOf(request));
 	}
-	return turnEndedAt === void 0 ? {} : { turnEndedAt };
+	return {
+		handOff: turnEndedAt === void 0 ? {} : { turnEndedAt },
+		requests
+	};
 }
-async function acquire(lockDir, pendingDir, owner, turnEndedAt, t) {
+async function removeRequests(pendingDir, requests) {
+	for (const name of requests) await fs.rm(path.join(pendingDir, name), { force: true }).catch(() => {});
+}
+async function acquire(lockDir, pendingDir, owner, turnEndedAt, t, drainer) {
 	const deadline = Date.now() + t.waitMs;
 	let seenHeld = false;
 	const attemptLock = async () => {
 		const attempt = await tryLock(lockDir, owner, t.staleMs);
 		seenHeld ||= attempt === "busy";
-		return attempt instanceof Error && seenHeld ? "busy" : attempt;
+		return attempt instanceof Error && (seenHeld || drainer) ? "busy" : attempt;
 	};
 	for (;;) {
 		let attempt = await attemptLock();
 		if (attempt === "busy" && Date.now() >= deadline) {
+			if (drainer) return "timed-out";
 			const asked = await requestRun(pendingDir, turnEndedAt);
 			attempt = await attemptLock();
 			if (attempt === "busy") return asked ? "handed-off" : "not-handed-off";
@@ -30186,6 +30227,99 @@ async function acquire(lockDir, pendingDir, owner, turnEndedAt, t) {
 			return "unlocked";
 		}
 		await (t.sleep ?? sleep)(t.pollMs);
+	}
+}
+const pathsOf = (rolloutFile) => ({
+	lockDir: `${rolloutFile}.traceroot.lock.d`,
+	pendingDir: `${rolloutFile}.traceroot.pending.d`,
+	drainerDir: `${rolloutFile}.traceroot.drainer.d`
+});
+/** Removes `owner`'s entry, then the directory if that left it empty. */
+async function releaseOwner(dir, owner) {
+	await fs.rm(path.join(dir, owner), { force: true }).catch(() => {});
+	await fs.rmdir(dir).catch(() => {});
+}
+/**
+* Whether a drainer is serving the session: the drainer directory, made like the
+* lock, names a live owner. A drainer exits within DRAIN_LIFETIME_MS, so an older
+* entry is one whose drainer died.
+*/
+async function drainerRunning(drainerDir) {
+	const owners = await ownersOf(drainerDir);
+	return !!owners && owners.some((owner) => !isStale(owner, DRAIN_LIFETIME_MS));
+}
+async function serve(rolloutFile, run$1, timings, role) {
+	const started = Date.now();
+	const { lockDir, pendingDir, drainerDir } = pathsOf(rolloutFile);
+	let owner = newOwner();
+	const turnEndedAt = role.endsTurn ? started : void 0;
+	const leaveToDrainer = async () => {
+		if (!role.startDrainer || !await hasRequests(pendingDir) || await drainerRunning(drainerDir)) return;
+		debugLog("starting a drainer for the runs this session's hooks left");
+		role.startDrainer();
+	};
+	const acquired = await acquire(lockDir, pendingDir, owner, turnEndedAt, timings, role.drainer);
+	if (acquired === "handed-off") {
+		debugLog("another hook of this session holds the lock; it runs again for this one");
+		await leaveToDrainer();
+		return;
+	}
+	if (acquired === "not-handed-off") {
+		debugLog("another hook of this session holds the lock, and this one could not ask it to run again; sending nothing");
+		return;
+	}
+	if (acquired === "timed-out") {
+		debugLog("the session lock stayed held; leaving its runs for the session's next hook");
+		return;
+	}
+	if (acquired === "unlocked") return run$1({ held: async () => true }, {});
+	const ownerPath = () => path.join(lockDir, owner);
+	let lostInRun = false;
+	const lock = { held: async () => {
+		const mine = await fs.readFile(ownerPath(), "utf-8").catch(() => "") === owner;
+		lostInRun ||= !mine;
+		return mine;
+	} };
+	const heartbeat = setInterval(() => {
+		lock.held().then((mine) => {
+			if (mine) return fs.utimes(ownerPath(), /* @__PURE__ */ new Date(), /* @__PURE__ */ new Date());
+		}).catch(() => {});
+	}, timings.heartbeatMs);
+	heartbeat.unref();
+	const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
+	const askAgainIfLost = async (handOff) => {
+		if (!await lock.held() || lostInRun) await requestRun(pendingDir, laterTurnEnd(turnEndedAt, handOff.turnEndedAt));
+	};
+	try {
+		for (;;) {
+			const claim = await claimRequests(pendingDir);
+			if (role.drainer && claim.requests.length === 0) {
+				debugLog("nothing left to run for; the hooks served it");
+				return;
+			}
+			lostInRun = false;
+			const result = await run$1(lock, claim.handOff).finally(async () => {
+				await askAgainIfLost(claim.handOff);
+				await removeRequests(pendingDir, claim.requests);
+			});
+			if (await hasRequests(pendingDir)) {
+				if (budgetLeft() && await lock.held()) {
+					debugLog("running again for a hook that handed its run to this one");
+					continue;
+				}
+				debugLog("leaving a handed-off run for a drainer or the session's next hook");
+				return result;
+			}
+			await releaseOwner(lockDir, owner);
+			if (!await hasRequests(pendingDir) || !budgetLeft()) return result;
+			owner = newOwner();
+			if (await tryLock(lockDir, owner, timings.staleMs) !== "held") return result;
+			debugLog("running again for a hook that asked while this one released");
+		}
+	} finally {
+		clearInterval(heartbeat);
+		await releaseOwner(lockDir, owner);
+		await leaveToDrainer();
 	}
 }
 /**
@@ -30199,66 +30333,49 @@ async function acquire(lockDir, pendingDir, owner, turnEndedAt, t) {
 * serves it is told when it arrived. The holder keeps its entry in the lock fresh
 * while it runs, so it is taken over only if it exits or freezes, and `run` checks
 * `held()` before exporting so a frozen holder that resumes sends nothing.
+*
+* A hook that exits while requests are still waiting, after handing off or as a
+* holder past its rerun budget, calls `startDrainer` unless a drainer is already
+* serving the session (see drainSession).
 */
-async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS, endsTurn = false) {
+async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS, endsTurn = false, startDrainer) {
+	return serve(rolloutFile, run$1, timings, {
+		endsTurn,
+		drainer: false,
+		startDrainer
+	});
+}
+/**
+* Serves the requests the session's hooks left, from a process that outlives them:
+* a drainer. It waits for the lock like a hook, but it never hands off, never runs
+* unlocked, and runs only for requests still waiting, so it adds no run when the
+* hooks served them. It starts no run after `rerunBudgetMs`.
+*
+* At most one drainer serves a session: it holds the drainer directory, made and
+* removed like the lock, while it works, and one that finds it held exits. After
+* letting go it looks again, since a hook that left a request meanwhile saw it
+* running and started no drainer of its own.
+*/
+async function drainSession(rolloutFile, run$1, timings = DRAIN_TIMINGS) {
 	const started = Date.now();
-	const lockDir = `${rolloutFile}.traceroot.lock.d`;
-	const pendingDir = `${rolloutFile}.traceroot.pending.d`;
-	let owner = newOwner();
-	const turnEndedAt = endsTurn ? started : void 0;
-	const acquired = await acquire(lockDir, pendingDir, owner, turnEndedAt, timings);
-	if (acquired === "handed-off") {
-		debugLog("another hook of this session holds the lock; it runs again for this one");
-		return;
-	}
-	if (acquired === "not-handed-off") {
-		debugLog("another hook of this session holds the lock, and this one could not ask it to run again; sending nothing");
-		return;
-	}
-	if (acquired === "unlocked") return run$1({ held: async () => true }, {});
-	const ownerPath = () => path.join(lockDir, owner);
-	let lostInRun = false;
-	const lock = { held: async () => {
-		const mine = await fs.readFile(ownerPath(), "utf-8").catch(() => "") === owner;
-		lostInRun ||= !mine;
-		return mine;
-	} };
-	const release = async () => {
-		await fs.rm(ownerPath(), { force: true }).catch(() => {});
-		await fs.rmdir(lockDir).catch(() => {});
-	};
-	const heartbeat = setInterval(() => {
-		lock.held().then((mine) => {
-			if (mine) return fs.utimes(ownerPath(), /* @__PURE__ */ new Date(), /* @__PURE__ */ new Date());
-		}).catch(() => {});
-	}, timings.heartbeatMs);
-	heartbeat.unref();
-	const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
-	const askAgainIfLost = async (handOff) => {
-		if (!await lock.held() || lostInRun) await requestRun(pendingDir, laterTurnEnd(turnEndedAt, handOff.turnEndedAt));
-	};
-	try {
-		for (;;) {
-			const handOff = await claimRequests(pendingDir);
-			lostInRun = false;
-			const result = await run$1(lock, handOff).finally(() => askAgainIfLost(handOff));
-			if (await hasRequests(pendingDir)) {
-				if (budgetLeft() && await lock.held()) {
-					debugLog("running again for a hook that handed its run to this one");
-					continue;
-				}
-				debugLog("leaving a handed-off run for the session's next hook");
-				return result;
-			}
-			await release();
-			if (!await hasRequests(pendingDir) || !budgetLeft()) return result;
-			owner = newOwner();
-			if (await tryLock(lockDir, owner, timings.staleMs) !== "held") return result;
-			debugLog("running again for a hook that asked while this one released");
+	const { pendingDir, drainerDir } = pathsOf(rolloutFile);
+	for (;;) {
+		const left = timings.rerunBudgetMs - (Date.now() - started);
+		if (left <= 0 || !await hasRequests(pendingDir)) return;
+		const owner = newOwner();
+		if (await tryLock(drainerDir, owner, DRAIN_LIFETIME_MS) !== "held") return;
+		try {
+			await serve(rolloutFile, run$1, {
+				...timings,
+				waitMs: Math.min(timings.waitMs, left),
+				rerunBudgetMs: left
+			}, {
+				endsTurn: false,
+				drainer: true
+			});
+		} finally {
+			await releaseOwner(drainerDir, owner);
 		}
-	} finally {
-		clearInterval(heartbeat);
-		await release();
 	}
 }
 
@@ -30939,7 +31056,17 @@ async function dispatch(hook, config, deps) {
 		debugLog("no transcript_path; skipping");
 		return { emitted: 0 };
 	}
-	return await withSessionLock(transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), deps?.lockTimings, hook.hook_event_name === "Stop") ?? { emitted: 0 };
+	return await withSessionLock(transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), deps?.lockTimings, hook.hook_event_name === "Stop", () => (deps?.startDrainer ?? spawnDrainer)(hook)) ?? { emitted: 0 };
+}
+/** Serves, as a drainer, the runs the session's hooks left behind (see drainSession). */
+async function drain(hook, config, deps) {
+	const transcript = hook.transcript_path;
+	if (!transcript) return;
+	const session = {
+		transcript_path: transcript,
+		cwd: hook.cwd
+	};
+	await drainSession(transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), deps?.drainTimings);
 }
 async function emitSession(hook, transcript, config, lock, handOff, deps) {
 	const buildTracingFn = deps?.buildTracing ?? buildLockedTracing;
@@ -31013,10 +31140,33 @@ async function runHook() {
 		}
 	}
 }
-runHook().catch((error) => {
+/**
+* Runs a drainer a hook started for its session: `session` names the rollout and
+* the cwd. Nothing reads its output or exit code. It stops at DRAIN_LIFETIME_MS
+* whatever it is doing; requests a run had not finished stay for the next hook.
+*/
+async function runDrainer(session, exit = () => process.exit()) {
+	setTimeout(exit, DRAIN_LIFETIME_MS).unref();
+	let hook;
+	try {
+		hook = JSON.parse(session ?? "");
+	} catch {
+		return;
+	}
+	const config = await getConfig(hook.cwd);
+	setDebug(config.debug);
+	if (!config.enabled || !hook.transcript_path) return;
+	try {
+		await drain(hook, config);
+	} catch (error) {
+		debugLog("drain failed:", error);
+	}
+}
+if (process.argv[2] === DRAIN_ARG) runDrainer(process.argv[3]).catch(() => {});
+else runHook().catch((error) => {
 	if (process.env.TRACEROOT_CODEX_DEBUG === "true") console.error("[traceroot-codex] fatal:", error);
 	if (process.env.TRACEROOT_CODEX_FAIL_ON_ERROR === "true") process.exitCode = 1;
 });
 
 //#endregion
-export { runHook };
+export { runDrainer, runHook };
