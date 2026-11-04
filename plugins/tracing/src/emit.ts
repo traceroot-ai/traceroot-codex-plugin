@@ -15,8 +15,11 @@ import { debugLog } from "./util.js";
 const STACK_GUARD = 32;
 
 export type Deps = {
-  /** `stillHeld` says whether this hook still holds the session's lock; each request is sent only while it does. */
-  buildTracing: (c: Config, stillHeld?: () => Promise<boolean>) => Tracing;
+  /**
+   * `stillHeld` says whether this hook still holds the session's lock; each request
+   * is sent only while it does. `onDelivered` records each accepted request's spans.
+   */
+  buildTracing: (c: Config, stillHeld?: () => Promise<boolean>, onDelivered?: (ids: string[]) => Promise<void>) => Tracing;
   getGit: (cwd: string) => Promise<{ repo?: string; ref?: string }>;
   /**
    * Resolve a subagent's child rollout path by thread id.
@@ -30,7 +33,8 @@ export type Deps = {
   startDrainer: (hook: HookInput) => void;
 };
 
-const buildLockedTracing: Deps["buildTracing"] = (c, stillHeld) => defaultBuildTracing(c, undefined, stillHeld);
+const buildLockedTracing: Deps["buildTracing"] = (c, stillHeld, onDelivered) =>
+  defaultBuildTracing(c, undefined, stillHeld, onDelivered);
 
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
 async function emitTurnTree(
@@ -132,6 +136,7 @@ export async function drain(hook: HookInput, config: Config, deps?: Partial<Deps
   const session: HookInput = { transcript_path: transcript, cwd: hook.cwd };
   await drainSession(
     transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), deps?.drainTimings,
+    () => (deps?.startDrainer ?? spawnDrainer)(session),
   );
 }
 
@@ -142,21 +147,15 @@ async function emitSession(
   const getGit = deps?.getGit ?? getGitContext;
   const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
 
-  // The Stop hook is the "turn is ending" signal — only then is the root span
-  // emitted (see planTurnSpans). Mid-turn PostToolUse hooks leave the root absent
-  // so the trace stays live. SubagentStop carries the PARENT transcript while the
-  // parent turn is still running, so it must NOT count as the parent turn ending.
-  // The Stop hook is the "turn is ending" signal — only then is the root span
-  // emitted (see planTurnSpans). Mid-turn PostToolUse hooks leave the root absent
-  // so the trace stays live. SubagentStop carries the PARENT transcript while the
-  // parent turn is still running, so it must NOT count as the parent turn ending.
-  const turnEnding = hook.hook_event_name === "Stop";
-
   const { sessionMeta, turns } = parseRollout(await readRollout(transcript));
-  // A Stop that handed its run to this one ends the turn as well, unless a newer
-  // turn has started since it arrived: that turn is still running.
+  // The Stop hook, this hook or one that handed its run to it, is the "turn is
+  // ending" signal — only then is the root span emitted (see planTurnSpans),
+  // unless a newer turn has started since it arrived: that turn is still running.
+  // Mid-turn PostToolUse hooks leave the root absent so the trace stays live.
+  // SubagentStop carries the PARENT transcript while the parent turn is still
+  // running, so it must NOT count as the parent turn ending.
   const latest = turns.at(-1);
-  const handedOffStop = handOff.turnEndedAt !== undefined && !!latest && latest.startTime <= handOff.turnEndedAt;
+  const turnEnding = handOff.turnEndedAt !== undefined && !!latest && latest.startTime <= handOff.turnEndedAt;
 
   // A subagent session is emitted NESTED under its parent's trace (via the
   // parent's spawn_agent tool). Codex fires PostToolUse/Stop on the subagent
@@ -173,14 +172,24 @@ async function emitSession(
   const git = await getGit(cwd).catch(() => ({}));
   const ctx: EmitCtx = {
     environment: config.environment, userId: config.userId, git, maxChars: config.maxChars,
-    turnEnding: turnEnding || handedOffStop,
+    turnEnding,
     captureImages: config.captureImages,
   };
 
   const already = await loadEmittedSpanIds(transcript);
   // A hook that froze past the stale limit and lost the lock must not send what it read.
   if (!(await lock.held())) { debugLog("session lock lost before export; skipping"); return { emitted: 0 }; }
-  const tracing = buildTracingFn(config, lock.held);
+  // Each request's spans are recorded as soon as it is accepted, so a hook killed
+  // at Codex's deadline keeps what it delivered and the next hook sends only the rest.
+  const marked = new Set<string>();
+  const record = async (ids: string[]) => {
+    for (const id of ids) {
+      if (marked.has(id)) continue;
+      marked.add(id);
+      await markSpanEmitted(transcript, id);
+    }
+  };
+  const tracing = buildTracingFn(config, lock.held, record);
   let emitted = 0;
   const emittedIds: string[] = [];
 
@@ -200,9 +209,7 @@ async function emitSession(
     } finally {
       // Mark only the spans the backend accepted, even when shutdown reports a
       // failed export: anything left unmarked is sent again on the next hook.
-      for (const id of emittedIds) {
-        if (tracing.delivered.has(id)) await markSpanEmitted(transcript, id);
-      }
+      await record(emittedIds.filter((id) => tracing.delivered.has(id)));
     }
   }
   debugLog(`emitted ${emitted} spans`);

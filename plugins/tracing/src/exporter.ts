@@ -36,18 +36,21 @@ function exportSafely(
  * Passes spans through to `inner` and records the ids of every span whose export
  * call succeeded, so a span is only treated as sent once the backend accepted it.
  * A throwing `inner.export` is reported as a failed export, never propagated.
+ * `onDelivered` gets each successful call's ids before its result is passed on,
+ * so they are recorded before the next request goes out.
  */
 export class DeliveryTrackingExporter implements SpanExporter {
   readonly delivered = new Set<string>();
 
-  constructor(private readonly inner: SpanExporter) {}
+  constructor(private readonly inner: SpanExporter, private readonly onDelivered?: (ids: string[]) => Promise<void>) {}
 
   export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
     exportSafely(this.inner, spans, (result) => {
-      if (result.code === ExportResultCode.SUCCESS) {
-        for (const span of spans) this.delivered.add(span.spanContext().spanId);
-      }
-      resultCallback(result);
+      if (result.code !== ExportResultCode.SUCCESS) return resultCallback(result);
+      const ids = spans.map((span) => span.spanContext().spanId);
+      for (const id of ids) this.delivered.add(id);
+      if (!this.onDelivered) return resultCallback(result);
+      void this.onDelivered(ids).catch(() => {}).then(() => resultCallback(result));
     });
   }
 
@@ -155,8 +158,9 @@ function otlpExporter(config: Config): SpanExporter {
 
 export function buildTracing(
   config: Config, exporter: SpanExporter = otlpExporter(config), stillHeld?: () => Promise<boolean>,
+  onDelivered?: (ids: string[]) => Promise<void>,
 ): Tracing {
-  const tracked = new DeliveryTrackingExporter(stillHeld ? new LockGuardedExporter(exporter, stillHeld) : exporter);
+  const tracked = new DeliveryTrackingExporter(stillHeld ? new LockGuardedExporter(exporter, stillHeld) : exporter, onDelivered);
   // Batch (not Simple): a hook invocation can complete many spans at once (a turn
   // with many tools, or a subagent's whole subtree). Simple sends one HTTP POST
   // per span, and a burst loses the tail before this short-lived process exits.

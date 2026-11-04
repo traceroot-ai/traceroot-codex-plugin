@@ -473,6 +473,51 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
     expect(tried).toBeGreaterThan(100);
   }, 120_000);
 
+  it("never removes a request that a newer holder claimed after taking over this hook's stale lock", async () => {
+    const rollout = await rolloutPath();
+    await real.mkdir(pendingOf(rollout));
+    await real.writeFile(path.join(pendingOf(rollout), "stop-request"), "1234");
+    const quiet: LockTimings = { ...T, heartbeatMs: 1_000_000_000 };
+    const paused = deferred();
+    const resume = deferred();
+    const newerRunning = deferred();
+    const finishNewer = deferred();
+    // The old holder served the request, then pauses right before removing it.
+    steps.before = async (op, [file]) => {
+      if (op !== "rm" || actor.getStore() !== "old" || !String(file).startsWith(`${pendingOf(rollout)}${path.sep}`)) return;
+      steps.before = undefined;
+      paused.resolve();
+      await resume.promise;
+    };
+
+    const old = as("old", () => withSessionLock(rollout, async () => {}, quiet));
+    await paused.promise;
+    // It stays silent past the stale limit, and a newer hook takes the lock over and claims the request.
+    const [owner] = await ownersOf(rollout);
+    const stale = new Date(Date.now() - 120_000);
+    await real.utimes(path.join(lockOf(rollout), owner!), stale, stale);
+    let newerLock: SessionLock | undefined;
+    const served: HandOff[] = [];
+    const newer = as("newer", () => withSessionLock(rollout, async (lock, handOff) => {
+      newerLock = lock;
+      served.push(handOff);
+      newerRunning.resolve();
+      await finishNewer.promise;
+    }, quiet));
+    await newerRunning.promise;
+    resume.resolve();
+    await old;
+    const whileNewerRuns = await requestsOf(rollout);
+    const newerHolds = await as("check", () => newerLock!.held());
+    finishNewer.resolve();
+    await newer;
+
+    expect(served).toEqual([{ turnEndedAt: 1234 }]);
+    expect(newerHolds).toBe(true);
+    expect(whileNewerRuns).toHaveLength(1);
+    expect(await requestsOf(rollout)).toEqual([]); // removed by the holder that claimed it last, once it finished
+  });
+
   type Arrival = (rollout: string, stop: () => Promise<void>, startDrainer: () => void, runs: ReturnType<typeof inFlight>) => Promise<unknown>;
 
   it.each<[string, Arrival, number]>([

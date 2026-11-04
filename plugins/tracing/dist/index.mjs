@@ -29918,16 +29918,22 @@ function exportSafely(exporter, spans, resultCallback) {
 * Passes spans through to `inner` and records the ids of every span whose export
 * call succeeded, so a span is only treated as sent once the backend accepted it.
 * A throwing `inner.export` is reported as a failed export, never propagated.
+* `onDelivered` gets each successful call's ids before its result is passed on,
+* so they are recorded before the next request goes out.
 */
 var DeliveryTrackingExporter = class {
 	delivered = /* @__PURE__ */ new Set();
-	constructor(inner) {
+	constructor(inner, onDelivered) {
 		this.inner = inner;
+		this.onDelivered = onDelivered;
 	}
 	export(spans, resultCallback) {
 		exportSafely(this.inner, spans, (result) => {
-			if (result.code === import_src.ExportResultCode.SUCCESS) for (const span of spans) this.delivered.add(span.spanContext().spanId);
-			resultCallback(result);
+			if (result.code !== import_src.ExportResultCode.SUCCESS) return resultCallback(result);
+			const ids = spans.map((span) => span.spanContext().spanId);
+			for (const id of ids) this.delivered.add(id);
+			if (!this.onDelivered) return resultCallback(result);
+			this.onDelivered(ids).catch(() => {}).then(() => resultCallback(result));
 		});
 	}
 	shutdown() {
@@ -30023,8 +30029,8 @@ function otlpExporter(config) {
 		compression: "gzip"
 	});
 }
-function buildTracing(config, exporter = otlpExporter(config), stillHeld) {
-	const tracked = new DeliveryTrackingExporter(stillHeld ? new LockGuardedExporter(exporter, stillHeld) : exporter);
+function buildTracing(config, exporter = otlpExporter(config), stillHeld, onDelivered) {
+	const tracked = new DeliveryTrackingExporter(stillHeld ? new LockGuardedExporter(exporter, stillHeld) : exporter, onDelivered);
 	return buildTracingWith(new import_index_shim.BatchSpanProcessor(new SizeLimitedExporter(tracked, config.maxRequestBytes), {
 		maxQueueSize: 4096,
 		maxExportBatchSize: 1024,
@@ -30073,8 +30079,10 @@ const DRAIN_TIMINGS = {
 	staleMs: 3e4,
 	heartbeatMs: 5e3,
 	rerunBudgetMs: 9e4,
-	pollMs: 200
+	pollMs: 200,
+	retryMs: 1e3
 };
+const RETRY_MAX_MS = 15e3;
 const sleep = (ms$1) => new Promise((resolve) => setTimeout(resolve, ms$1));
 function isAlive(pid) {
 	try {
@@ -30155,6 +30163,7 @@ function laterTurnEnd(a, b) {
 	if (a === void 0) return b;
 	return b === void 0 ? a : Math.max(a, b);
 }
+const handOffOf = (turnEndedAt) => turnEndedAt === void 0 ? {} : { turnEndedAt };
 /**
 * Asks the holder to run again for this hook: a request file of its own in
 * `pendingDir`, written in full before it appears. A hook that ended its turn
@@ -30175,30 +30184,42 @@ async function requestRun(pendingDir, turnEndedAt) {
 	}
 }
 const hasRequests = (pendingDir) => fs.readdir(pendingDir).then((names) => names.length > 0, () => false);
+/** A request's own name, whichever run last claimed it (see claimRequests). */
+const requestOf = (name) => name.split(".")[0];
+/** The requests waiting for a run, by their own names. */
+const waitingRequests = (pendingDir) => fs.readdir(pendingDir).then((names) => names.map(requestOf), () => []);
 /**
-* Takes the requests waiting for a run. Requests made after this are not among
-* them, so they get a run of their own. They stay in place until the run that
-* claimed them has finished, so a hook killed during that run leaves them for the
-* next one.
+* Takes the requests waiting for a run, renaming each to `<request>.<owner>`.
+* Requests made after this are not among them, so they get a run of their own.
+* They stay in place until the run that claimed them has served them, so a hook
+* killed during that run, or a run whose export failed, leaves them for the next
+* one. That run claims them under its own owner, so the earlier run, should it
+* resume after losing the lock, can no longer remove them.
 */
-async function claimRequests(pendingDir) {
-	let requests;
+async function claimRequests(pendingDir, owner) {
+	let names;
 	try {
-		requests = await fs.readdir(pendingDir);
+		names = await fs.readdir(pendingDir);
 	} catch (error) {
-		if (error.code === "ENOENT") return {
-			handOff: {},
-			requests: []
-		};
+		if (error.code === "ENOENT") return { requests: [] };
 		throw error;
 	}
+	const requests = [];
 	let turnEndedAt;
-	for (const name of requests) {
-		const request = await fs.readFile(path.join(pendingDir, name), "utf-8").catch(() => "");
+	for (const name of names) {
+		const claimed = `${requestOf(name)}.${owner}`;
+		try {
+			await fs.rename(path.join(pendingDir, name), path.join(pendingDir, claimed));
+		} catch (error) {
+			if (error.code === "ENOENT") continue;
+			throw error;
+		}
+		const request = await fs.readFile(path.join(pendingDir, claimed), "utf-8").catch(() => "");
 		turnEndedAt = laterTurnEnd(turnEndedAt, turnEndOf(request));
+		requests.push(claimed);
 	}
 	return {
-		handOff: turnEndedAt === void 0 ? {} : { turnEndedAt },
+		turnEndedAt,
 		requests
 	};
 }
@@ -30272,7 +30293,7 @@ async function serve(rolloutFile, run$1, timings, role) {
 		debugLog("the session lock stayed held; leaving its runs for the session's next hook");
 		return;
 	}
-	if (acquired === "unlocked") return run$1({ held: async () => true }, {});
+	if (acquired === "unlocked") return run$1({ held: async () => true }, handOffOf(turnEndedAt));
 	const ownerPath = () => path.join(lockDir, owner);
 	let lostInRun = false;
 	const lock = { held: async () => {
@@ -30287,21 +30308,27 @@ async function serve(rolloutFile, run$1, timings, role) {
 	}, timings.heartbeatMs);
 	heartbeat.unref();
 	const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
-	const askAgainIfLost = async (handOff) => {
-		if (!await lock.held() || lostInRun) await requestRun(pendingDir, laterTurnEnd(turnEndedAt, handOff.turnEndedAt));
+	const settle = async (claim, served) => {
+		if (!await lock.held() || lostInRun) {
+			if (turnEndedAt !== void 0 || claim.requests.length === 0) await requestRun(pendingDir, turnEndedAt);
+		} else if (served) await removeRequests(pendingDir, claim.requests);
 	};
 	try {
 		for (;;) {
-			const claim = await claimRequests(pendingDir);
+			const claim = await claimRequests(pendingDir, owner);
 			if (role.drainer && claim.requests.length === 0) {
 				debugLog("nothing left to run for; the hooks served it");
 				return;
 			}
 			lostInRun = false;
-			const result = await run$1(lock, claim.handOff).finally(async () => {
-				await askAgainIfLost(claim.handOff);
-				await removeRequests(pendingDir, claim.requests);
-			});
+			let served = false;
+			let result;
+			try {
+				result = await run$1(lock, handOffOf(laterTurnEnd(turnEndedAt, claim.turnEndedAt)));
+				served = true;
+			} finally {
+				await settle(claim, served);
+			}
 			if (await hasRequests(pendingDir)) {
 				if (budgetLeft() && await lock.held()) {
 					debugLog("running again for a hook that handed its run to this one");
@@ -30329,14 +30356,16 @@ async function serve(rolloutFile, run$1, timings, role) {
 *
 * A hook that can't get the lock within `waitMs` never runs on its own: it leaves
 * a request and returns undefined, and the holder runs again, reading the rollout
-* as it is then. A hook that `endsTurn` says so in its request, and the run that
-* serves it is told when it arrived. The holder keeps its entry in the lock fresh
-* while it runs, so it is taken over only if it exits or freezes, and `run` checks
-* `held()` before exporting so a frozen holder that resumes sends nothing.
+* as it is then. A hook that `endsTurn` is told when it arrived in each of its
+* runs, and says so in its request, so the run that serves it is told too. The
+* holder keeps its entry in the lock fresh while it runs, so it is taken over only
+* if it exits or freezes, and `run` checks `held()` before exporting so a frozen
+* holder that resumes sends nothing. A run that throws leaves the requests it was
+* serving in place.
 *
-* A hook that exits while requests are still waiting, after handing off or as a
-* holder past its rerun budget, calls `startDrainer` unless a drainer is already
-* serving the session (see drainSession).
+* A hook that exits while requests are still waiting, after handing off, as a
+* holder past its rerun budget or after a failed run, calls `startDrainer` unless
+* a drainer is already serving the session (see drainSession).
 */
 async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS, endsTurn = false, startDrainer) {
 	return serve(rolloutFile, run$1, timings, {
@@ -30349,19 +30378,36 @@ async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS, en
 * Serves the requests the session's hooks left, from a process that outlives them:
 * a drainer. It waits for the lock like a hook, but it never hands off, never runs
 * unlocked, and runs only for requests still waiting, so it adds no run when the
-* hooks served them. It starts no run after `rerunBudgetMs`.
+* hooks served them. A failed run leaves its requests, and the drainer tries again
+* after a wait that doubles each time. It starts no run after `rerunBudgetMs`, and
+* leaves what is still waiting then for the session's next hook.
 *
 * At most one drainer serves a session: it holds the drainer directory, made and
 * removed like the lock, while it works, and one that finds it held exits. After
 * letting go it looks again, since a hook that left a request meanwhile saw it
-* running and started no drainer of its own.
+* running and started no drainer of its own. A request it finds then that it never
+* saw before gets `startDrainer` if its budget is spent: each request can start a
+* drainer this way only once, so drainers don't start one another without new
+* requests from the session's hooks.
 */
-async function drainSession(rolloutFile, run$1, timings = DRAIN_TIMINGS) {
+async function drainSession(rolloutFile, run$1, timings = DRAIN_TIMINGS, startDrainer) {
 	const started = Date.now();
 	const { pendingDir, drainerDir } = pathsOf(rolloutFile);
+	const seen = /* @__PURE__ */ new Set();
+	const budgetLeft = () => timings.rerunBudgetMs - (Date.now() - started);
+	let failures = 0;
 	for (;;) {
-		const left = timings.rerunBudgetMs - (Date.now() - started);
-		if (left <= 0 || !await hasRequests(pendingDir)) return;
+		const waiting = await waitingRequests(pendingDir);
+		const left = budgetLeft();
+		if (left <= 0) {
+			if (waiting.some((request) => !seen.has(request))) {
+				debugLog("starting a drainer for a run handed to this one after its last");
+				startDrainer?.();
+			}
+			return;
+		}
+		if (waiting.length === 0) return;
+		for (const request of waiting) seen.add(request);
 		const owner = newOwner();
 		if (await tryLock(drainerDir, owner, DRAIN_LIFETIME_MS) !== "held") return;
 		try {
@@ -30373,6 +30419,12 @@ async function drainSession(rolloutFile, run$1, timings = DRAIN_TIMINGS) {
 				endsTurn: false,
 				drainer: true
 			});
+			failures = 0;
+		} catch (error) {
+			const wait = Math.min((timings.retryMs ?? DRAIN_TIMINGS.retryMs) * 2 ** failures, RETRY_MAX_MS, budgetLeft());
+			failures += 1;
+			debugLog(`a drainer run failed; trying again in ${Math.max(wait, 0)} ms:`, error);
+			if (wait > 0) await (timings.sleep ?? sleep)(wait);
 		} finally {
 			await releaseOwner(drainerDir, owner);
 		}
@@ -31008,7 +31060,7 @@ function parseRollout(lines) {
 //#endregion
 //#region src/emit.ts
 const STACK_GUARD = 32;
-const buildLockedTracing = (c, stillHeld) => buildTracing(c, void 0, stillHeld);
+const buildLockedTracing = (c, stillHeld, onDelivered) => buildTracing(c, void 0, stillHeld, onDelivered);
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
 async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, emittedIds, findSubagent) {
 	let n = 0;
@@ -31066,16 +31118,15 @@ async function drain(hook, config, deps) {
 		transcript_path: transcript,
 		cwd: hook.cwd
 	};
-	await drainSession(transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), deps?.drainTimings);
+	await drainSession(transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), deps?.drainTimings, () => (deps?.startDrainer ?? spawnDrainer)(session));
 }
 async function emitSession(hook, transcript, config, lock, handOff, deps) {
 	const buildTracingFn = deps?.buildTracing ?? buildLockedTracing;
 	const getGit = deps?.getGit ?? getGitContext;
 	const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
-	const turnEnding = hook.hook_event_name === "Stop";
 	const { sessionMeta, turns } = parseRollout(await readRollout(transcript));
 	const latest = turns.at(-1);
-	const handedOffStop = handOff.turnEndedAt !== void 0 && !!latest && latest.startTime <= handOff.turnEndedAt;
+	const turnEnding = handOff.turnEndedAt !== void 0 && !!latest && latest.startTime <= handOff.turnEndedAt;
 	if (sessionMeta.threadSource === "subagent" || sessionMeta.parentThreadId) {
 		debugLog(`subagent session ${sessionMeta.sessionId}; skipping standalone emit (nested under parent)`);
 		return { emitted: 0 };
@@ -31086,7 +31137,7 @@ async function emitSession(hook, transcript, config, lock, handOff, deps) {
 		userId: config.userId,
 		git,
 		maxChars: config.maxChars,
-		turnEnding: turnEnding || handedOffStop,
+		turnEnding,
 		captureImages: config.captureImages
 	};
 	const already = await loadEmittedSpanIds(transcript);
@@ -31094,7 +31145,15 @@ async function emitSession(hook, transcript, config, lock, handOff, deps) {
 		debugLog("session lock lost before export; skipping");
 		return { emitted: 0 };
 	}
-	const tracing = buildTracingFn(config, lock.held);
+	const marked = /* @__PURE__ */ new Set();
+	const record = async (ids) => {
+		for (const id of ids) {
+			if (marked.has(id)) continue;
+			marked.add(id);
+			await markSpanEmitted(transcript, id);
+		}
+	};
+	const tracing = buildTracingFn(config, lock.held, record);
 	let emitted = 0;
 	const emittedIds = [];
 	const visited = /* @__PURE__ */ new Set();
@@ -31104,7 +31163,7 @@ async function emitSession(hook, transcript, config, lock, handOff, deps) {
 		try {
 			await tracing.shutdown();
 		} finally {
-			for (const id of emittedIds) if (tracing.delivered.has(id)) await markSpanEmitted(transcript, id);
+			await record(emittedIds.filter((id) => tracing.delivered.has(id)));
 		}
 	}
 	debugLog(`emitted ${emitted} spans`);

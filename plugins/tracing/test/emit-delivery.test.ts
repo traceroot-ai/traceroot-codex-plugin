@@ -1,6 +1,8 @@
 import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
 import { BatchSpanProcessor, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import * as fs from "node:fs/promises";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,6 +121,46 @@ describe("dispatch marks spans as sent only after their export succeeded", () =>
     const retry = new ScriptedExporter();
     await dispatch({ transcript_path: transcript }, config, deps(retry));
     expect(ids(retry.calls.flat()).sort()).toEqual([ROOT, TOOL].sort());
+  });
+});
+
+describe("dispatch records spans as each request is accepted", () => {
+  it("keeps a request's spans recorded when the hook is killed during a later request", async () => {
+    const transcript = await copyFixture();
+    // A collector that accepts the first request and holds later ones until released.
+    const held: Array<() => void> = [];
+    let holding = true;
+    let laterArrived!: () => void;
+    const arrived = new Promise<void>((resolve) => { laterArrived = resolve; });
+    let requests = 0;
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        const accept = () => { res.writeHead(200, { "content-type": "application/x-protobuf" }); res.end(); };
+        if (++requests === 1 || !holding) return accept();
+        held.push(accept);
+        laterArrived();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      // One span per request, sent through the tracing a hook builds by default.
+      const hook = dispatch({ transcript_path: transcript }, { ...config, hostUrl: `http://127.0.0.1:${port}`, maxRequestBytes: 1 },
+        { getGit: async () => ({}) });
+      await arrived;
+      // A hook killed now, at Codex's deadline, has recorded the request that was accepted.
+      expect(await sidecar(transcript)).toHaveLength(1);
+
+      holding = false;
+      for (const accept of held.splice(0)) accept();
+      expect((await hook).emitted).toBe(3);
+      expect(requests).toBe(3);
+      expect(await sidecar(transcript)).toEqual([ROOT, STEP, TOOL].sort());
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 });
 

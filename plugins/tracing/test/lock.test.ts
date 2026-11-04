@@ -1,4 +1,4 @@
-import type { ExportResult } from "@opentelemetry/core";
+import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -15,7 +15,7 @@ import { makeSpanId } from "../src/ids.js";
 import { drainSession, type HandOff, type LockTimings, withSessionLock } from "../src/lock.js";
 import { loadEmittedSpanIds } from "../src/sidecar.js";
 import type { HookInput } from "../src/types.js";
-import { ids, OK, ScriptedExporter } from "./helpers.js";
+import { failed, ids, OK, ScriptedExporter } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const T: LockTimings = { waitMs: 2_000, staleMs: 60_000, heartbeatMs: 1_000, rerunBudgetMs: 60_000, pollMs: 5 };
@@ -388,6 +388,18 @@ describe("withSessionLock", () => {
     expect(await exists(lockOf(rollout))).toBe(false);
   });
 
+  it("keeps the requests it claimed when its run fails, and leaves them to a drainer", async () => {
+    const rollout = await rolloutPath();
+    await leaveRequest(rollout, 1234);
+    let starts = 0;
+
+    await expect(withSessionLock(rollout, async () => { throw new Error("export failed"); }, T, false, () => { starts += 1; }))
+      .rejects.toThrow("export failed");
+    expect(await requestsOf(rollout)).toEqual([1234]);
+    expect(starts).toBe(1);
+    expect(await exists(lockOf(rollout))).toBe(false);
+  });
+
   it("does not hold up another session", async () => {
     const rollout = await rolloutPath();
     const started = deferred();
@@ -445,8 +457,10 @@ describe("drainers", () => {
     const gate = deferred();
     const drainers: Promise<void>[] = [];
     const served: HandOff[] = [];
+    const drainerWaiting = deferred();
     const startDrainer = () => {
-      drainers.push(drainSession(rollout, (_lock, handOff) => run(async () => { served.push(handOff); }), T));
+      drainers.push(drainSession(rollout, (_lock, handOff) => run(async () => { served.push(handOff); }),
+        waitingTimings(T, drainerWaiting)));
     };
 
     const holder = withSessionLock(rollout, () => run(async () => { started.resolve(); await gate.promise; }),
@@ -454,6 +468,8 @@ describe("drainers", () => {
     await started.promise;
     const arrived = Date.now();
     expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, startDrainer)).toBeUndefined();
+    // The drainer holds the drainer directory and waits for the lock before the holder lets go.
+    await drainerWaiting.promise;
     gate.resolve();
     await holder;
     await Promise.all(drainers);
@@ -569,6 +585,72 @@ describe("drainers", () => {
     expect(await exists(drainerOf(rollout))).toBe(false);
   });
 
+  it("keep a handed-off Stop whose run failed, and serve it on a later try", async () => {
+    const rollout = await rolloutPath();
+    await leaveRequest(rollout, 1234);
+    const served: HandOff[] = [];
+    let tries = 0;
+
+    await drainSession(rollout, async (_lock, handOff) => {
+      if (++tries === 1) throw new Error("export failed");
+      served.push(handOff);
+    }, { ...T, retryMs: 1 });
+    expect(tries).toBe(2);
+    expect(served).toEqual([{ turnEndedAt: 1234 }]);
+    await settled(rollout);
+  });
+
+  it("leave a request whose runs keep failing for a later hook once their budget is spent, waiting longer between tries", async () => {
+    const rollout = await rolloutPath();
+    await leaveRequest(rollout, 1234);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const waits: number[] = [];
+    let tries = 0;
+    let starts = 0;
+
+    await drainSession(rollout, async () => {
+      tries += 1;
+      throw new Error("export failed");
+    }, {
+      ...T, rerunBudgetMs: 30_000, retryMs: 1_000,
+      sleep: async (ms) => { waits.push(ms); vi.setSystemTime(Date.now() + ms); },
+    }, () => { starts += 1; });
+
+    expect(waits.slice(0, 4)).toEqual([1_000, 2_000, 4_000, 8_000]);
+    expect(waits.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(30_000);
+    expect(tries).toBe(waits.length);
+    expect(await requestsOf(rollout)).toEqual([1234]);
+    expect(starts).toBe(0); // no other drainer for requests it already tried
+    expect(await exists(drainerOf(rollout))).toBe(false);
+    expect(await exists(lockOf(rollout))).toBe(false);
+  });
+
+  it("start another drainer for a Stop that handed off during their last run", async () => {
+    const rollout = await rolloutPath();
+    await leaveRequest(rollout);
+    const served: HandOff[] = [];
+    const drainers: Promise<void>[] = [];
+    const run = async (_lock: unknown, handOff: HandOff) => { served.push(handOff); };
+    const startDrainer = () => { drainers.push(drainSession(rollout, run, T)); };
+    let arrived = 0;
+
+    // The drainer's run outlasts its budget, and the turn's last Stop hands off to
+    // it meanwhile: the Stop finds the drainer serving and starts none.
+    await drainSession(rollout, async (lock, handOff) => {
+      await run(lock, handOff);
+      await sleep(60);
+      arrived = Date.now();
+      expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, startDrainer)).toBeUndefined();
+      expect(drainers).toHaveLength(0);
+    }, { ...T, rerunBudgetMs: 50 }, startDrainer);
+    await Promise.all(drainers);
+
+    expect(drainers).toHaveLength(1);
+    expect(served).toHaveLength(2);
+    expect(served[1]!.turnEndedAt).toBeGreaterThanOrEqual(arrived);
+    await settled(rollout);
+  });
+
   it("exit at once when no run is waiting", async () => {
     const rollout = await rolloutPath();
     let ran = false;
@@ -615,6 +697,15 @@ describe("dispatch under the session lock", () => {
     await fs.copyFile(path.join(here, "fixtures", fixture), transcript);
     return transcript;
   }
+
+  /** Passes spans to `inner`, adding the ids of those it accepted to `accepted`. */
+  const recording = (inner: SpanExporter, accepted: Set<string>): SpanExporter => ({
+    export: (spans, resultCallback) => inner.export(spans, (result) => {
+      if (result.code === ExportResultCode.SUCCESS) for (const id of ids(spans)) accepted.add(id);
+      resultCallback(result);
+    }),
+    shutdown: () => inner.shutdown(),
+  });
 
   const depsFor = (label: string, events: string[], exporter: SpanExporter, timings: LockTimings) => ({
     // A fresh exporter wrapper per run: each run builds and shuts down its own tracing.
@@ -697,10 +788,12 @@ describe("dispatch under the session lock", () => {
     const gate = deferred();
     const exporting = deferred();
     const drainers: Promise<void>[] = [];
+    const drainerWaiting = deferred();
     // What a hook starts runs on its own, in the drainer the real hook would spawn.
     const startDrainer = (hook: HookInput) => {
       events.push("drainer:started");
-      drainers.push(drain(hook, config, depsFor("drainer", events, new GatedExporter("drainer", events), T)));
+      drainers.push(drain(hook, config,
+        depsFor("drainer", events, new GatedExporter("drainer", events), waitingTimings(T, drainerWaiting))));
     };
 
     // The holder's export is slow: by the time it is delivered, the holder's rerun budget is spent.
@@ -710,6 +803,8 @@ describe("dispatch under the session lock", () => {
     // The turn's last Stop hands off and exits. No hook runs after it.
     expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop", cwd: dir }, config,
       { ...depsFor("stop", events, new GatedExporter("stop", events), { ...T, waitMs: 0 }), startDrainer })).toEqual({ emitted: 0 });
+    // The drainer holds the drainer directory and waits for the lock before the holder lets go.
+    await drainerWaiting.promise;
     gate.resolve();
     await holder;
     await Promise.all(drainers);
@@ -721,6 +816,91 @@ describe("dispatch under the session lock", () => {
     expect(await requestsOf(transcript)).toEqual([]);
     expect(await exists(lockOf(transcript))).toBe(false);
     expect(await exists(`${transcript}.traceroot.drainer.d`)).toBe(false);
+  });
+
+  it("sends the rest of the turn for its last Stop with no later hook, when the drainer's first export fails", async () => {
+    const transcript = await transcriptCopy("rollout-inprogress.jsonl");
+    const events: string[] = [];
+    const gate = deferred();
+    const exporting = deferred();
+    const accepted = new Set<string>();
+    const drainers: Promise<void>[] = [];
+    const drainerWaiting = deferred();
+    // The collector rejects the drainer's first request, then recovers.
+    let drainerCalls = 0;
+    const collector = new ScriptedExporter(() => (++drainerCalls === 1 ? failed("Service Unavailable") : OK));
+    const startDrainer = (hook: HookInput) => {
+      drainers.push(drain(hook, config, {
+        ...depsFor("drainer", events, recording(collector, accepted), waitingTimings({ ...T, retryMs: 1 }, drainerWaiting)),
+        startDrainer: () => { throw new Error("a drainer started another"); },
+      }));
+    };
+
+    const holder = dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config, {
+      ...depsFor("holder", events, recording(new GatedExporter("holder", events, gate.promise, exporting.resolve), accepted),
+        { ...T, rerunBudgetMs: 0 }),
+      startDrainer,
+    });
+    await exporting.promise;
+    // The turn's last Stop hands off and exits. No hook runs after it.
+    expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop", cwd: dir }, config,
+      { ...depsFor("stop", events, new GatedExporter("stop", events), { ...T, waitMs: 0 }), startDrainer })).toEqual({ emitted: 0 });
+    // The drainer holds the drainer directory and waits for the lock before the holder lets go.
+    await drainerWaiting.promise;
+    gate.resolve();
+    await holder;
+    await Promise.all(drainers);
+
+    // What a single Stop over the whole rollout sends.
+    const reference = new ScriptedExporter();
+    const referenceRollout = path.join(dir, "reference.jsonl");
+    await fs.copyFile(path.join(here, "fixtures", "rollout-inprogress.jsonl"), referenceRollout);
+    await dispatch({ transcript_path: referenceRollout, hook_event_name: "Stop" }, config,
+      { buildTracing: (c: Config) => buildTracing(c, reference), getGit: async () => ({}), lockTimings: T });
+    expect(drainers).toHaveLength(1);
+    expect(collector.calls).toHaveLength(2);
+    expect(ids(collector.calls[0]!)).toContain(ROOT);
+    expect([...accepted].sort()).toEqual([...new Set(ids(reference.calls.flat()))].sort());
+    expect(await requestsOf(transcript)).toEqual([]);
+    expect(await exists(lockOf(transcript))).toBe(false);
+    expect(await exists(`${transcript}.traceroot.drainer.d`)).toBe(false);
+  });
+
+  it("does not end a newer turn when a Stop holding the lock runs again after that turn started", async () => {
+    const transcript = await transcriptCopy("rollout-inprogress.jsonl");
+    const exporter = new ScriptedExporter();
+    const reading = deferred();
+    const gate = deferred();
+    let reads = 0;
+    const deps = {
+      buildTracing: (c: Config, stillHeld?: () => Promise<boolean>) => buildTracing(c, exporter, stillHeld),
+      // The Stop's first run waits right after reading the rollout.
+      getGit: async () => {
+        if (++reads === 1) { reading.resolve(); await gate.promise; }
+        return {};
+      },
+      lockTimings: T,
+      startDrainer: () => {},
+    };
+
+    const stop = dispatch({ transcript_path: transcript, hook_event_name: "Stop" }, config, deps);
+    await reading.promise;
+    // Meanwhile the next turn starts, and one of its hooks hands its run to the Stop.
+    const later = new Date(Date.now() + 60_000).toISOString();
+    await fs.appendFile(transcript, [
+      { timestamp: later, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } },
+      { timestamp: later, type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } },
+      { timestamp: later, type: "event_msg", payload: { type: "user_message", message: "and the hidden ones?" } },
+    ].map((line) => `${JSON.stringify(line)}\n`).join(""));
+    expect(await dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config,
+      { ...deps, lockTimings: { ...T, waitMs: 0 } })).toEqual({ emitted: 0 });
+    gate.resolve();
+    await stop;
+
+    expect(reads).toBe(2); // the Stop ran again for the hook that handed off
+    const sent = ids(exporter.calls.flat());
+    expect(sent).toContain(ROOT);
+    expect(sent.includes(NEXT_ROOT)).toBe(false);
   });
 
   it.each([

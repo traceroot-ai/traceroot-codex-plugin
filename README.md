@@ -1,6 +1,6 @@
 # traceroot-codex-plugin
 
-Trace OpenAI Codex sessions to [TraceRoot](https://traceroot.ai). Every query becomes **one live trace** — agent turn, model calls, tool calls, file edits, and any subagents it spawns — streamed as the agent works and linked to your git repo. No daemon; tracing never blocks Codex.
+Trace OpenAI Codex sessions to [TraceRoot](https://traceroot.ai). Every query becomes **one live trace** — agent turn, model calls, tool calls, file edits, and any subagents it spawns — streamed as the agent works and linked to your git repo. No service to run, and the hooks fail open, so a tracing error doesn't stop Codex.
 
 ## Install
 
@@ -26,7 +26,7 @@ features.hooks = true
 enabled = true
 ```
 
-Trust the plugin's hooks. Codex won't run a plugin's hooks until you've reviewed and trusted them, and installing the plugin doesn't do that for you. The reason it asks: hooks run as your user, outside Codex's sandbox. What you're trusting here is three hook definitions in [`plugins/tracing/hooks/hooks.json`](plugins/tracing/hooks/hooks.json) (`PostToolUse`, `Stop`, `SubagentStop`), each running `node "$PLUGIN_ROOT/dist/index.mjs"`. That script reads the session transcript and sends spans to your TraceRoot host; it writes nothing back into Codex and fails open. Source is in [`plugins/tracing/src/`](plugins/tracing/src/).
+Trust the plugin's hooks. Codex won't run a plugin's hooks until you've reviewed and trusted them, and installing the plugin doesn't do that for you. The reason it asks: hooks run as your user, outside Codex's sandbox. What you're trusting here is three hook definitions in [`plugins/tracing/hooks/hooks.json`](plugins/tracing/hooks/hooks.json) (`PostToolUse`, `Stop`, `SubagentStop`), each running `node "$PLUGIN_ROOT/dist/index.mjs"`. That script reads the session transcript and sends spans to your TraceRoot host; it writes nothing back into Codex and fails open. Hooks of one session take turns through a lock directory next to the transcript (`<transcript>.traceroot.lock.d`). A hook that waits more than 10 s for it leaves a request in `<transcript>.traceroot.pending.d` and exits, and may start a background copy of the same script (`node dist/index.mjs --drain`, holding `<transcript>.traceroot.drainer.d` while it works) that sends the rest and exits within 2 minutes. Source is in [`plugins/tracing/src/`](plugins/tracing/src/).
 
 Start `codex`. At the "Hooks need review" prompt, choose **Trust all and continue** if you've looked at the above, or **Continue without trusting (hooks won't run)** and review them first under `/hooks`. Note that "all" means every hook awaiting review, not only this plugin's. Codex records a hash of each hook definition in `~/.codex/config.toml`, so you're asked once per definition and again if `hooks.json` changes; the hash does not cover `dist/index.mjs`, so a plugin update that changes the script runs under the existing grant. See [Codex hooks](https://developers.openai.com/codex/hooks).
 
