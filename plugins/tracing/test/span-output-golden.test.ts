@@ -3,12 +3,12 @@
  * that alters what existing rollouts produce (with optional features left off)
  * fails here. fixtures/spans-golden.json holds the expected spans.
  */
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { type EmitCtx, planTurnSpans } from "../src/spans.js";
 import { parseRollout, readRollout } from "../src/transcript.js";
+import { GOLDEN_CONTEXTS, readGolden } from "./helpers.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -23,18 +23,7 @@ const FIXTURES = [
   "rollout-prompt-image.jsonl",
 ];
 
-// "full" mirrors a live Stop hook with every optional context field set;
-// "tight" truncates hard so the truncation path is pinned too.
-const CONTEXTS: Record<string, EmitCtx> = {
-  full: {
-    environment: "dev", userId: "user-1", git: { repo: "traceroot-ai/traceroot", ref: "a".repeat(40) },
-    maxChars: 20000, turnEnding: true,
-  },
-  tight: { maxChars: 64 },
-};
-
-const golden = JSON.parse(fs.readFileSync(path.join(fixtures, "spans-golden.json"), "utf-8")) as
-  Record<string, Record<string, unknown>>;
+const golden = readGolden();
 
 async function planFixture(name: string, ctx: EmitCtx) {
   const { sessionMeta, turns } = parseRollout(await readRollout(path.join(fixtures, name)));
@@ -42,10 +31,10 @@ async function planFixture(name: string, ctx: EmitCtx) {
 }
 
 describe("planned spans for every rollout fixture", () => {
-  const cases = FIXTURES.flatMap((f) => Object.keys(CONTEXTS).map((c) => [f, c] as const));
+  const cases = FIXTURES.flatMap((f) => Object.keys(GOLDEN_CONTEXTS).map((c) => [f, c] as const));
 
   it.each(cases)("%s (%s context) matches the pinned output", async (fixture, context) => {
-    const spans = await planFixture(fixture, CONTEXTS[context]!);
+    const spans = await planFixture(fixture, GOLDEN_CONTEXTS[context]!);
     expect(spans).toEqual(golden[fixture]![context]);
     expect(JSON.stringify(spans)).toBe(JSON.stringify(golden[fixture]![context]));
   });

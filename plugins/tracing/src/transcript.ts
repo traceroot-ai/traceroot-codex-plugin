@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { isImageDataUrl } from "./images.js";
 import type {
   EventMsgPayload, ModelStep, ResponseItem, RolloutLine, SessionMeta, SubagentRef, ToolCall, Turn, TurnContextPayload,
 } from "./types.js";
@@ -56,11 +57,11 @@ function messageText(content: unknown): string | undefined {
   return parts.length ? parts.join("") : undefined;
 }
 
-/** Image data URLs among a message's `input_image` content parts. */
+/** Image data URLs, in the formats kept whole, among a message's `input_image` content parts. */
 function messageImages(content: unknown): string[] {
   if (!Array.isArray(content)) return [];
   return (content as Array<{ type?: string; image_url?: unknown }>)
-    .filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && c.image_url.startsWith("data:image/"))
+    .filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && isImageDataUrl(c.image_url))
     .map((c) => c.image_url as string);
 }
 
@@ -255,11 +256,13 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
           if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) {
             userInputFallback.set(turn, text);
           }
-          // Images attached to the prompt are read from here, whichever event
-          // carried the prompt text.
+          // Images attached to a user message are read from here, whichever event
+          // carried its text, and belong to the model call that follows it: the
+          // prompt's to the first call, a message sent while the turn runs to a
+          // later one.
           if (!text || !isInjectedFallbackText(text)) {
             for (const url of messageImages(p.content)) {
-              if (!(turn.userImages ??= []).includes(url)) turn.userImages.push(url);
+              if (!turn.steps.some((t) => t.userImages?.includes(url))) (s.userImages ??= []).push(url);
             }
           }
         } else if (p.role !== "developer") {

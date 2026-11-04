@@ -1,5 +1,7 @@
 import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
-import { type ReadableSpan, type SpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import {
+  type ReadableSpan, type SpanExporter, BatchSpanProcessor, SimpleSpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
 import { describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
 import { buildTracing, buildTracingWith, DeliveryTrackingExporter, type Tracing } from "../src/exporter.js";
@@ -102,5 +104,24 @@ describe("buildTracing delivery tracking", () => {
   it("buildTracingWith without a delivery set reports nothing as delivered", () => {
     const tracing = buildTracingWith(new SimpleSpanProcessor(new ScriptedExporter()), new PrimedIdGenerator());
     expect(tracing.delivered.size).toBe(0);
+  });
+
+  it("shutdown rejects on a failed batch only after the exports still in flight are answered", async () => {
+    const [a, b, c] = ["d".repeat(16), "e".repeat(16), "f".repeat(16)];
+    // `a` fills a one-span batch and is exported at once; `b` and `c` are flushed
+    // as two concurrent batches. `b` fails at once, `a` and `c` succeed later.
+    const sink = new ScriptedExporter(
+      (spans) => (ids(spans).includes(b) ? failed("Request Entity Too Large") : OK),
+      (spans) => (ids(spans).includes(b) ? 0 : 20),
+    );
+    const tracked = new DeliveryTrackingExporter(sink);
+    const tracing = buildTracingWith(
+      new BatchSpanProcessor(tracked, { maxExportBatchSize: 1 }), new PrimedIdGenerator(), tracked.delivered,
+    );
+    endSpans(tracing, [a, b, c]);
+
+    await expect(tracing.shutdown()).rejects.toBeDefined();
+    expect(sink.calls).toHaveLength(3);
+    expect([...tracing.delivered].sort()).toEqual([a, c]);
   });
 });

@@ -18,17 +18,18 @@ const start: RolloutLine[] = [
 const userMessage = (content: unknown[]): RolloutLine =>
   ({ timestamp: ts, type: "response_item", payload: { type: "message", role: "user", content } }) as RolloutLine;
 const turnOf = (lines: RolloutLine[]) => parseRollout([...start, ...lines]).turns[0]!;
+const tokenCount: RolloutLine = { timestamp: ts, type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 1 } } } };
 
 describe("prompt images", () => {
   it("keeps images attached to the prompt, next to the authoritative prompt text", async () => {
     const { turns } = await parseFixture("rollout-prompt-image.jsonl");
     expect(turns[0]!.userInput).toBe("what colour is this image?");
-    expect(turns[0]!.userImages).toHaveLength(1);
-    expect(turns[0]!.userImages![0]).toMatch(/^data:image\/jpeg;base64,\/9j\//);
+    expect(turns[0]!.steps[0]!.userImages).toHaveLength(1);
+    expect(turns[0]!.steps[0]!.userImages![0]).toMatch(/^data:image\/jpeg;base64,\/9j\//);
   });
 
   it("keeps an image sent without any text", () => {
-    expect(turnOf([userMessage([{ type: "input_image", image_url: PNG }])]).userImages).toEqual([PNG]);
+    expect(turnOf([userMessage([{ type: "input_image", image_url: PNG }])]).steps[0]!.userImages).toEqual([PNG]);
   });
 
   it("keeps several images in order and drops repeats", () => {
@@ -36,7 +37,26 @@ describe("prompt images", () => {
       userMessage([{ type: "input_text", text: "compare" }, { type: "input_image", image_url: PNG }, { type: "input_image", image_url: JPEG }]),
       userMessage([{ type: "input_text", text: "again" }, { type: "input_image", image_url: PNG }]),
     ]);
-    expect(turn.userImages).toEqual([PNG, JPEG]);
+    expect(turn.steps[0]!.userImages).toEqual([PNG, JPEG]);
+  });
+
+  it("puts an image sent after the first model call closed on the model call that follows it", () => {
+    const turn = turnOf([
+      userMessage([{ type: "input_text", text: "fix the page" }, { type: "input_image", image_url: JPEG }]),
+      tokenCount,
+      userMessage([{ type: "input_text", text: "<image name=[Image #1]>" }, { type: "input_image", image_url: PNG }, { type: "input_text", text: "</image>" }]),
+      tokenCount,
+    ]);
+    expect(turn.steps.map((s) => s.userImages)).toEqual([[JPEG], [PNG]]);
+  });
+
+  it("keeps an image sent again later in the turn only on the first model call that got it", () => {
+    const turn = turnOf([
+      userMessage([{ type: "input_image", image_url: PNG }]),
+      tokenCount,
+      userMessage([{ type: "input_text", text: "again" }, { type: "input_image", image_url: PNG }]),
+    ]);
+    expect(turn.steps.map((s) => s.userImages)).toEqual([[PNG], undefined]);
   });
 
   it("ignores injected context messages, remote URLs and other parts", () => {
@@ -49,12 +69,24 @@ describe("prompt images", () => {
         { type: "output_image", image_url: JPEG },
       ]),
     ]);
-    expect(turn.userImages).toBeUndefined();
+    expect(turn.steps[0]!.userImages).toBeUndefined();
   });
 
-  it("does not add the field to a turn without images", async () => {
+  it("keeps only PNG, JPEG, GIF and WebP base64 data URLs", () => {
+    const turn = turnOf([userMessage([
+      { type: "input_text", text: "look" },
+      { type: "input_image", image_url: "data:image/svg+xml;base64,PHN2Zy8+" },
+      { type: "input_image", image_url: PNG },
+      { type: "input_image", image_url: "data:image/png,%89PNG" },
+    ])]);
+    expect(turn.steps[0]!.userImages).toEqual([PNG]);
+    const svgOnly = turnOf([userMessage([{ type: "input_image", image_url: "data:image/svg+xml;base64,PHN2Zy8+" }])]);
+    expect(svgOnly.steps[0]!.userImages).toBeUndefined();
+  });
+
+  it("does not add the field to the model calls of a turn without images", async () => {
     const { turns } = await parseFixture("rollout-basic.jsonl");
-    expect("userImages" in turns[0]!).toBe(false);
+    expect(turns[0]!.steps.some((s) => "userImages" in s)).toBe(false);
   });
 });
 

@@ -12,7 +12,7 @@ import { attributesBytes } from "../src/size.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
 import { parseRollout, readRollout } from "../src/transcript.js";
 import type { SessionMeta, Turn } from "../src/types.js";
-import { memTracing } from "./helpers.js";
+import { GOLDEN_CONTEXTS, memTracing, readGolden } from "./helpers.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const MiB = 1024 * 1024;
@@ -37,12 +37,13 @@ const attr = (span: EmittableSpan | undefined, key: string): string => String(sp
 const imageOf = (bytes: number): string => `data:image/png;base64,${"A".repeat(Math.ceil(bytes / 3) * 4)}`;
 
 const sessionMeta: SessionMeta = { sessionId: "sess-big" };
-const turnWith = (patch: Partial<Turn>, output?: unknown): Turn => ({
+const turnWith = (patch: Partial<Turn>, output?: unknown, promptImages?: string[]): Turn => ({
   turnId: "turn-big", startTime: 0, endTime: 10, model: "gpt-5.5", completed: true, aborted: false,
   userInput: "go", ...patch,
   steps: [{
     index: 0, startTime: 1, endTime: 2, usage: { input_tokens: 1 },
     toolCalls: output === undefined ? [] : [{ callId: "call-big", name: "exec", args: "shot()", startTime: 1, endTime: 2, output }],
+    ...(promptImages ? { userImages: promptImages } : {}),
   }],
 });
 
@@ -50,8 +51,9 @@ describe("image capture on: tool output", () => {
   it("keeps the screenshot data URL whole in the tool span output", async () => {
     const png = await fixtureImage("rollout-tool-image.jsonl", "png");
     const tool = (await plan("rollout-tool-image.jsonl", on)).find((s) => s.kind === "TOOL");
+    // The JSON around the strings and "input_text" take 60 of the 64 characters.
     expect(JSON.parse(attr(tool, OUTPUT))).toEqual([
-      { type: "input_text", text: "Captured a 4x4 screenshot." },
+      { type: "input_text", text: "Capt…[truncated 22 chars]" },
       { type: "input_image", image_url: png },
     ]);
   });
@@ -71,11 +73,22 @@ describe("image capture on: tool output", () => {
     expect(JSON.parse(next)[0].output[1]).toEqual({ type: "input_image", image_url: "[image: see tool call call-shot]" });
   });
 
+  it("keeps the placeholder in the next model call's input after tool text longer than maxChars", () => {
+    const output = [{ type: "input_text", text: "t".repeat(30000) }, { type: "input_image", image_url: imageOf(3000) }];
+    const turn = turnWith({}, output);
+    turn.steps.push({ index: 1, startTime: 3, endTime: 4, usage: { input_tokens: 1 }, toolCalls: [] });
+    const next = attr(planTurnSpans(sessionMeta, turn, { ...on, maxChars: 20000 }).filter((s) => s.kind === "LLM")[1], INPUT);
+    expect(next).not.toContain("data:image");
+    const fed = JSON.parse(next)[0].output;
+    expect(fed[0].text).toMatch(/^t{19913}…\[truncated \d+ chars\]$/);
+    expect(fed[1]).toEqual({ type: "input_image", image_url: "[image: see tool call call-big]" });
+  });
+
   it("cuts long tool text at maxChars but keeps the image after it", () => {
     const output = [{ type: "input_text", text: "t".repeat(30000) }, { type: "input_image", image_url: imageOf(3000) }];
     const tool = planTurnSpans(sessionMeta, turnWith({}, output), { ...on, maxChars: 20000 }).find((s) => s.kind === "TOOL");
     const parsed = JSON.parse(attr(tool, OUTPUT));
-    expect(parsed[0].text).toMatch(/…\[truncated 10010 chars\]$/);
+    expect(parsed[0].text).toMatch(/…\[truncated 10060 chars\]$/);
     expect(parsed[1].image_url).toBe(imageOf(3000));
   });
 
@@ -112,10 +125,18 @@ describe("image capture on: prompt images", () => {
     expect(root).not.toContain("data:image");
   });
 
+  it("keeps the turn input's placeholder after a prompt longer than maxChars", () => {
+    const turn = turnWith({ userInput: "q".repeat(30000) }, undefined, [imageOf(30)]);
+    const [root] = planTurnSpans(sessionMeta, turn, { ...on, maxChars: 20000 });
+    const parsed = JSON.parse(attr(root, INPUT));
+    expect(parsed[0]).toEqual({ type: "input_text", text: `${"q".repeat(19940)}…[truncated 10060 chars]` });
+    expect(parsed[1]).toEqual({ type: "input_image", image_url: FIRST_CALL });
+  });
+
   it("sends an image-only prompt as the image alone", () => {
     const png = imageOf(30);
     const [root, step] = planTurnSpans(
-      sessionMeta, turnWith({ userInput: undefined, userImages: [png] }), { ...on, maxChars: 20000 },
+      sessionMeta, turnWith({ userInput: undefined }, undefined, [png]), { ...on, maxChars: 20000 },
     );
     expect(JSON.parse(attr(step, INPUT))).toEqual([{ type: "input_image", image_url: png }]);
     expect(JSON.parse(attr(root, INPUT))).toEqual([{ type: "input_image", image_url: FIRST_CALL }]);
@@ -130,7 +151,7 @@ describe("image capture on: prompt images", () => {
 
   it("fits prompt images into 8 MiB on the first model call span", () => {
     const [a, b] = [imageOf(4.5 * MiB), imageOf(4 * MiB)];
-    const [root, step] = planTurnSpans(sessionMeta, turnWith({ userImages: [a, b] }), on);
+    const [root, step] = planTurnSpans(sessionMeta, turnWith({}, undefined, [a, b]), { ...on, maxChars: 20000 });
     expect(attributesBytes(step!.attributes)).toBeLessThanOrEqual(MAX_SPAN_BYTES);
     expect(JSON.parse(attr(step, INPUT))[1].image_url).toBe(SPAN_TOO_LARGE_IMAGE);
     expect(JSON.parse(attr(step, INPUT))[2].image_url).toBe(b);
@@ -139,27 +160,130 @@ describe("image capture on: prompt images", () => {
   });
 });
 
-describe("image capture off", () => {
-  const golden = JSON.parse(fs.readFileSync(path.join(fixtures, "spans-golden.json"), "utf-8")) as
-    Record<string, Record<string, unknown>>;
-  const contexts: Record<string, EmitCtx> = {
-    full: {
-      environment: "dev", userId: "user-1", git: { repo: "traceroot-ai/traceroot", ref: "a".repeat(40) },
-      maxChars: 20000, turnEnding: true,
-    },
-    tight: { maxChars: 64 },
-  };
-  const cases = Object.keys(golden).flatMap((f) => Object.keys(contexts).map((c) => [f, c] as const));
-
-  it.each(cases)("%s (%s context) is byte-identical to the pinned output", async (fixture, context) => {
-    const spans = await plan(fixture, { ...contexts[context]!, captureImages: false });
-    expect(JSON.stringify(spans)).toBe(JSON.stringify(golden[fixture]![context]));
+describe("image capture on: an image sent while the turn is running", () => {
+  let dir: string | undefined;
+  afterEach(() => {
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
   });
 
-  it.each(cases.filter(([f]) => !f.includes("image")))(
-    "%s (%s context) without images changes only by the tool call ids with capture on",
+  const line = (ms: number, type: string, payload: Record<string, unknown>): string =>
+    JSON.stringify({ timestamp: new Date(Date.UTC(2026, 6, 1, 12, 0, 0, ms)).toISOString(), type, payload });
+  const config: Config = {
+    enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * MiB,
+    debug: false, failOnError: true, captureImages: true,
+  };
+
+  it("goes on the model call after it, which is still unsent, and the turn input points at that call", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-steer-"));
+    const transcript = path.join(dir, "rollout.jsonl");
+    const png = await fixtureImage("rollout-tool-image.jsonl", "png");
+    const throughFirstCall = [
+      line(0, "session_meta", { id: "sess-steer", cwd: "/repo" }),
+      line(10, "event_msg", { type: "task_started", turn_id: "turn-steer" }),
+      line(20, "turn_context", { turn_id: "turn-steer", model: "gpt-5.5" }),
+      line(100, "response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "fix the page" }] }),
+      line(110, "event_msg", { type: "user_message", message: "fix the page" }),
+      line(1000, "response_item", { type: "function_call", name: "exec_command", call_id: "call-edit", arguments: "{}" }),
+      line(1100, "event_msg", { type: "token_count", info: { last_token_usage: { input_tokens: 10 } } }),
+      line(2000, "response_item", { type: "function_call_output", call_id: "call-edit", output: "edited" }),
+    ];
+    // The user sends a screenshot while the first model call's tool runs.
+    const steeringAndRest = [
+      line(2500, "response_item", {
+        type: "message", role: "user", content: [
+          { type: "input_text", text: "<image name=[Image #1]>" }, { type: "input_image", image_url: png },
+          { type: "input_text", text: "</image>" }, { type: "input_text", text: "it should look like this" },
+        ],
+      }),
+      line(2510, "event_msg", { type: "user_message", message: "it should look like this" }),
+      line(3000, "response_item", { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done." }] }),
+      line(3100, "event_msg", { type: "token_count", info: { last_token_usage: { input_tokens: 20 } } }),
+      line(3200, "event_msg", { type: "task_complete", turn_id: "turn-steer", last_agent_message: "Done." }),
+    ];
+    const mem = new InMemorySpanExporter();
+    const deps = { buildTracing: () => memTracing(mem), getGit: async () => ({}) };
+
+    fs.writeFileSync(transcript, `${throughFirstCall.join("\n")}\n`);
+    await dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config, deps);
+    fs.appendFileSync(transcript, `${steeringAndRest.join("\n")}\n`);
+    await dispatch({ transcript_path: transcript, hook_event_name: "Stop" }, config, deps);
+
+    const sent = mem.getFinishedSpans();
+    const ofType = (t: string) => sent.filter((s) => s.attributes["traceroot.span.type"] === t);
+    const [first, second] = ofType("LLM");
+    expect(ofType("LLM")).toHaveLength(2);
+    expect(first!.attributes[INPUT]).toBe("fix the page");
+    expect(JSON.parse(String(second!.attributes[INPUT]))).toEqual([
+      { type: "input_text", text: JSON.stringify([{ name: "exec_command", output: "edited" }]) },
+      { type: "input_image", image_url: png },
+    ]);
+    expect(JSON.parse(String(second!.attributes["traceroot.span.metadata"]))).toEqual({ "codex.step_index": 1 });
+    expect(JSON.parse(String(ofType("AGENT")[0]!.attributes[INPUT]))).toEqual([
+      { type: "input_text", text: "fix the page\n\nit should look like this" },
+      { type: "input_image", image_url: "[image: see model call 1]" },
+    ]);
+  });
+
+  it("puts each model call's images on that call, and points the turn input at the call holding each", () => {
+    const [a, b] = [imageOf(30), imageOf(60)];
+    const turn = turnWith({}, undefined, [a, b]);
+    turn.steps.push({ index: 1, startTime: 3, endTime: 4, usage: { input_tokens: 1 }, toolCalls: [], userImages: [imageOf(90)] });
+    const [root, step0, step1] = planTurnSpans(sessionMeta, turn, { ...on, maxChars: 20000 });
+    expect(JSON.parse(attr(step0, INPUT)).slice(1)).toEqual([a, b].map((url) => ({ type: "input_image", image_url: url })));
+    expect(JSON.parse(attr(step1, INPUT))).toEqual([{ type: "input_image", image_url: imageOf(90) }]);
+    expect(JSON.parse(attr(root, INPUT)).map((item: { image_url?: string }) => item.image_url)).toEqual([
+      undefined, "[image: see first model call]", "[image: see first model call]", "[image: see model call 1]",
+    ]);
+  });
+});
+
+describe("image capture on: a placeholder for an image left out of its span", () => {
+  const wide: EmitCtx = { ...on, maxChars: 20000 };
+  const fed = (spans: EmittableSpan[]) => JSON.parse(attr(spans.filter((s) => s.kind === "LLM")[1], INPUT))[0].output;
+  const withNextCall = (turn: Turn): Turn => {
+    turn.steps.push({ index: 1, startTime: 3, endTime: 4, usage: { input_tokens: 1 }, toolCalls: [] });
+    return turn;
+  };
+
+  it("shows in the next model call that the tool span dropped the image to fit in 8 MiB", () => {
+    const [large, small] = [imageOf(4.5 * MiB), imageOf(4 * MiB)];
+    const output = [{ type: "input_image", image_url: small }, { type: "input_image", image_url: large }];
+    const spans = planTurnSpans(sessionMeta, withNextCall(turnWith({}, output)), wide);
+    expect(JSON.parse(attr(spans.find((s) => s.kind === "TOOL"), OUTPUT))[1].image_url).toBe(SPAN_TOO_LARGE_IMAGE);
+    expect(fed(spans)).toEqual([
+      { type: "input_image", image_url: "[image: see tool call call-big]" },
+      { type: "input_image", image_url: SPAN_TOO_LARGE_IMAGE },
+    ]);
+  });
+
+  it("shows in the next model call that the tool's image was over 5 MiB", () => {
+    const output = [{ type: "input_text", text: "Captured." }, { type: "input_image", image_url: imageOf(5 * MiB + 3) }];
+    const spans = planTurnSpans(sessionMeta, withNextCall(turnWith({}, output)), wide);
+    expect(fed(spans)).toEqual([{ type: "input_text", text: "Captured." }, { type: "input_image", image_url: OVERSIZE_IMAGE }]);
+  });
+
+  it("shows in the turn input which prompt images the first model call dropped", () => {
+    const [a, b] = [imageOf(4.5 * MiB), imageOf(4 * MiB)];
+    const [root] = planTurnSpans(sessionMeta, turnWith({}, undefined, [a, b, imageOf(5 * MiB + 3)]), wide);
+    expect(JSON.parse(attr(root, INPUT)).slice(1)).toEqual([
+      { type: "input_image", image_url: SPAN_TOO_LARGE_IMAGE },
+      { type: "input_image", image_url: "[image: see first model call]" },
+      { type: "input_image", image_url: OVERSIZE_IMAGE },
+    ]);
+  });
+});
+
+// With capture off, every fixture's spans are pinned by span-output-golden.test.ts.
+describe("image capture on, fixtures without images", () => {
+  const golden = readGolden();
+  const cases = Object.keys(golden).filter((f) => !f.includes("image"))
+    .flatMap((f) => Object.keys(GOLDEN_CONTEXTS).map((c) => [f, c] as const));
+
+  it.each(cases)(
+    "%s (%s context) changes only by the tool call ids",
     async (fixture, context) => {
-      const spans = await plan(fixture, { ...contexts[context]!, captureImages: true });
+      const spans = await plan(fixture, { ...GOLDEN_CONTEXTS[context]!, captureImages: true });
       for (const span of spans.filter((s) => s.kind === "TOOL")) {
         const { call_id, ...rest } = JSON.parse(String(span.attributes["traceroot.span.metadata"]));
         expect(makeSpanId(call_id)).toBe(span.spanId);

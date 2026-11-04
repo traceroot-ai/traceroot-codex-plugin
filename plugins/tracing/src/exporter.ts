@@ -65,7 +65,8 @@ export class DeliveryTrackingExporter implements SpanExporter {
 
 /**
  * Sends each export call as sequential requests whose estimated size stays within
- * `maxBytes`, so no single request passes the ingest endpoint's size limit. Each
+ * `maxBytes`, to keep each request under the ingest endpoint's size limit. A span
+ * whose estimate alone passes `maxBytes` is still sent, in a request of its own. Each
  * request goes through `inner` on its own, so a failed request fails only its own
  * spans; the call as a whole reports the first failure, after trying every request.
  */
@@ -137,9 +138,15 @@ export function buildTracingWith(
     delivered,
     // Both needed: forceFlush drains pending spans, shutdown awaits in-flight
     // OTLP HTTP delivery so this short-lived process delivers spans before exit.
+    // forceFlush rejects on the first failed batch while other exports may still
+    // be in flight, so shutdown runs either way: `delivered` is complete only
+    // once every export has been answered.
     shutdown: async () => {
-      await provider.forceFlush();
-      await provider.shutdown();
+      try {
+        await provider.forceFlush();
+      } finally {
+        await provider.shutdown();
+      }
     },
   };
 }

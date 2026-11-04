@@ -56,7 +56,7 @@ Resolved highest-precedence first: env vars → project `.codex/traceroot.json` 
 | `api_key` | `TRACEROOT_API_KEY` | — | Required. |
 | `host_url` | `TRACEROOT_HOST_URL` | `https://app.traceroot.ai` | Point at a self-hosted instance. |
 | `max_chars` | `TRACEROOT_CODEX_MAX_CHARS` | `20000` | Truncate long span attributes. |
-| `max_request_bytes` | `TRACEROOT_CODEX_MAX_REQUEST_BYTES` | `12582912` (12 MiB) | Upper bound on the estimated size of one upload request. Larger batches of spans are sent as several requests. |
+| `max_request_bytes` | `TRACEROOT_CODEX_MAX_REQUEST_BYTES` | `12582912` (12 MiB) | Target for the estimated size of one upload request. Larger batches of spans are sent as several requests. A single span larger than this is sent in a request of its own. |
 | `debug` | `TRACEROOT_CODEX_DEBUG` | `false` | Log to stderr. |
 | `fail_on_error` | `TRACEROOT_CODEX_FAIL_ON_ERROR` | `false` | Off by default — tracing never blocks a Codex turn. |
 | `capture_images` | `TRACEROOT_CODEX_CAPTURE_IMAGES` | `false` | Send screenshots from tool output and images attached to prompts. Read only from the env var or the global `~/.codex/traceroot.json`. See [Images](#images). |
@@ -92,10 +92,12 @@ To check a headless setup, run `codex exec --skip-git-repo-check "echo hello" < 
 
 By default, tool output is cut at `max_chars`, which also cuts any screenshot in it, and images attached to a prompt are left out of the trace. Set `capture_images` to `true` in `~/.codex/traceroot.json` (or `TRACEROOT_CODEX_CAPTURE_IMAGES=true`) to keep them. A project's `.codex/traceroot.json` can't turn this on, so a repository you open can't start sending your screen content. With it on:
 
-- Tool output keeps PNG, JPEG, GIF and WebP images (`data:image/...;base64,` URLs) whole. `max_chars` applies to the text around them.
-- Images attached to a prompt appear in the first model call's input. The turn's input shows `[image: see first model call]` in their place, because the turn is sent again on every hook.
+- Tool output keeps PNG, JPEG, GIF and WebP images (`data:image/...;base64,` URLs) whole. `max_chars` applies to the rest of the output.
+- Images attached to a prompt, in the same four formats, appear in the first model call's input. An image attached to a message you send while the turn is running appears in the input of the model call that follows it. The turn's input shows `[image: see first model call]` or `[image: see model call <n>]` in their place, where `<n>` is that call's `codex.step_index`, because the turn is sent again on every hook.
 - When a tool's output is fed to the next model call, each image in it shows there as `[image: see tool call <call id>]` instead of a second copy. The tool span's metadata carries the matching `call_id`.
-- An image larger than 5 MiB is replaced with `[image omitted: larger than 5 MiB]`. If a span would still be larger than 8 MiB, its largest images are replaced with `[image omitted: span larger than 8 MiB]` until it fits.
+- An image larger than 5 MiB is replaced with `[image omitted: larger than 5 MiB]`. If a span would still be larger than 8 MiB, its largest images are replaced with `[image omitted: span larger than 8 MiB]` until it fits. Where a placeholder would point at an image replaced this way, it shows the same text instead.
+
+Screenshots are stored as images only when your TraceRoot server has image extraction enabled for the project. On a self-hosted server, set `ATTACHMENT_ENABLED=true`, and optionally `ATTACHMENT_PROJECT_IDS` to a comma-separated list of the projects to enable it for. Without it, screenshots are stored inline in the span text.
 
 ## Privacy
 
