@@ -231,6 +231,34 @@ describe("dispatch with a request that fails", () => {
   });
 });
 
+describe("dispatch with a tool call whose rollout entry has a missing or non-string name", () => {
+  let dir: string;
+  afterEach(() => { if (dir) fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it.each([["missing", {}], ["a number", { name: 42 }]])("sends every span when the name is %s", async (_label, name) => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-name-"));
+    const transcript = path.join(dir, "rollout.jsonl");
+    const at = (s: number) => `2026-06-30T00:00:0${s}.000Z`;
+    const lines: unknown[] = [
+      { timestamp: at(0), type: "session_meta", payload: { id: "sess-name" } },
+      { timestamp: at(1), type: "event_msg", payload: { type: "task_started", turn_id: "t1" } },
+      { timestamp: at(2), type: "event_msg", payload: { type: "user_message", message: "run it" } },
+      { timestamp: at(3), type: "response_item", payload: { type: "function_call", ...name, call_id: "c1", arguments: "{}" } },
+      { timestamp: at(4), type: "response_item", payload: { type: "function_call_output", call_id: "c1", output: "ok" } },
+      { timestamp: at(5), type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 1 } } } },
+      { timestamp: at(6), type: "event_msg", payload: { type: "task_complete", turn_id: "t1", last_agent_message: "done" } },
+    ];
+    fs.writeFileSync(transcript, lines.map((l) => JSON.stringify(l)).join("\n"));
+
+    const exporter = new ScriptedExporter();
+    await dispatch({ transcript_path: transcript }, config, {
+      buildTracing: (c: Config) => buildTracing(c, exporter), getGit: async () => ({}),
+    });
+    expect(exporter.calls.flat()).toHaveLength(3);
+    expect(await loadEmittedSpanIds(transcript)).toEqual(new Set(ids(exporter.calls.flat())));
+  });
+});
+
 describe("max_request_bytes setting", () => {
   const saved = { ...process.env };
   let home: string;

@@ -180,7 +180,7 @@ function planToolSpan(
   if (tc.kind !== undefined) meta["tool_kind"] = tc.kind;
   if (tc.status !== undefined) meta["status"] = tc.status;
   if (tc.exitCode !== undefined) meta["exit_code"] = tc.exitCode;
-  if (tc.error !== undefined) meta["error"] = tc.error;
+  if (tc.error !== undefined) meta["error"] = str(tc.error, ctx.maxChars);
   if (Object.keys(meta).length > 0) attrs["traceroot.span.metadata"] = JSON.stringify(meta);
   return {
     spanId: makeSpanId(seed + tc.callId), parentSpanId, traceId, kind: "TOOL",

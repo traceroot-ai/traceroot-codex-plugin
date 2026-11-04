@@ -30,7 +30,8 @@ const traceStateBytes = (state: TraceState | undefined): number => utf8Bytes(sta
 
 /** Estimated size `span` adds to an OTLP protobuf request, never below the real size. */
 export function estimateSpanBytes(span: ReadableSpan): number {
-  let n = SPAN_OVERHEAD_BYTES + utf8Bytes(span.name) + utf8Bytes(span.status.message ?? "")
+  // A span name is copied from the rollout unchecked, so it may not be a string.
+  let n = SPAN_OVERHEAD_BYTES + valueBytes(span.name) + utf8Bytes(span.status.message ?? "")
     + traceStateBytes(span.spanContext().traceState) + attributesBytes(span.attributes);
   for (const event of span.events) {
     n += SPAN_OVERHEAD_BYTES + utf8Bytes(event.name) + attributesBytes(event.attributes ?? {});

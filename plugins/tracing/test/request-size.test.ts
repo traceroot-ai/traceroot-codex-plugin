@@ -90,6 +90,20 @@ describe("estimateSpanBytes", () => {
     expect(estimateSpanBytes(span!) - added).toBeLessThan(512);
   });
 
+  it("estimates a span whose name isn't a string without throwing, never below its serialized size", async () => {
+    const sink = new ScriptedExporter();
+    const tracing = buildTracingWith(new SimpleSpanProcessor(sink), new PrimedIdGenerator());
+    tracing.tracer.startSpan("anchor").end();
+    for (const name of [undefined, 42, ["exec"]]) tracing.tracer.startSpan(name as unknown as string).end();
+    await tracing.shutdown();
+    const [anchor, unnamed, numbered, listed] = sink.calls.flat();
+
+    // The serializer leaves a missing name out; it can't write a number or a list at all.
+    const added = requestBytes([anchor!, unnamed!]) - requestBytes([anchor!]);
+    expect(estimateSpanBytes(unnamed!)).toBeGreaterThanOrEqual(added);
+    expect(splitBySize([anchor!, unnamed!, numbered!, listed!], MiB)).toEqual([[anchor, unnamed, numbered, listed]]);
+  });
+
   it("counts attribute values by their UTF-8 size", () => {
     expect(attributesBytes({ k: "é" }) - attributesBytes({ k: "e" })).toBe(1);
     expect(attributesBytes({})).toBe(0);
