@@ -29816,11 +29816,12 @@ function attributesBytes(attributes) {
 	for (const [key, value] of Object.entries(attributes)) n += ATTRIBUTE_OVERHEAD_BYTES + utf8Bytes(key) + valueBytes(value);
 	return n;
 }
+const traceStateBytes = (state) => utf8Bytes(state?.serialize() ?? "");
 /** Estimated size `span` adds to an OTLP protobuf request, never below the real size. */
 function estimateSpanBytes(span) {
-	let n = SPAN_OVERHEAD_BYTES + utf8Bytes(span.name) + utf8Bytes(span.status.message ?? "") + attributesBytes(span.attributes);
+	let n = SPAN_OVERHEAD_BYTES + valueBytes(span.name) + utf8Bytes(span.status.message ?? "") + traceStateBytes(span.spanContext().traceState) + attributesBytes(span.attributes);
 	for (const event of span.events) n += SPAN_OVERHEAD_BYTES + utf8Bytes(event.name) + attributesBytes(event.attributes ?? {});
-	for (const link of span.links) n += SPAN_OVERHEAD_BYTES + attributesBytes(link.attributes ?? {});
+	for (const link of span.links) n += SPAN_OVERHEAD_BYTES + traceStateBytes(link.context.traceState) + attributesBytes(link.attributes ?? {});
 	return n;
 }
 /**
@@ -29884,7 +29885,8 @@ var DeliveryTrackingExporter = class {
 };
 /**
 * Sends each export call as sequential requests whose estimated size stays within
-* `maxBytes`, so no single request passes the ingest endpoint's size limit. Each
+* `maxBytes`, to keep each request under the ingest endpoint's size limit. A span
+* whose estimate alone passes `maxBytes` is still sent, in a request of its own. Each
 * request goes through `inner` on its own, so a failed request fails only its own
 * spans; the call as a whole reports the first failure, after trying every request.
 */
@@ -29926,8 +29928,11 @@ function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set(
 		idGen,
 		delivered,
 		shutdown: async () => {
-			await provider.forceFlush();
-			await provider.shutdown();
+			try {
+				await provider.forceFlush();
+			} finally {
+				await provider.shutdown();
+			}
 		}
 	};
 }
@@ -30286,7 +30291,7 @@ function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx) {
 	if (tc.kind !== void 0) meta["tool_kind"] = tc.kind;
 	if (tc.status !== void 0) meta["status"] = tc.status;
 	if (tc.exitCode !== void 0) meta["exit_code"] = tc.exitCode;
-	if (tc.error !== void 0) meta["error"] = tc.error;
+	if (tc.error !== void 0) meta["error"] = str(tc.error, ctx.maxChars);
 	if (Object.keys(meta).length > 0) attrs["traceroot.span.metadata"] = JSON.stringify(meta);
 	return {
 		spanId: makeSpanId(seed + tc.callId),

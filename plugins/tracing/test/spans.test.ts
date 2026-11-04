@@ -149,6 +149,24 @@ describe("planToolSpan enriched metadata", () => {
     expect(meta["exit_code"]).toBe(1);
     expect(String(meta["error"])).toContain("boom");
   });
+
+  it("cuts a failed tool's error text at maxChars, so error output alone can't pass the upload limit", () => {
+    const stderr = "e".repeat(17 * 1024 * 1024);
+    const failedTurn: Turn = {
+      ...turn,
+      steps: [{
+        ...turn.steps[0]!,
+        toolCalls: [{
+          callId: "call-fail", name: "exec", args: { cmd: "make" }, startTime: 1800, endTime: 2000,
+          status: "failed", exitCode: 2, error: stderr,
+        } satisfies ToolCall],
+      }],
+    };
+    const tool = planTurnSpans(sessionMeta, failedTurn, ctx).find((s) => s.kind === "TOOL")!;
+    const meta = JSON.parse(tool.attributes["traceroot.span.metadata"] as string) as Record<string, unknown>;
+    expect(meta["error"]).toBe(`${"e".repeat(20000)}…[truncated ${stderr.length - 20000} chars]`);
+    expect(meta["status"]).toBe("failed");
+  });
 });
 
 import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
