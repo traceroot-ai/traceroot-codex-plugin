@@ -29927,8 +29927,11 @@ function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set(
 		idGen,
 		delivered,
 		shutdown: async () => {
-			await provider.forceFlush();
-			await provider.shutdown();
+			try {
+				await provider.forceFlush();
+			} finally {
+				await provider.shutdown();
+			}
 		}
 	};
 }
