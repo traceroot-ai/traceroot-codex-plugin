@@ -30025,9 +30025,14 @@ const IMAGE_DATA_URL = /data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/]+
 const WHOLE_IMAGE_DATA_URL = /* @__PURE__ */ new RegExp(`^(?:${IMAGE_DATA_URL.source})$`);
 /** Stands in for a prompt image in the turn span, which is sent again on every hook. */
 const FIRST_CALL_IMAGE = "[image: see first model call]";
+/**
+* Stands in, in the turn span, for an image the model call with this step index
+* got with the user message before it.
+*/
+const modelCallImage = (stepIndex) => stepIndex === 0 ? FIRST_CALL_IMAGE : `[image: see model call ${stepIndex}]`;
 /** Stands in for a tool's image in the next model call's input. */
 const toolCallImage = (callId) => `[image: see tool call ${callId}]`;
-const KEPT = new RegExp(`${IMAGE_DATA_URL.source}|\\[image: see (?:first model call|tool call [^\\]\\s]{1,200})\\]`, "g");
+const KEPT = new RegExp(`${IMAGE_DATA_URL.source}|\\[image: see (?:first model call|model call \\d{1,9}|tool call [^\\]\\s]{1,200})\\]`, "g");
 const SPARE_CHARS_PER_IMAGE = 64;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_SPAN_BYTES = 8 * 1024 * 1024;
@@ -30035,6 +30040,8 @@ const OVERSIZE_IMAGE = "[image omitted: larger than 5 MiB]";
 const SPAN_TOO_LARGE_IMAGE = "[image omitted: span larger than 8 MiB]";
 /** Whether `s` is exactly one base64 image data URL in a format kept whole. */
 const isImageDataUrl = (s) => WHOLE_IMAGE_DATA_URL.test(s);
+/** The image data URLs in a span attribute's text. */
+const imagesIn = (text) => new Set(typeof text === "string" ? text.match(IMAGE_DATA_URL) : []);
 /** Decoded size of a base64 data URL's payload, in bytes. */
 function decodedBytes(dataUrl) {
 	const payload = dataUrl.slice(dataUrl.indexOf(",") + 1);
@@ -30085,10 +30092,22 @@ function parseJsonContainer(text) {
 	}
 }
 /**
+* `value` serialized with its strings cut one by one, so JSON stays valid. The
+* keys, numbers and punctuation around the strings count toward the budget
+* first, as they do in the plain cut. When they alone pass it, returns
+* undefined: only cutting the serialized text as one string keeps it in budget.
+*/
+function capStrings(value, budget) {
+	const structure = JSON.stringify(mapStrings(value, () => "")).length;
+	if (structure > budget.left) return void 0;
+	budget.left -= structure;
+	return JSON.stringify(mapStrings(value, (s) => capString(s, budget)));
+}
+/**
 * Serializes `value` for a span attribute and caps it at `max` characters like
 * the plain cut, but keeps image data URLs and the placeholders that point at
-* them whole: only the text counts toward `max`, and strings are cut one by one
-* so JSON stays valid. Once `max` is spent, the strings after it share 64
+* them whole: everything else counts toward `max`, and strings are cut one by
+* one so JSON stays valid. Once `max` is spent, the strings after it share 64
 * characters per image, so many short strings can't carry the text past `max`.
 * An image over 5 MiB decoded becomes a placeholder. A value without images or
 * placeholders is cut exactly as the plain cut does.
@@ -30101,14 +30120,18 @@ function capWithImages(value, max) {
 		left: max,
 		spare: kept * SPARE_CHARS_PER_IMAGE
 	};
-	const cap = (s) => capString(s, budget);
-	if (typeof value !== "string") return JSON.stringify(mapStrings(value, cap));
-	const parsed = text.replace(KEPT, "").length > max ? parseJsonContainer(text) : void 0;
-	return parsed === void 0 ? cap(text) : JSON.stringify(mapStrings(parsed, cap));
+	const container = typeof value !== "string" ? value : text.replace(KEPT, "").length > max ? parseJsonContainer(text) : void 0;
+	return (container === void 0 ? void 0 : capStrings(container, budget)) ?? capString(text, budget);
 }
-/** `value` with every image data URL in it replaced by `placeholder`. */
-function replaceImages(value, placeholder) {
-	return mapStrings(value, (s) => s.replace(IMAGE_DATA_URL, () => placeholder));
+/** What stands in for an image a span left out: over 5 MiB, or dropped so the span fits in 8 MiB. */
+const omittedImage = (url) => decodedBytes(url) > MAX_IMAGE_BYTES ? OVERSIZE_IMAGE : SPAN_TOO_LARGE_IMAGE;
+/**
+* `value` with every image data URL in it replaced by `placeholder`. Given the
+* images the span that `placeholder` points at kept, an image that span left out
+* is replaced by the reason instead, so no placeholder points at a missing image.
+*/
+function replaceImages(value, placeholder, kept) {
+	return mapStrings(value, (s) => s.replace(IMAGE_DATA_URL, (url) => kept === void 0 || kept.has(url) ? placeholder : omittedImage(url)));
 }
 /**
 * Replaces image data URLs in `attributes` with a placeholder, largest first,
@@ -30158,22 +30181,26 @@ const ROOT_NAME = "Codex Turn";
 const str = (v, max) => truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
 /** Span input/output capped at maxChars; with image capture on, images and their placeholders stay whole. */
 const io = (v, ctx) => ctx.captureImages ? capWithImages(v, ctx.maxChars) : str(v, ctx.maxChars);
-/** The prompt as the model got it: its text, plus attached images when image capture is on. */
-function promptOf(turn, ctx) {
-	if (!ctx.captureImages || !turn.userImages?.length) return turn.userInput;
-	return [...turn.userInput ? [{
-		type: "input_text",
-		text: turn.userInput
-	}] : [], ...turn.userImages.map((url) => ({
-		type: "input_image",
-		image_url: url
-	}))];
-}
+/** `text` and then `images` as content items, the way Codex records a user message; without images, just `text`. */
+const withImages = (text, images) => images.length === 0 ? text : [...text ? [{
+	type: "input_text",
+	text
+}] : [], ...images.map((url) => ({
+	type: "input_image",
+	image_url: url
+}))];
+/** A model call's input: `text`, plus the images sent with the user message before it when image capture is on. */
+const callInput = (text, step, ctx) => ctx.captureImages ? withImages(text, step.userImages ?? []) : text;
 /**
 * A tool's output as the next model call is shown it. With image capture on, each
 * image points at the tool span that already holds it instead of being sent twice.
 */
-const fedBackOutput = (tc, ctx) => ctx.captureImages ? replaceImages(tc.output, toolCallImage(tc.callId)) : tc.output;
+const fedBackOutput = (tc, toolSpan, ctx) => ctx.captureImages ? replaceImages(tc.output, toolCallImage(tc.callId), imagesIn(toolSpan.attributes["traceroot.span.output"])) : tc.output;
+/** With image capture on, images are kept whole, so trade a span's largest for placeholders until it fits. */
+function fitted(span, ctx) {
+	if (ctx.captureImages) fitSpanImages(span.attributes);
+	return span;
+}
 function commonTrace(attrs, sessionMeta, ctx) {
 	attrs["traceroot.sdk.name"] = SDK_NAME;
 	attrs["traceroot.sdk.version"] = SDK_VERSION;
@@ -30187,14 +30214,36 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 	const traceId = opts?.traceId ?? makeTraceId(sessionMeta.sessionId, turn.turnId);
 	const rootId = makeSpanId(seed + turn.turnId + ":root");
 	const rootParentSpanId = opts?.rootParentSpanId !== void 0 ? opts.rootParentSpanId : null;
-	const out = [];
+	const children = [];
+	const turnImages = [];
+	let firstCallImages;
+	let prevToolResults;
+	for (const step of turn.steps) {
+		const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
+		const stepSpan = fitted(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, callInput(step.index === 0 ? turn.userInput : prevToolResults, step, ctx)), ctx);
+		children.push(stepSpan);
+		if (ctx.captureImages) {
+			const kept = imagesIn(stepSpan.attributes["traceroot.span.input"]);
+			if (step.index === 0) firstCallImages = kept;
+			for (const url of step.userImages ?? []) turnImages.push(kept.has(url) ? modelCallImage(step.index) : omittedImage(url));
+		}
+		const fed = [];
+		for (const tc of step.toolCalls) {
+			const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx), ctx);
+			children.push(toolSpan);
+			fed.push({
+				name: tc.name,
+				output: fedBackOutput(tc, toolSpan, ctx)
+			});
+		}
+		if (step.toolCalls.length) prevToolResults = io(fed, ctx);
+	}
 	const rootAttrs = {
 		"traceroot.span.type": "AGENT",
 		"traceroot.span.path": [ROOT_NAME]
 	};
 	commonTrace(rootAttrs, sessionMeta, ctx);
-	const prompt = promptOf(turn, ctx);
-	const rootInput = ctx.captureImages ? replaceImages(prompt, FIRST_CALL_IMAGE) : prompt;
+	const rootInput = ctx.captureImages ? withImages(replaceImages(turn.userInput, FIRST_CALL_IMAGE, firstCallImages), turnImages) : turn.userInput;
 	if (rootInput) rootAttrs["traceroot.span.input"] = io(rootInput, ctx);
 	if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
 	rootAttrs["traceroot.span.metadata"] = JSON.stringify(pruneUndefined({
@@ -30212,7 +30261,7 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		if (step.endTime > rootEnd) rootEnd = step.endTime;
 		for (const tc of step.toolCalls) if (tc.endTime !== void 0 && tc.endTime > rootEnd) rootEnd = tc.endTime;
 	}
-	out.push({
+	return [fitted({
 		spanId: rootId,
 		parentSpanId: rootParentSpanId,
 		traceId,
@@ -30222,20 +30271,7 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		endTime: rootEnd,
 		attributes: rootAttrs,
 		complete: rootParentSpanId === null ? turn.completed || !!ctx.turnEnding : turn.completed
-	});
-	let prevToolResults;
-	for (const step of turn.steps) {
-		const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
-		const input = step.index === 0 ? prompt : prevToolResults;
-		out.push(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input));
-		for (const tc of step.toolCalls) out.push(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx));
-		if (step.toolCalls.length) prevToolResults = io(step.toolCalls.map((tc) => ({
-			name: tc.name,
-			output: fedBackOutput(tc, ctx)
-		})), ctx);
-	}
-	if (ctx.captureImages) for (const span of out) fitSpanImages(span.attributes);
-	return out;
+	}, ctx), ...children];
 }
 function pruneUndefined(o) {
 	const r = {};
@@ -30607,7 +30643,7 @@ function parseRollout(lines) {
 				if (p.role === "user") {
 					if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) userInputFallback.set(turn, text);
 					if (!text || !isInjectedFallbackText(text)) {
-						for (const url of messageImages(p.content)) if (!(turn.userImages ??= []).includes(url)) turn.userImages.push(url);
+						for (const url of messageImages(p.content)) if (!turn.steps.some((t) => t.userImages?.includes(url))) (s.userImages ??= []).push(url);
 					}
 				} else if (p.role !== "developer") {
 					s.text = text;

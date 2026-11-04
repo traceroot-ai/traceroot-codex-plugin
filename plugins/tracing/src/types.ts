@@ -105,6 +105,11 @@ export type ModelStep = {
   text?: string;
   toolCalls: ToolCall[];
   usage?: TokenUsage;
+  /**
+   * Image data URLs from the user messages before this model call, in order,
+   * leaving out any that an earlier call of the turn already has.
+   */
+  userImages?: string[];
 };
 
 export type SubagentRef = { threadId: string; spawnCallId?: string };
@@ -115,8 +120,6 @@ export type Turn = {
   endTime: number;
   model?: string;
   userInput?: string;
-  /** Image data URLs attached to the prompt, in order, without duplicates. */
-  userImages?: string[];
   finalOutput?: string;
   steps: ModelStep[];
   /** Subagent spawns captured from spawn_agent / collab_agent_spawn_end. */

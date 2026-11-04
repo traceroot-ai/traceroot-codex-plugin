@@ -1,7 +1,9 @@
 import { ROOT_CONTEXT, type SpanContext, SpanKind, TraceFlags, trace } from "@opentelemetry/api";
 import type { Tracing } from "./exporter.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
-import { capWithImages, FIRST_CALL_IMAGE, fitSpanImages, replaceImages, toolCallImage } from "./images.js";
+import {
+  capWithImages, FIRST_CALL_IMAGE, fitSpanImages, imagesIn, modelCallImage, omittedImage, replaceImages, toolCallImage,
+} from "./images.js";
 import { SDK_NAME, SDK_VERSION } from "./sdk.js";
 import { mapUsage } from "./tokens.js";
 import type { ModelStep, SessionMeta, ToolCall, Turn } from "./types.js";
@@ -47,21 +49,29 @@ const str = (v: unknown, max: number): string =>
 const io = (v: unknown, ctx: EmitCtx): string =>
   ctx.captureImages ? capWithImages(v, ctx.maxChars) : str(v, ctx.maxChars);
 
-/** The prompt as the model got it: its text, plus attached images when image capture is on. */
-function promptOf(turn: Turn, ctx: EmitCtx): unknown {
-  if (!ctx.captureImages || !turn.userImages?.length) return turn.userInput;
-  return [
-    ...(turn.userInput ? [{ type: "input_text", text: turn.userInput }] : []),
-    ...turn.userImages.map((url) => ({ type: "input_image", image_url: url })),
-  ];
-}
+/** `text` and then `images` as content items, the way Codex records a user message; without images, just `text`. */
+const withImages = (text: unknown, images: string[]): unknown => (images.length === 0 ? text : [
+  ...(text ? [{ type: "input_text", text }] : []),
+  ...images.map((url) => ({ type: "input_image", image_url: url })),
+]);
+
+/** A model call's input: `text`, plus the images sent with the user message before it when image capture is on. */
+const callInput = (text: unknown, step: ModelStep, ctx: EmitCtx): unknown =>
+  ctx.captureImages ? withImages(text, step.userImages ?? []) : text;
 
 /**
  * A tool's output as the next model call is shown it. With image capture on, each
  * image points at the tool span that already holds it instead of being sent twice.
  */
-const fedBackOutput = (tc: ToolCall, ctx: EmitCtx): unknown =>
-  ctx.captureImages ? replaceImages(tc.output, toolCallImage(tc.callId)) : tc.output;
+const fedBackOutput = (tc: ToolCall, toolSpan: EmittableSpan, ctx: EmitCtx): unknown => (ctx.captureImages
+  ? replaceImages(tc.output, toolCallImage(tc.callId), imagesIn(toolSpan.attributes["traceroot.span.output"]))
+  : tc.output);
+
+/** With image capture on, images are kept whole, so trade a span's largest for placeholders until it fits. */
+function fitted(span: EmittableSpan, ctx: EmitCtx): EmittableSpan {
+  if (ctx.captureImages) fitSpanImages(span.attributes);
+  return span;
+}
 
 function commonTrace(attrs: SpanAttrs, sessionMeta: SessionMeta, ctx: EmitCtx): void {
   attrs["traceroot.sdk.name"] = SDK_NAME;
@@ -89,15 +99,47 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
   const traceId = opts?.traceId ?? makeTraceId(sessionMeta.sessionId, turn.turnId);
   const rootId = makeSpanId(seed + turn.turnId + ":root");
   const rootParentSpanId = opts?.rootParentSpanId !== undefined ? opts.rootParentSpanId : null;
-  const out: EmittableSpan[] = [];
+
+  // LLM-step input is the user prompt (first step) or the prior step's tool
+  // results fed back to the model (continuation steps) — like the conversation
+  // the model actually saw. These spans are planned before the root, because the
+  // root's image placeholders depend on which images they keep.
+  const children: EmittableSpan[] = [];
+  // With image capture on: what the turn input shows for each image a user sent,
+  // and which images the first model call kept.
+  const turnImages: string[] = [];
+  let firstCallImages: Set<string> | undefined;
+  let prevToolResults: string | undefined;
+  for (const step of turn.steps) {
+    const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
+    const text = step.index === 0 ? turn.userInput : prevToolResults;
+    const input = callInput(text, step, ctx);
+    const stepSpan = fitted(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input), ctx);
+    children.push(stepSpan);
+    if (ctx.captureImages) {
+      const kept = imagesIn(stepSpan.attributes["traceroot.span.input"]);
+      if (step.index === 0) firstCallImages = kept;
+      for (const url of step.userImages ?? []) {
+        turnImages.push(kept.has(url) ? modelCallImage(step.index) : omittedImage(url));
+      }
+    }
+    const fed: Array<{ name: string; output: unknown }> = [];
+    for (const tc of step.toolCalls) {
+      const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx), ctx);
+      children.push(toolSpan);
+      fed.push({ name: tc.name, output: fedBackOutput(tc, toolSpan, ctx) });
+    }
+    if (step.toolCalls.length) prevToolResults = io(fed, ctx);
+  }
 
   // Root AGENT span (trace-level attrs live here).
   const rootAttrs: SpanAttrs = { "traceroot.span.type": "AGENT", "traceroot.span.path": [ROOT_NAME] };
   commonTrace(rootAttrs, sessionMeta, ctx);
-  const prompt = promptOf(turn, ctx);
-  // The turn span is re-sent on every hook, so it never carries image bytes: its
-  // prompt images point at the first model call span, which is sent once.
-  const rootInput = ctx.captureImages ? replaceImages(prompt, FIRST_CALL_IMAGE) : prompt;
+  // The turn span is re-sent on every hook, so it never carries image bytes: each
+  // image a user sent points at the model call span that holds it, which is sent once.
+  const rootInput = ctx.captureImages
+    ? withImages(replaceImages(turn.userInput, FIRST_CALL_IMAGE, firstCallImages), turnImages)
+    : turn.userInput;
   if (rootInput) rootAttrs["traceroot.span.input"] = io(rootInput, ctx);
   if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
   rootAttrs["traceroot.span.metadata"] = JSON.stringify(pruneUndefined({
@@ -123,7 +165,7 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
       if (tc.endTime !== undefined && tc.endTime > rootEnd) rootEnd = tc.endTime;
     }
   }
-  out.push({
+  const root = fitted({
     spanId: rootId, parentSpanId: rootParentSpanId, traceId, kind: "AGENT",
     name: ROOT_NAME, startTime: turn.startTime, endTime: rootEnd,
     attributes: rootAttrs,
@@ -135,27 +177,8 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
     // runs; meanwhile traceroot.span.path keeps the title "Codex Turn". Subagent roots
     // (rootParentSpanId !== null) stay gated on their own completion.
     complete: rootParentSpanId === null ? (turn.completed || !!ctx.turnEnding) : turn.completed,
-  });
-
-  // LLM-step input is the user prompt (first step) or the prior step's tool
-  // results fed back to the model (continuation steps) — like the conversation
-  // the model actually saw.
-  let prevToolResults: string | undefined;
-  for (const step of turn.steps) {
-    const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
-    const input = step.index === 0 ? prompt : prevToolResults;
-    out.push(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input));
-    for (const tc of step.toolCalls) out.push(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx));
-    if (step.toolCalls.length) {
-      prevToolResults = io(
-        step.toolCalls.map((tc) => ({ name: tc.name, output: fedBackOutput(tc, ctx) })), ctx,
-      );
-    }
-  }
-  // Images are kept whole, so a span can grow past what the backend stores;
-  // trade its largest images for placeholders until it fits.
-  if (ctx.captureImages) for (const span of out) fitSpanImages(span.attributes);
-  return out;
+  }, ctx);
+  return [root, ...children];
 }
 
 function pruneUndefined(o: Record<string, unknown>): Record<string, unknown> {

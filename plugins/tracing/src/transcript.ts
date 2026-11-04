@@ -256,11 +256,13 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
           if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) {
             userInputFallback.set(turn, text);
           }
-          // Images attached to the prompt are read from here, whichever event
-          // carried the prompt text.
+          // Images attached to a user message are read from here, whichever event
+          // carried its text, and belong to the model call that follows it: the
+          // prompt's to the first call, a message sent while the turn runs to a
+          // later one.
           if (!text || !isInjectedFallbackText(text)) {
             for (const url of messageImages(p.content)) {
-              if (!(turn.userImages ??= []).includes(url)) turn.userImages.push(url);
+              if (!turn.steps.some((t) => t.userImages?.includes(url))) (s.userImages ??= []).push(url);
             }
           }
         } else if (p.role !== "developer") {

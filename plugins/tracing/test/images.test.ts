@@ -46,17 +46,19 @@ describe("capWithImages", () => {
     expect(capWithImages(items("Captured."), 64)).toBe(JSON.stringify(items("Captured.")));
   });
 
-  it("cuts only the text, keeps the image whole, and stays valid JSON", () => {
+  it("cuts the text, keeps the image whole, and stays valid JSON", () => {
     const parsed = JSON.parse(capWithImages(items("t".repeat(30000)), 20000));
     expect(parsed[0].type).toBe("input_text");
-    expect(parsed[0].text).toBe(`${"t".repeat(19990)}…[truncated 10010 chars]`);
+    // The JSON around the strings takes 50 of the 20,000 characters, and "input_text" 10.
+    expect(parsed[0].text).toBe(`${"t".repeat(19940)}…[truncated 10060 chars]`);
     expect(parsed[1]).toEqual({ type: "input_image", image_url: PNG });
   });
 
   it("keeps an image that comes after text which used up the budget", () => {
     const value = [{ type: "input_text", text: "a".repeat(100) }, { type: "input_text", text: "b".repeat(100) }, ...items("c")];
-    // Every string counts toward the budget, so "input_text" takes 10 of the 50.
-    const parsed = JSON.parse(capWithImages(value, 50));
+    // The JSON around the strings takes 94 of the 144 characters. Every string
+    // counts toward the 50 left, so "input_text" takes 10 of them.
+    const parsed = JSON.parse(capWithImages(value, 144));
     expect(parsed[0].text).toBe(`${"a".repeat(40)}…[truncated 60 chars]`);
     expect(parsed[1].type).toBe("input_text"); // never replaced by a longer marker
     expect(parsed[1].text).toBe("…[truncated 100 chars]");
@@ -66,7 +68,8 @@ describe("capWithImages", () => {
 
   it("bounds the text when many short strings follow the spent budget", () => {
     const value = [...Array.from({ length: 5000 }, () => "ab"), PNG];
-    const parsed = JSON.parse(capWithImages(value, 64)) as string[];
+    // The JSON around the strings takes 15,004 characters, which leaves 64.
+    const parsed = JSON.parse(capWithImages(value, 15004 + 64)) as string[];
     expect(parsed).toHaveLength(5001);
     expect(parsed.at(-1)).toBe(PNG);
     // 32 strings fill the budget, 32 more take the 64 spare characters of the one
@@ -77,7 +80,8 @@ describe("capWithImages", () => {
 
   it("empties strings past the spare characters but still keeps the image", () => {
     const value = ["a", "b", "c", "d"].map((c) => c.repeat(100));
-    expect(JSON.parse(capWithImages([...value, PNG], 10))).toEqual([
+    // The JSON around the strings takes 16 characters, which leaves 10.
+    expect(JSON.parse(capWithImages([...value, PNG], 26))).toEqual([
       `${"a".repeat(10)}…[truncated 90 chars]`,
       "…[truncated 100 chars]", // 22 of the 64 spare characters
       "…[truncated 100 chars]", // 44
@@ -91,7 +95,7 @@ describe("capWithImages", () => {
     ["a tool call", toolCallImage("call_9f2Kq")],
   ])("keeps a placeholder pointing at %s whole when the text before it is cut", (_label, placeholder) => {
     const parsed = JSON.parse(capWithImages(items("t".repeat(30000), placeholder), 20000));
-    expect(parsed[0].text).toBe(`${"t".repeat(19990)}…[truncated 10010 chars]`);
+    expect(parsed[0].text).toBe(`${"t".repeat(19940)}…[truncated 10060 chars]`);
     expect(parsed[1]).toEqual({ type: "input_image", image_url: placeholder });
     expect(capWithImages(`${"x".repeat(100)} ${placeholder}`, 20)).toBe(`${"x".repeat(20)}…[truncated 81 chars]${placeholder}`);
   });
@@ -99,9 +103,19 @@ describe("capWithImages", () => {
   it("keeps the image item when content items arrive as serialized JSON and the text is cut", () => {
     const parsed = JSON.parse(capWithImages(JSON.stringify(items("t".repeat(21000))), 20000));
     expect(parsed).toHaveLength(2);
-    expect(parsed[0]).toEqual({ type: "input_text", text: `${"t".repeat(19990)}…[truncated 1010 chars]` });
+    expect(parsed[0]).toEqual({ type: "input_text", text: `${"t".repeat(19940)}…[truncated 1060 chars]` });
     expect(parsed[1]).toEqual({ type: "input_image", image_url: PNG });
   });
+
+  const withSamples = { content: items("Captured."), samples: Array.from({ length: 200_000 }, (_, i) => i) };
+  it.each([["a value", withSamples], ["serialized JSON", JSON.stringify(withSamples)]])(
+    "counts keys, numbers and nesting in %s toward max as the plain cut does, and keeps the image",
+    (_label, value) => {
+      const capped = capWithImages(value, 20000);
+      expect(capped).toContain(PNG);
+      expect(capped.replace(PNG, "").length).toBeLessThanOrEqual(plain(value, 20000).length);
+    },
+  );
 
   it("leaves serialized JSON with images exactly as it was when the text fits", () => {
     const s = JSON.stringify(items("Captured."), null, 2);
