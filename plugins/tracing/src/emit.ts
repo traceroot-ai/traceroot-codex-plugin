@@ -1,5 +1,6 @@
 import type { SpanExporter } from "@opentelemetry/sdk-trace-base";
 import type { Config } from "./config.js";
+import { imagePolicy, textPolicy } from "./content.js";
 import { spawnDrainer } from "./drainer.js";
 import { buildTracing, otlpExporter, sendInRequests, type Tracing } from "./exporter.js";
 import { getGitContext } from "./git.js";
@@ -170,7 +171,7 @@ async function emitSession(
   const ctx: EmitCtx = {
     environment: config.environment, userId: config.userId, git, maxChars: config.maxChars,
     turnEnding,
-    captureImages: config.captureImages,
+    content: config.captureImages ? imagePolicy : textPolicy,
   };
 
   const already = await loadEmittedSpanIds(transcript);

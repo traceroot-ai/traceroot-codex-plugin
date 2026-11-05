@@ -1,13 +1,11 @@
 import { ROOT_CONTEXT, type SpanContext, SpanKind, TraceFlags, trace } from "@opentelemetry/api";
+import { type ContentPolicy, textPolicy } from "./content.js";
 import type { Tracing } from "./exporter.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
-import {
-  capWithImages, FIRST_CALL_IMAGE, fitSpanImages, imagesIn, modelCallImage, omittedImage, replaceImages, toolCallImage,
-} from "./images.js";
 import { SDK_NAME, SDK_VERSION } from "./sdk.js";
 import { mapUsage } from "./tokens.js";
 import type { ModelStep, SessionMeta, ToolCall, Turn } from "./types.js";
-import { truncate } from "./util.js";
+import { str, truncate } from "./util.js";
 
 // The trace title. Used as the root span name AND as path[0] on every span so
 // the trace reads as "Codex Turn" even before the root span exists (see below).
@@ -23,9 +21,8 @@ export type EmitCtx = {
   // root in ClickHouse — which is how the backend's live-stream detector knows
   // the trace is in progress and keeps streaming (matching the SDK's model).
   turnEnding?: boolean;
-  // Keep image data URLs in tool output and prompts whole instead of cutting
-  // them at maxChars (off by default).
-  captureImages?: boolean;
+  // How span content is rendered; dispatch sets it from capture_images. Unset means textPolicy.
+  content?: ContentPolicy;
 };
 
 type SpanAttrs = Record<string, string | number | string[]>;
@@ -42,34 +39,8 @@ export type EmittableSpan = {
   complete: boolean;
 };
 
-const str = (v: unknown, max: number): string =>
-  truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
-
-/** Span input/output capped at maxChars; with image capture on, images and their placeholders stay whole. */
-const io = (v: unknown, ctx: EmitCtx): string =>
-  ctx.captureImages ? capWithImages(v, ctx.maxChars) : str(v, ctx.maxChars);
-
-/** `text` and then `images` as content items, the way Codex records a user message; without images, just `text`. */
-const withImages = (text: unknown, images: string[]): unknown => (images.length === 0 ? text : [
-  ...(text ? [{ type: "input_text", text }] : []),
-  ...images.map((url) => ({ type: "input_image", image_url: url })),
-]);
-
-/** A model call's input: `text`, plus the images sent with the user message before it when image capture is on. */
-const callInput = (text: unknown, step: ModelStep, ctx: EmitCtx): unknown =>
-  ctx.captureImages ? withImages(text, step.userImages ?? []) : text;
-
-/**
- * A tool's output as the next model call is shown it. With image capture on, each
- * image points at the tool span that already holds it instead of being sent twice.
- */
-const fedBackOutput = (tc: ToolCall, toolSpan: EmittableSpan, ctx: EmitCtx): unknown => (ctx.captureImages
-  ? replaceImages(tc.output, toolCallImage(tc.callId), imagesIn(toolSpan.attributes["traceroot.span.output"]))
-  : tc.output);
-
-/** With image capture on, images are kept whole, so trade a span's largest for placeholders until it fits. */
-function fitted(span: EmittableSpan, ctx: EmitCtx): EmittableSpan {
-  if (ctx.captureImages) fitSpanImages(span.attributes);
+function fitted(span: EmittableSpan, content: ContentPolicy): EmittableSpan {
+  content.fit(span.attributes);
   return span;
 }
 
@@ -102,48 +73,38 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
   // The session's own turn is over once it completes or the Stop hook ends it; a
   // subagent's turn only once it completes, since it can outlive the parent's turn.
   const turnOver = rootParentSpanId === null ? turn.completed || !!ctx.turnEnding : turn.completed;
+  const content = ctx.content ?? textPolicy;
 
   // LLM-step input is the user prompt (first step) or the prior step's tool
   // results fed back to the model (continuation steps) — like the conversation
   // the model actually saw. These spans are planned before the root, because the
   // root's image placeholders depend on which images they keep.
   const children: EmittableSpan[] = [];
-  // With image capture on: what the turn input shows for each image a user sent,
-  // and which images the first model call kept.
-  const turnImages: string[] = [];
-  let firstCallImages: Set<string> | undefined;
+  const calls: Array<[ModelStep, SpanAttrs]> = [];
   let prevToolResults: string | undefined;
   for (const step of turn.steps) {
     const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
     const text = step.index === 0 ? turn.userInput : prevToolResults;
-    const input = callInput(text, step, ctx);
-    const stepSpan = fitted(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input), ctx);
+    const input = content.callInput(text, step);
+    const stepSpan = fitted(
+      planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, content, input), content,
+    );
     children.push(stepSpan);
-    if (ctx.captureImages) {
-      const kept = imagesIn(stepSpan.attributes["traceroot.span.input"]);
-      if (step.index === 0) firstCallImages = kept;
-      for (const url of step.userImages ?? []) {
-        turnImages.push(kept.has(url) ? modelCallImage(step.index) : omittedImage(url));
-      }
-    }
+    calls.push([step, stepSpan.attributes]);
     const fed: Array<{ name: string; output: unknown }> = [];
     for (const tc of step.toolCalls) {
-      const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx, turnOver), ctx);
+      const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx, turnOver, content), content);
       children.push(toolSpan);
-      fed.push({ name: tc.name, output: fedBackOutput(tc, toolSpan, ctx) });
+      fed.push({ name: tc.name, output: content.fedBack(tc, toolSpan.attributes) });
     }
-    if (step.toolCalls.length) prevToolResults = io(fed, ctx);
+    if (step.toolCalls.length) prevToolResults = content.io(fed, ctx.maxChars);
   }
 
   // Root AGENT span (trace-level attrs live here).
   const rootAttrs: SpanAttrs = { "traceroot.span.type": "AGENT", "traceroot.span.path": [ROOT_NAME] };
   commonTrace(rootAttrs, sessionMeta, ctx);
-  // The turn span is re-sent on every hook, so it never carries image bytes: each
-  // image a user sent points at the model call span that holds it, which is sent once.
-  const rootInput = ctx.captureImages
-    ? withImages(replaceImages(turn.userInput, FIRST_CALL_IMAGE, firstCallImages), turnImages)
-    : turn.userInput;
-  if (rootInput) rootAttrs["traceroot.span.input"] = io(rootInput, ctx);
+  const rootInput = content.turnInput(turn.userInput, calls);
+  if (rootInput) rootAttrs["traceroot.span.input"] = content.io(rootInput, ctx.maxChars);
   if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
   rootAttrs["traceroot.span.metadata"] = JSON.stringify(pruneUndefined({
     "codex.turn_id": turn.turnId,
@@ -180,7 +141,7 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
     // runs; meanwhile traceroot.span.path keeps the title "Codex Turn". Subagent roots
     // (rootParentSpanId !== null) stay gated on their own completion.
     complete: turnOver,
-  }, ctx);
+  }, content);
   return [root, ...children];
 }
 
@@ -202,7 +163,7 @@ function buildStepOutput(step: ModelStep, max: number): string | undefined {
 
 function planStepSpan(
   sessionMeta: SessionMeta, turn: Turn, step: ModelStep,
-  spanId: string, parentSpanId: string, traceId: string, ctx: EmitCtx, input: unknown,
+  spanId: string, parentSpanId: string, traceId: string, ctx: EmitCtx, content: ContentPolicy, input: unknown,
 ): EmittableSpan {
   const attrs: SpanAttrs = {
     "traceroot.span.type": "LLM",
@@ -213,7 +174,7 @@ function planStepSpan(
   };
   commonTrace(attrs, sessionMeta, ctx);
   if (turn.model) attrs["traceroot.llm.model"] = turn.model;
-  if (input) attrs["traceroot.span.input"] = io(input, ctx);
+  if (input) attrs["traceroot.span.input"] = content.io(input, ctx.maxChars);
   const output = buildStepOutput(step, ctx.maxChars);
   if (output) attrs["traceroot.span.output"] = output;
   attrs["traceroot.span.metadata"] = JSON.stringify({ "codex.step_index": step.index });
@@ -228,6 +189,7 @@ function planStepSpan(
 function planToolSpan(
   sessionMeta: SessionMeta, tc: ToolCall, seed: string, parentSpanId: string, traceId: string, ctx: EmitCtx,
   turnOver: boolean,
+  content: ContentPolicy,
 ): EmittableSpan {
   const attrs: SpanAttrs = {
     "traceroot.span.type": "TOOL",
@@ -235,11 +197,9 @@ function planToolSpan(
   };
   commonTrace(attrs, sessionMeta, ctx);
   attrs["traceroot.span.input"] = str(tc.args, ctx.maxChars);
-  if (tc.output !== undefined) attrs["traceroot.span.output"] = io(tc.output, ctx);
+  if (tc.output !== undefined) attrs["traceroot.span.output"] = content.io(tc.output, ctx.maxChars);
   const meta: Record<string, unknown> = {};
-  // Matches this span to the "[image: see tool call <call_id>]" placeholders in
-  // the next model call's input.
-  if (ctx.captureImages) meta["call_id"] = tc.callId;
+  content.toolMeta(tc, meta);
   if (tc.kind !== undefined) meta["tool_kind"] = tc.kind;
   if (tc.status !== undefined) meta["status"] = tc.status;
   if (tc.exitCode !== undefined) meta["exit_code"] = tc.exitCode;

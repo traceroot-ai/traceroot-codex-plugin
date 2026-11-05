@@ -114,6 +114,8 @@ function truncate(s, max) {
 	if (s.length <= max) return s;
 	return `${s.slice(0, max)}…[truncated ${s.length - max} chars]`;
 }
+/** `v` as text, a string as-is and anything else as JSON, cut at `max` characters. */
+const str = (v, max) => truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
 
 //#endregion
 //#region src/drainer.ts
@@ -148,6 +150,230 @@ function spawnDrainer(hook, entry = fileURLToPath(import.meta.url)) {
 		debugLog("could not start a drainer:", error);
 	}
 }
+
+//#endregion
+//#region src/size.ts
+const SPAN_OVERHEAD_BYTES = 256;
+const ATTRIBUTE_OVERHEAD_BYTES = 32;
+const utf8Bytes = (s) => Buffer.byteLength(s, "utf8");
+function valueBytes(value) {
+	if (typeof value === "string") return utf8Bytes(value);
+	if (Array.isArray(value)) return value.reduce((n, v) => n + ATTRIBUTE_OVERHEAD_BYTES + valueBytes(v), 0);
+	return 10;
+}
+/** Estimated serialized size of span attributes, never below the real size. */
+function attributesBytes(attributes) {
+	let n = 0;
+	for (const [key, value] of Object.entries(attributes)) n += ATTRIBUTE_OVERHEAD_BYTES + utf8Bytes(key) + valueBytes(value);
+	return n;
+}
+const traceStateBytes = (state) => utf8Bytes(state?.serialize() ?? "");
+/** Estimated size `span` adds to an OTLP protobuf request, never below the real size. */
+function estimateSpanBytes(span) {
+	let n = SPAN_OVERHEAD_BYTES + valueBytes(span.name) + utf8Bytes(span.status.message ?? "") + traceStateBytes(span.spanContext().traceState) + attributesBytes(span.attributes);
+	for (const event of span.events) n += SPAN_OVERHEAD_BYTES + utf8Bytes(event.name) + attributesBytes(event.attributes ?? {});
+	for (const link of span.links) n += SPAN_OVERHEAD_BYTES + traceStateBytes(link.context.traceState) + attributesBytes(link.attributes ?? {});
+	return n;
+}
+/**
+* Splits `spans`, keeping their order, into groups of at most `maxSpans` spans whose
+* estimated size stays within `maxBytes`. A span larger than `maxBytes` on its own
+* forms its own group.
+*/
+function splitBySize(spans, maxBytes, maxSpans = Infinity) {
+	const groups = [];
+	let group = [];
+	let size = 0;
+	for (const span of spans) {
+		const bytes = estimateSpanBytes(span);
+		if (group.length > 0 && (group.length >= maxSpans || size + bytes > maxBytes)) {
+			groups.push(group);
+			group = [];
+			size = 0;
+		}
+		group.push(span);
+		size += bytes;
+	}
+	if (group.length > 0) groups.push(group);
+	return groups;
+}
+
+//#endregion
+//#region src/images.ts
+const IMAGE_DATA_URL = /data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/]+={0,2}/g;
+const WHOLE_IMAGE_DATA_URL = /* @__PURE__ */ new RegExp(`^(?:${IMAGE_DATA_URL.source})$`);
+/** Stands in for a prompt image in the turn span, which is sent again on every hook. */
+const FIRST_CALL_IMAGE = "[image: see first model call]";
+/**
+* Stands in, in the turn span, for an image the model call with this step index
+* got with the user message before it.
+*/
+const modelCallImage = (stepIndex) => stepIndex === 0 ? FIRST_CALL_IMAGE : `[image: see model call ${stepIndex}]`;
+/** Stands in for a tool's image in the next model call's input. */
+const toolCallImage = (callId) => `[image: see tool call ${callId}]`;
+const KEPT = new RegExp(`${IMAGE_DATA_URL.source}|\\[image: see (?:first model call|model call \\d{1,9}|tool call [^\\]\\s]{1,200})\\]`, "g");
+const SPARE_CHARS_PER_IMAGE = 64;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_SPAN_BYTES = 8 * 1024 * 1024;
+const OVERSIZE_IMAGE = "[image omitted: larger than 5 MiB]";
+const SPAN_TOO_LARGE_IMAGE = "[image omitted: span larger than 8 MiB]";
+/** Whether `s` is exactly one base64 image data URL in a format kept whole. */
+const isImageDataUrl = (s) => WHOLE_IMAGE_DATA_URL.test(s);
+/** The image data URLs in a span attribute's text. */
+const imagesIn = (text) => new Set(typeof text === "string" ? text.match(IMAGE_DATA_URL) : []);
+/** Decoded size of a base64 data URL's payload, in bytes. */
+function decodedBytes(dataUrl) {
+	const payload = dataUrl.slice(dataUrl.indexOf(",") + 1);
+	const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+	return Math.floor(payload.length * 3 / 4) - padding;
+}
+/** Applies `fn` to every string in a JSON value, keeping its shape. */
+function mapStrings(value, fn) {
+	if (typeof value === "string") return fn(value);
+	if (Array.isArray(value)) return value.map((v) => mapStrings(v, fn));
+	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mapStrings(v, fn)]));
+	return value;
+}
+/**
+* Cuts `text` to what is left of the budget, unless the cut marker would be longer
+* than the text it drops. Once the budget is spent, that shorter form comes out of
+* the spare characters, and the text is emptied when they run out.
+*/
+function capText(text, budget) {
+	const cut = truncate(text, budget.left);
+	const shorter = cut.length < text.length ? cut : text;
+	if (budget.left > 0) {
+		budget.left = Math.max(0, budget.left - text.length);
+		return shorter;
+	}
+	if (shorter.length > budget.spare) return "";
+	budget.spare -= shorter.length;
+	return shorter;
+}
+function capString(s, budget) {
+	let out = "";
+	let at = 0;
+	for (const m of s.matchAll(KEPT)) {
+		const oversize = m[0].startsWith("data:") && decodedBytes(m[0]) > MAX_IMAGE_BYTES;
+		out += capText(s.slice(at, m.index), budget) + (oversize ? OVERSIZE_IMAGE : m[0]);
+		at = m.index + m[0].length;
+	}
+	return out + capText(s.slice(at), budget);
+}
+/** `text` parsed, when it is a serialized JSON array or object; otherwise undefined. */
+function parseJsonContainer(text) {
+	if (!/^\s*[[{]/.test(text)) return void 0;
+	try {
+		const parsed = JSON.parse(text);
+		return parsed !== null && typeof parsed === "object" ? parsed : void 0;
+	} catch {
+		return;
+	}
+}
+/**
+* `value` serialized with its strings cut one by one, so JSON stays valid. The
+* keys, numbers and punctuation around the strings count toward the budget
+* first, as they do in the plain cut. When they alone pass it, returns
+* undefined: only cutting the serialized text as one string keeps it in budget.
+*/
+function capStrings(value, budget) {
+	const structure = JSON.stringify(mapStrings(value, () => "")).length;
+	if (structure > budget.left) return void 0;
+	budget.left -= structure;
+	return JSON.stringify(mapStrings(value, (s) => capString(s, budget)));
+}
+/**
+* Serializes `value` for a span attribute and caps it at `max` characters like
+* the plain cut, but keeps image data URLs and the placeholders that point at
+* them whole: everything else counts toward `max`, and strings are cut one by
+* one so JSON stays valid. Once `max` is spent, the strings after it share 64
+* characters per image, so many short strings can't carry the text past `max`.
+* An image over 5 MiB decoded becomes a placeholder. A value without images or
+* placeholders is cut exactly as the plain cut does.
+*/
+function capWithImages(value, max) {
+	const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+	const kept = text.match(KEPT)?.length ?? 0;
+	if (kept === 0) return truncate(text, max);
+	const budget = {
+		left: max,
+		spare: kept * SPARE_CHARS_PER_IMAGE
+	};
+	const container = typeof value !== "string" ? value : text.replace(KEPT, "").length > max ? parseJsonContainer(text) : void 0;
+	return (container === void 0 ? void 0 : capStrings(container, budget)) ?? capString(text, budget);
+}
+/** What stands in for an image a span left out: over 5 MiB, or dropped so the span fits in 8 MiB. */
+const omittedImage = (url) => decodedBytes(url) > MAX_IMAGE_BYTES ? OVERSIZE_IMAGE : SPAN_TOO_LARGE_IMAGE;
+/**
+* `value` with every image data URL in it replaced by `placeholder`. Given the
+* images the span that `placeholder` points at kept, an image that span left out
+* is replaced by the reason instead, so no placeholder points at a missing image.
+*/
+function replaceImages(value, placeholder, kept) {
+	return mapStrings(value, (s) => s.replace(IMAGE_DATA_URL, (url) => kept === void 0 || kept.has(url) ? placeholder : omittedImage(url)));
+}
+/**
+* Replaces image data URLs in `attributes` with a placeholder, largest first,
+* until the attributes' estimated size is within MAX_SPAN_BYTES.
+*/
+function fitSpanImages(attributes) {
+	let size = attributesBytes(attributes);
+	if (size <= MAX_SPAN_BYTES) return;
+	const images = [];
+	for (const [key, value] of Object.entries(attributes)) {
+		if (typeof value !== "string") continue;
+		for (const m of value.matchAll(IMAGE_DATA_URL)) images.push({
+			key,
+			url: m[0]
+		});
+	}
+	images.sort((a, b) => b.url.length - a.url.length);
+	for (const { key, url } of images) {
+		if (size <= MAX_SPAN_BYTES) break;
+		attributes[key] = attributes[key].replace(url, () => SPAN_TOO_LARGE_IMAGE);
+		size -= url.length - 39;
+	}
+}
+
+//#endregion
+//#region src/content.ts
+/** Image capture off: every value takes the plain maxChars cut. */
+const textPolicy = {
+	io: str,
+	callInput: (text) => text,
+	fedBack: (tc) => tc.output,
+	turnInput: (userInput) => userInput,
+	fit: () => {},
+	toolMeta: () => {}
+};
+/** `text`, then `images` as content items like a Codex user message; just `text` without images. */
+const withImages = (text, images) => images.length === 0 ? text : [...text ? [{
+	type: "input_text",
+	text
+}] : [], ...images.map((url) => ({
+	type: "input_image",
+	image_url: url
+}))];
+/** Image capture on: images stay whole, then the largest give way until a span fits in 8 MiB. */
+const imagePolicy = {
+	io: capWithImages,
+	callInput: (text, step) => withImages(text, step.userImages ?? []),
+	fedBack: (tc, toolAttrs) => replaceImages(tc.output, toolCallImage(tc.callId), imagesIn(toolAttrs["traceroot.span.output"])),
+	turnInput(userInput, calls) {
+		const turnImages = [];
+		let firstCallImages;
+		for (const [step, attrs] of calls) {
+			const kept = imagesIn(attrs["traceroot.span.input"]);
+			if (step.index === 0) firstCallImages = kept;
+			for (const url of step.userImages ?? []) turnImages.push(kept.has(url) ? modelCallImage(step.index) : omittedImage(url));
+		}
+		return withImages(replaceImages(userInput, FIRST_CALL_IMAGE, firstCallImages), turnImages);
+	},
+	fit: fitSpanImages,
+	toolMeta: (tc, meta) => {
+		meta["call_id"] = tc.callId;
+	}
+};
 
 //#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+api@1.9.1/node_modules/@opentelemetry/api/build/esm/version.js
@@ -29855,53 +30081,6 @@ const SDK_NAME = "traceroot-codex-plugin";
 const SDK_VERSION = "0.1.1";
 
 //#endregion
-//#region src/size.ts
-const SPAN_OVERHEAD_BYTES = 256;
-const ATTRIBUTE_OVERHEAD_BYTES = 32;
-const utf8Bytes = (s) => Buffer.byteLength(s, "utf8");
-function valueBytes(value) {
-	if (typeof value === "string") return utf8Bytes(value);
-	if (Array.isArray(value)) return value.reduce((n, v) => n + ATTRIBUTE_OVERHEAD_BYTES + valueBytes(v), 0);
-	return 10;
-}
-/** Estimated serialized size of span attributes, never below the real size. */
-function attributesBytes(attributes) {
-	let n = 0;
-	for (const [key, value] of Object.entries(attributes)) n += ATTRIBUTE_OVERHEAD_BYTES + utf8Bytes(key) + valueBytes(value);
-	return n;
-}
-const traceStateBytes = (state) => utf8Bytes(state?.serialize() ?? "");
-/** Estimated size `span` adds to an OTLP protobuf request, never below the real size. */
-function estimateSpanBytes(span) {
-	let n = SPAN_OVERHEAD_BYTES + valueBytes(span.name) + utf8Bytes(span.status.message ?? "") + traceStateBytes(span.spanContext().traceState) + attributesBytes(span.attributes);
-	for (const event of span.events) n += SPAN_OVERHEAD_BYTES + utf8Bytes(event.name) + attributesBytes(event.attributes ?? {});
-	for (const link of span.links) n += SPAN_OVERHEAD_BYTES + traceStateBytes(link.context.traceState) + attributesBytes(link.attributes ?? {});
-	return n;
-}
-/**
-* Splits `spans`, keeping their order, into groups of at most `maxSpans` spans whose
-* estimated size stays within `maxBytes`. A span larger than `maxBytes` on its own
-* forms its own group.
-*/
-function splitBySize(spans, maxBytes, maxSpans = Infinity) {
-	const groups = [];
-	let group = [];
-	let size = 0;
-	for (const span of spans) {
-		const bytes = estimateSpanBytes(span);
-		if (group.length > 0 && (group.length >= maxSpans || size + bytes > maxBytes)) {
-			groups.push(group);
-			group = [];
-			size = 0;
-		}
-		group.push(span);
-		size += bytes;
-	}
-	if (group.length > 0) groups.push(group);
-	return groups;
-}
-
-//#endregion
 //#region src/exporter.ts
 var import_src = require_src$7();
 /** Keeps every ended span, so the hook can send them all once it has ended them. */
@@ -30404,143 +30583,6 @@ async function markSpansEmitted(rolloutFile, spanIds) {
 }
 
 //#endregion
-//#region src/images.ts
-const IMAGE_DATA_URL = /data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/]+={0,2}/g;
-const WHOLE_IMAGE_DATA_URL = /* @__PURE__ */ new RegExp(`^(?:${IMAGE_DATA_URL.source})$`);
-/** Stands in for a prompt image in the turn span, which is sent again on every hook. */
-const FIRST_CALL_IMAGE = "[image: see first model call]";
-/**
-* Stands in, in the turn span, for an image the model call with this step index
-* got with the user message before it.
-*/
-const modelCallImage = (stepIndex) => stepIndex === 0 ? FIRST_CALL_IMAGE : `[image: see model call ${stepIndex}]`;
-/** Stands in for a tool's image in the next model call's input. */
-const toolCallImage = (callId) => `[image: see tool call ${callId}]`;
-const KEPT = new RegExp(`${IMAGE_DATA_URL.source}|\\[image: see (?:first model call|model call \\d{1,9}|tool call [^\\]\\s]{1,200})\\]`, "g");
-const SPARE_CHARS_PER_IMAGE = 64;
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-const MAX_SPAN_BYTES = 8 * 1024 * 1024;
-const OVERSIZE_IMAGE = "[image omitted: larger than 5 MiB]";
-const SPAN_TOO_LARGE_IMAGE = "[image omitted: span larger than 8 MiB]";
-/** Whether `s` is exactly one base64 image data URL in a format kept whole. */
-const isImageDataUrl = (s) => WHOLE_IMAGE_DATA_URL.test(s);
-/** The image data URLs in a span attribute's text. */
-const imagesIn = (text) => new Set(typeof text === "string" ? text.match(IMAGE_DATA_URL) : []);
-/** Decoded size of a base64 data URL's payload, in bytes. */
-function decodedBytes(dataUrl) {
-	const payload = dataUrl.slice(dataUrl.indexOf(",") + 1);
-	const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
-	return Math.floor(payload.length * 3 / 4) - padding;
-}
-/** Applies `fn` to every string in a JSON value, keeping its shape. */
-function mapStrings(value, fn) {
-	if (typeof value === "string") return fn(value);
-	if (Array.isArray(value)) return value.map((v) => mapStrings(v, fn));
-	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mapStrings(v, fn)]));
-	return value;
-}
-/**
-* Cuts `text` to what is left of the budget, unless the cut marker would be longer
-* than the text it drops. Once the budget is spent, that shorter form comes out of
-* the spare characters, and the text is emptied when they run out.
-*/
-function capText(text, budget) {
-	const cut = truncate(text, budget.left);
-	const shorter = cut.length < text.length ? cut : text;
-	if (budget.left > 0) {
-		budget.left = Math.max(0, budget.left - text.length);
-		return shorter;
-	}
-	if (shorter.length > budget.spare) return "";
-	budget.spare -= shorter.length;
-	return shorter;
-}
-function capString(s, budget) {
-	let out = "";
-	let at = 0;
-	for (const m of s.matchAll(KEPT)) {
-		const oversize = m[0].startsWith("data:") && decodedBytes(m[0]) > MAX_IMAGE_BYTES;
-		out += capText(s.slice(at, m.index), budget) + (oversize ? OVERSIZE_IMAGE : m[0]);
-		at = m.index + m[0].length;
-	}
-	return out + capText(s.slice(at), budget);
-}
-/** `text` parsed, when it is a serialized JSON array or object; otherwise undefined. */
-function parseJsonContainer(text) {
-	if (!/^\s*[[{]/.test(text)) return void 0;
-	try {
-		const parsed = JSON.parse(text);
-		return parsed !== null && typeof parsed === "object" ? parsed : void 0;
-	} catch {
-		return;
-	}
-}
-/**
-* `value` serialized with its strings cut one by one, so JSON stays valid. The
-* keys, numbers and punctuation around the strings count toward the budget
-* first, as they do in the plain cut. When they alone pass it, returns
-* undefined: only cutting the serialized text as one string keeps it in budget.
-*/
-function capStrings(value, budget) {
-	const structure = JSON.stringify(mapStrings(value, () => "")).length;
-	if (structure > budget.left) return void 0;
-	budget.left -= structure;
-	return JSON.stringify(mapStrings(value, (s) => capString(s, budget)));
-}
-/**
-* Serializes `value` for a span attribute and caps it at `max` characters like
-* the plain cut, but keeps image data URLs and the placeholders that point at
-* them whole: everything else counts toward `max`, and strings are cut one by
-* one so JSON stays valid. Once `max` is spent, the strings after it share 64
-* characters per image, so many short strings can't carry the text past `max`.
-* An image over 5 MiB decoded becomes a placeholder. A value without images or
-* placeholders is cut exactly as the plain cut does.
-*/
-function capWithImages(value, max) {
-	const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-	const kept = text.match(KEPT)?.length ?? 0;
-	if (kept === 0) return truncate(text, max);
-	const budget = {
-		left: max,
-		spare: kept * SPARE_CHARS_PER_IMAGE
-	};
-	const container = typeof value !== "string" ? value : text.replace(KEPT, "").length > max ? parseJsonContainer(text) : void 0;
-	return (container === void 0 ? void 0 : capStrings(container, budget)) ?? capString(text, budget);
-}
-/** What stands in for an image a span left out: over 5 MiB, or dropped so the span fits in 8 MiB. */
-const omittedImage = (url) => decodedBytes(url) > MAX_IMAGE_BYTES ? OVERSIZE_IMAGE : SPAN_TOO_LARGE_IMAGE;
-/**
-* `value` with every image data URL in it replaced by `placeholder`. Given the
-* images the span that `placeholder` points at kept, an image that span left out
-* is replaced by the reason instead, so no placeholder points at a missing image.
-*/
-function replaceImages(value, placeholder, kept) {
-	return mapStrings(value, (s) => s.replace(IMAGE_DATA_URL, (url) => kept === void 0 || kept.has(url) ? placeholder : omittedImage(url)));
-}
-/**
-* Replaces image data URLs in `attributes` with a placeholder, largest first,
-* until the attributes' estimated size is within MAX_SPAN_BYTES.
-*/
-function fitSpanImages(attributes) {
-	let size = attributesBytes(attributes);
-	if (size <= MAX_SPAN_BYTES) return;
-	const images = [];
-	for (const [key, value] of Object.entries(attributes)) {
-		if (typeof value !== "string") continue;
-		for (const m of value.matchAll(IMAGE_DATA_URL)) images.push({
-			key,
-			url: m[0]
-		});
-	}
-	images.sort((a, b) => b.url.length - a.url.length);
-	for (const { key, url } of images) {
-		if (size <= MAX_SPAN_BYTES) break;
-		attributes[key] = attributes[key].replace(url, () => SPAN_TOO_LARGE_IMAGE);
-		size -= url.length - 39;
-	}
-}
-
-//#endregion
 //#region src/tokens.ts
 /**
 * Map Codex `last_token_usage` to the backend's flat token attribute keys.
@@ -30562,27 +30604,8 @@ function mapUsage(u) {
 //#region src/spans.ts
 init_esm$2();
 const ROOT_NAME = "Codex Turn";
-const str = (v, max) => truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
-/** Span input/output capped at maxChars; with image capture on, images and their placeholders stay whole. */
-const io = (v, ctx) => ctx.captureImages ? capWithImages(v, ctx.maxChars) : str(v, ctx.maxChars);
-/** `text` and then `images` as content items, the way Codex records a user message; without images, just `text`. */
-const withImages = (text, images) => images.length === 0 ? text : [...text ? [{
-	type: "input_text",
-	text
-}] : [], ...images.map((url) => ({
-	type: "input_image",
-	image_url: url
-}))];
-/** A model call's input: `text`, plus the images sent with the user message before it when image capture is on. */
-const callInput = (text, step, ctx) => ctx.captureImages ? withImages(text, step.userImages ?? []) : text;
-/**
-* A tool's output as the next model call is shown it. With image capture on, each
-* image points at the tool span that already holds it instead of being sent twice.
-*/
-const fedBackOutput = (tc, toolSpan, ctx) => ctx.captureImages ? replaceImages(tc.output, toolCallImage(tc.callId), imagesIn(toolSpan.attributes["traceroot.span.output"])) : tc.output;
-/** With image capture on, images are kept whole, so trade a span's largest for placeholders until it fits. */
-function fitted(span, ctx) {
-	if (ctx.captureImages) fitSpanImages(span.attributes);
+function fitted(span, content) {
+	content.fit(span.attributes);
 	return span;
 }
 function commonTrace(attrs, sessionMeta, ctx) {
@@ -30599,37 +30622,34 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 	const rootId = makeSpanId(seed + turn.turnId + ":root");
 	const rootParentSpanId = opts?.rootParentSpanId !== void 0 ? opts.rootParentSpanId : null;
 	const turnOver = rootParentSpanId === null ? turn.completed || !!ctx.turnEnding : turn.completed;
+	const content = ctx.content ?? textPolicy;
 	const children = [];
-	const turnImages = [];
-	let firstCallImages;
+	const calls = [];
 	let prevToolResults;
 	for (const step of turn.steps) {
 		const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
-		const stepSpan = fitted(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, callInput(step.index === 0 ? turn.userInput : prevToolResults, step, ctx)), ctx);
+		const text = step.index === 0 ? turn.userInput : prevToolResults;
+		const stepSpan = fitted(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, content, content.callInput(text, step)), content);
 		children.push(stepSpan);
-		if (ctx.captureImages) {
-			const kept = imagesIn(stepSpan.attributes["traceroot.span.input"]);
-			if (step.index === 0) firstCallImages = kept;
-			for (const url of step.userImages ?? []) turnImages.push(kept.has(url) ? modelCallImage(step.index) : omittedImage(url));
-		}
+		calls.push([step, stepSpan.attributes]);
 		const fed = [];
 		for (const tc of step.toolCalls) {
-			const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx, turnOver), ctx);
+			const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx, turnOver, content), content);
 			children.push(toolSpan);
 			fed.push({
 				name: tc.name,
-				output: fedBackOutput(tc, toolSpan, ctx)
+				output: content.fedBack(tc, toolSpan.attributes)
 			});
 		}
-		if (step.toolCalls.length) prevToolResults = io(fed, ctx);
+		if (step.toolCalls.length) prevToolResults = content.io(fed, ctx.maxChars);
 	}
 	const rootAttrs = {
 		"traceroot.span.type": "AGENT",
 		"traceroot.span.path": [ROOT_NAME]
 	};
 	commonTrace(rootAttrs, sessionMeta, ctx);
-	const rootInput = ctx.captureImages ? withImages(replaceImages(turn.userInput, FIRST_CALL_IMAGE, firstCallImages), turnImages) : turn.userInput;
-	if (rootInput) rootAttrs["traceroot.span.input"] = io(rootInput, ctx);
+	const rootInput = content.turnInput(turn.userInput, calls);
+	if (rootInput) rootAttrs["traceroot.span.input"] = content.io(rootInput, ctx.maxChars);
 	if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
 	rootAttrs["traceroot.span.metadata"] = JSON.stringify(pruneUndefined({
 		"codex.turn_id": turn.turnId,
@@ -30656,7 +30676,7 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		endTime: rootEnd,
 		attributes: rootAttrs,
 		complete: turnOver
-	}, ctx), ...children];
+	}, content), ...children];
 }
 function pruneUndefined(o) {
 	const r = {};
@@ -30675,14 +30695,14 @@ function buildStepOutput(step, max) {
 	if (Object.keys(o).length === 0) return void 0;
 	return truncate(JSON.stringify(o), max);
 }
-function planStepSpan(sessionMeta, turn, step, spanId, parentSpanId, traceId, ctx, input) {
+function planStepSpan(sessionMeta, turn, step, spanId, parentSpanId, traceId, ctx, content, input) {
 	const attrs = {
 		"traceroot.span.type": "LLM",
 		"traceroot.span.path": [ROOT_NAME, turn.model ?? "model"]
 	};
 	commonTrace(attrs, sessionMeta, ctx);
 	if (turn.model) attrs["traceroot.llm.model"] = turn.model;
-	if (input) attrs["traceroot.span.input"] = io(input, ctx);
+	if (input) attrs["traceroot.span.input"] = content.io(input, ctx.maxChars);
 	const output = buildStepOutput(step, ctx.maxChars);
 	if (output) attrs["traceroot.span.output"] = output;
 	attrs["traceroot.span.metadata"] = JSON.stringify({ "codex.step_index": step.index });
@@ -30699,16 +30719,16 @@ function planStepSpan(sessionMeta, turn, step, spanId, parentSpanId, traceId, ct
 		complete: Boolean(step.usage)
 	};
 }
-function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx, turnOver) {
+function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx, turnOver, content) {
 	const attrs = {
 		"traceroot.span.type": "TOOL",
 		"traceroot.span.path": [ROOT_NAME, tc.name]
 	};
 	commonTrace(attrs, sessionMeta, ctx);
 	attrs["traceroot.span.input"] = str(tc.args, ctx.maxChars);
-	if (tc.output !== void 0) attrs["traceroot.span.output"] = io(tc.output, ctx);
+	if (tc.output !== void 0) attrs["traceroot.span.output"] = content.io(tc.output, ctx.maxChars);
 	const meta = {};
-	if (ctx.captureImages) meta["call_id"] = tc.callId;
+	content.toolMeta(tc, meta);
 	if (tc.kind !== void 0) meta["tool_kind"] = tc.kind;
 	if (tc.status !== void 0) meta["status"] = tc.status;
 	if (tc.exitCode !== void 0) meta["exit_code"] = tc.exitCode;
@@ -31158,7 +31178,7 @@ async function emitSession(hook, transcript, config, lock, handOff, deps) {
 		git,
 		maxChars: config.maxChars,
 		turnEnding,
-		captureImages: config.captureImages
+		content: config.captureImages ? imagePolicy : textPolicy
 	};
 	const already = await loadEmittedSpanIds(transcript);
 	if (!await lock.held()) {

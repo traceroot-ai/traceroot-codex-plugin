@@ -23,13 +23,13 @@ export const GOLDEN_FIXTURES = [
 /**
  * The contexts fixtures/spans-golden.json was planned in. "full" mirrors a live
  * Stop hook with every context field set the way dispatch sets it by default,
- * image capture off included; "tight" leaves the optional fields unset and
+ * except content, whose default is image capture off; "tight" leaves the optional fields unset and
  * truncates hard, so the truncation path is pinned too.
  */
 export const GOLDEN_CONTEXTS: Record<string, EmitCtx> = {
   full: {
     environment: "dev", userId: "user-1", git: { repo: "traceroot-ai/traceroot", ref: "a".repeat(40) },
-    maxChars: 20000, turnEnding: true, captureImages: false,
+    maxChars: 20000, turnEnding: true,
   },
   tight: { maxChars: 64 },
 };
