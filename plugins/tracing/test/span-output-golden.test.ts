@@ -3,14 +3,8 @@
  * that alters what existing rollouts produce (with optional features left off)
  * fails here. fixtures/spans-golden.json holds the expected spans.
  */
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { type EmitCtx, planTurnSpans } from "../src/spans.js";
-import { parseRollout, readRollout } from "../src/transcript.js";
-import { GOLDEN_CONTEXTS, readGolden } from "./helpers.js";
-
-const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+import { GOLDEN_CONTEXTS, planFixture, readGolden } from "./helpers.js";
 
 const FIXTURES = [
   "rollout-basic.jsonl",
@@ -24,11 +18,6 @@ const FIXTURES = [
 ];
 
 const golden = readGolden();
-
-async function planFixture(name: string, ctx: EmitCtx) {
-  const { sessionMeta, turns } = parseRollout(await readRollout(path.join(fixtures, name)));
-  return turns.flatMap((turn) => planTurnSpans(sessionMeta, turn, ctx));
-}
 
 describe("planned spans for every rollout fixture", () => {
   const cases = FIXTURES.flatMap((f) => Object.keys(GOLDEN_CONTEXTS).map((c) => [f, c] as const));

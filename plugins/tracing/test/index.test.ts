@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
+import { testConfig } from "./helpers.js";
 
 // Hoisted mocks with benign DISABLED defaults so the module-load self-invoke
 // (`runHook().catch(...)` at the bottom of src/index.ts) lands on the
@@ -22,15 +23,7 @@ vi.mock("../src/emit.js", () => ({ dispatch: mocks.dispatchMock, drain: mocks.dr
 const { runDrainer, runHook } = await import("../src/index.js");
 const { DRAIN_LIFETIME_MS } = await import("../src/lock.js");
 
-const baseConfig: Config = {
-  enabled: false,
-  hostUrl: "https://app.traceroot.ai",
-  maxChars: 20000,
-  maxRequestBytes: 12 * 1024 * 1024,
-  debug: false,
-  failOnError: false,
-  captureImages: false,
-};
+const baseConfig = testConfig({ enabled: false, hostUrl: "https://app.traceroot.ai", failOnError: false });
 const disabledConfig: Config = { ...baseConfig, enabled: false };
 const enabledConfig: Config = { ...baseConfig, enabled: true };
 

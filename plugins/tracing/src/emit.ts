@@ -4,7 +4,7 @@ import { buildTracing as defaultBuildTracing, type Tracing } from "./exporter.js
 import { getGitContext } from "./git.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
 import { drainSession, type HandOff, type LockTimings, type SessionLock, withSessionLock } from "./lock.js";
-import { loadEmittedSpanIds, markSpanEmitted } from "./sidecar.js";
+import { loadEmittedSpanIds, markSpansEmitted } from "./sidecar.js";
 import { emitSpan, planTurnSpans, type EmitCtx, type PlanOpts } from "./spans.js";
 import { locateSubagentRollout } from "./subagents.js";
 import { parseRollout, readRollout } from "./transcript.js";
@@ -183,11 +183,9 @@ async function emitSession(
   // at Codex's deadline keeps what it delivered and the next hook sends only the rest.
   const marked = new Set<string>();
   const record = async (ids: string[]) => {
-    for (const id of ids) {
-      if (marked.has(id)) continue;
-      marked.add(id);
-      await markSpanEmitted(transcript, id);
-    }
+    const fresh = ids.filter((id) => !marked.has(id));
+    for (const id of fresh) marked.add(id);
+    await markSpansEmitted(transcript, fresh);
   };
   const tracing = buildTracingFn(config, lock.held, record);
   let emitted = 0;
