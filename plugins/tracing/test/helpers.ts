@@ -10,6 +10,7 @@ import { onTestFinished } from "vitest";
 import type { Config } from "../src/config.js";
 import { buildTracingWith, type Tracing } from "../src/exporter.js";
 import { PrimedIdGenerator } from "../src/ids.js";
+import { SDK_VERSION } from "../src/sdk.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
 import { parseRollout, readRollout } from "../src/transcript.js";
 
@@ -140,3 +141,13 @@ export async function planFixture(name: string, ctx: EmitCtx): Promise<Emittable
   const { sessionMeta, turns } = parseRollout(await readRollout(path.join(fixturesDir, name)));
   return turns.flatMap((turn) => planTurnSpans(sessionMeta, turn, ctx));
 }
+
+/**
+ * Golden spans with traceroot.sdk.version set to the current SDK_VERSION. The
+ * golden carries the version of the commit it was planned at, so a release bump
+ * would otherwise fail every case; every other byte stays pinned.
+ */
+export const withCurrentSdkVersion = (spans: unknown): EmittableSpan[] => (spans as EmittableSpan[]).map((s) => (
+  "traceroot.sdk.version" in s.attributes
+    ? { ...s, attributes: { ...s.attributes, "traceroot.sdk.version": SDK_VERSION } }
+    : s));

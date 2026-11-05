@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { GOLDEN_CONTEXTS, GOLDEN_FIXTURES, readGolden } from "./golden.js";
-import { planFixture } from "./helpers.js";
+import { planFixture, withCurrentSdkVersion } from "./helpers.js";
 
 const golden = readGolden();
 
@@ -17,7 +17,8 @@ describe("planned spans for every rollout fixture", () => {
 
   it.each(cases)("%s (%s context) matches the pinned output", async (fixture, context) => {
     const spans = await planFixture(fixture, GOLDEN_CONTEXTS[context]!);
-    expect(spans).toEqual(golden[fixture]![context]);
-    expect(JSON.stringify(spans)).toBe(JSON.stringify(golden[fixture]![context]));
+    const expected = withCurrentSdkVersion(golden[fixture]![context]);
+    expect(spans).toEqual(expected);
+    expect(JSON.stringify(spans)).toBe(JSON.stringify(expected));
   });
 });
