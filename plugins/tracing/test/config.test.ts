@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
 import { getConfig } from "../src/config.js";
 
 const saved = { ...process.env };
@@ -98,5 +98,45 @@ describe("max_request_bytes", () => {
   it.each(["0", "-1", "lots"])("falls back to the default for %j", async (value) => {
     process.env.TRACEROOT_CODEX_MAX_REQUEST_BYTES = value;
     expect((await getConfig()).maxRequestBytes).toBe(12 * MiB);
+  });
+});
+
+describe("capture_images", () => {
+  /** A project dir, removed after the test, whose checked-in .codex/traceroot.json holds `json`. */
+  function projectWith(json: Record<string, unknown>): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-proj-"));
+    onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(dir, ".codex"));
+    fs.writeFileSync(path.join(dir, ".codex", "traceroot.json"), JSON.stringify(json));
+    return dir;
+  }
+
+  it("is off by default", async () => {
+    expect((await getConfig()).captureImages).toBe(false);
+  });
+
+  it.each(["true", "1"])("is on with TRACEROOT_CODEX_CAPTURE_IMAGES=%s", async (value) => {
+    process.env.TRACEROOT_CODEX_CAPTURE_IMAGES = value;
+    expect((await getConfig()).captureImages).toBe(true);
+  });
+
+  it("reads capture_images from the global traceroot.json", async () => {
+    fs.writeFileSync(path.join(tmpHome, "traceroot.json"), JSON.stringify({ capture_images: true }));
+    expect((await getConfig()).captureImages).toBe(true);
+  });
+
+  it("ignores capture_images in a project's .codex/traceroot.json", async () => {
+    expect((await getConfig(projectWith({ capture_images: true }))).captureImages).toBe(false);
+  });
+
+  it("keeps the global setting whatever the project config says", async () => {
+    fs.writeFileSync(path.join(tmpHome, "traceroot.json"), JSON.stringify({ capture_images: true }));
+    expect((await getConfig(projectWith({ capture_images: false }))).captureImages).toBe(true);
+  });
+
+  it("lets the env var turn it off over traceroot.json", async () => {
+    fs.writeFileSync(path.join(tmpHome, "traceroot.json"), JSON.stringify({ capture_images: true }));
+    process.env.TRACEROOT_CODEX_CAPTURE_IMAGES = "false";
+    expect((await getConfig()).captureImages).toBe(false);
   });
 });

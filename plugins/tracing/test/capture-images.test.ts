@@ -3,16 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type Config, getConfig } from "../src/config.js";
+import { afterEach, describe, expect, it } from "vitest";
 import { dispatch } from "../src/emit.js";
 import { makeSpanId } from "../src/ids.js";
 import { MAX_SPAN_BYTES, OVERSIZE_IMAGE, SPAN_TOO_LARGE_IMAGE } from "../src/images.js";
 import { attributesBytes } from "../src/size.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
-import { parseRollout, readRollout } from "../src/transcript.js";
 import type { SessionMeta, Turn } from "../src/types.js";
-import { GOLDEN_CONTEXTS, memTracing, readGolden } from "./helpers.js";
+import { copyFixture, GOLDEN_CONTEXTS, memTracing, planFixture, readGolden, testConfig } from "./helpers.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const MiB = 1024 * 1024;
@@ -20,11 +18,6 @@ const INPUT = "traceroot.span.input";
 const OUTPUT = "traceroot.span.output";
 
 const on: EmitCtx = { maxChars: 64, turnEnding: true, captureImages: true };
-
-async function plan(fixture: string, ctx: EmitCtx): Promise<EmittableSpan[]> {
-  const { sessionMeta, turns } = parseRollout(await readRollout(path.join(fixtures, fixture)));
-  return turns.flatMap((turn) => planTurnSpans(sessionMeta, turn, ctx));
-}
 
 async function fixtureImage(fixture: string, mime: string): Promise<string> {
   const text = fs.readFileSync(path.join(fixtures, fixture), "utf-8");
@@ -50,7 +43,7 @@ const turnWith = (patch: Partial<Turn>, output?: unknown, promptImages?: string[
 describe("image capture on: tool output", () => {
   it("keeps the screenshot data URL whole in the tool span output", async () => {
     const png = await fixtureImage("rollout-tool-image.jsonl", "png");
-    const tool = (await plan("rollout-tool-image.jsonl", on)).find((s) => s.kind === "TOOL");
+    const tool = (await planFixture("rollout-tool-image.jsonl", on)).find((s) => s.kind === "TOOL");
     // The JSON around the strings and "input_text" take 60 of the 64 characters.
     expect(JSON.parse(attr(tool, OUTPUT))).toEqual([
       { type: "input_text", text: "Capt…[truncated 22 chars]" },
@@ -59,14 +52,14 @@ describe("image capture on: tool output", () => {
   });
 
   it("records the Codex call id on the tool span, so the placeholder resolves to it", async () => {
-    const spans = await plan("rollout-tool-image.jsonl", { ...on, maxChars: 20000 });
+    const spans = await planFixture("rollout-tool-image.jsonl", { ...on, maxChars: 20000 });
     const tool = spans.find((s) => s.kind === "TOOL");
     expect(JSON.parse(attr(tool, "traceroot.span.metadata"))).toEqual({ call_id: "call-shot" });
     expect(attr(spans.filter((s) => s.kind === "LLM")[1], INPUT)).toContain("[image: see tool call call-shot]");
   });
 
   it("puts a placeholder, not a second copy, into the next model call's input", async () => {
-    const steps = (await plan("rollout-tool-image.jsonl", { ...on, maxChars: 20000 })).filter((s) => s.kind === "LLM");
+    const steps = (await planFixture("rollout-tool-image.jsonl", { ...on, maxChars: 20000 })).filter((s) => s.kind === "LLM");
     const next = attr(steps[1], INPUT);
     expect(next).toContain("[image: see tool call call-shot]");
     expect(next).not.toContain("data:image");
@@ -117,7 +110,7 @@ describe("image capture on: prompt images", () => {
   it("puts the attached image in the first model call's input, and a placeholder in the turn input", async () => {
     const jpeg = await fixtureImage("rollout-prompt-image.jsonl", "jpeg");
     // Without images left in it, the turn input takes the plain maxChars cut.
-    const spans = await plan("rollout-prompt-image.jsonl", { ...on, maxChars: 20000 });
+    const spans = await planFixture("rollout-prompt-image.jsonl", { ...on, maxChars: 20000 });
     const text = { type: "input_text", text: "what colour is this image?" };
     expect(JSON.parse(attr(spans.find((s) => s.kind === "LLM"), INPUT))).toEqual([text, { type: "input_image", image_url: jpeg }]);
     const root = attr(spans.find((s) => s.kind === "AGENT"), INPUT);
@@ -169,10 +162,7 @@ describe("image capture on: an image sent while the turn is running", () => {
 
   const line = (ms: number, type: string, payload: Record<string, unknown>): string =>
     JSON.stringify({ timestamp: new Date(Date.UTC(2026, 6, 1, 12, 0, 0, ms)).toISOString(), type, payload });
-  const config: Config = {
-    enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * MiB,
-    debug: false, failOnError: true, captureImages: true,
-  };
+  const config = testConfig({ captureImages: true });
 
   it("goes on the model call after it, which is still unsent, and the turn input points at that call", async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-steer-"));
@@ -283,7 +273,7 @@ describe("image capture on, fixtures without images", () => {
   it.each(cases)(
     "%s (%s context) changes only by the tool call ids",
     async (fixture, context) => {
-      const spans = await plan(fixture, { ...GOLDEN_CONTEXTS[context]!, captureImages: true });
+      const spans = await planFixture(fixture, { ...GOLDEN_CONTEXTS[context]!, captureImages: true });
       for (const span of spans.filter((s) => s.kind === "TOOL")) {
         const { call_id, ...rest } = JSON.parse(String(span.attributes["traceroot.span.metadata"]));
         expect(makeSpanId(call_id)).toBe(span.spanId);
@@ -296,66 +286,10 @@ describe("image capture on, fixtures without images", () => {
 });
 
 describe("capture_images setting", () => {
-  const saved = { ...process.env };
-  let home: string;
-  let dir: string | undefined;
-  beforeEach(() => {
-    for (const k of Object.keys(process.env)) if (k.startsWith("TRACE")) delete process.env[k];
-    home = fs.mkdtempSync(path.join(os.tmpdir(), "tr-codexhome-"));
-    process.env.CODEX_HOME = home;
-  });
-  afterEach(() => {
-    process.env = { ...saved };
-    fs.rmSync(home, { recursive: true, force: true });
-    if (dir) fs.rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("is off by default", async () => {
-    expect((await getConfig()).captureImages).toBe(false);
-  });
-
-  it.each(["true", "1"])("is on with TRACEROOT_CODEX_CAPTURE_IMAGES=%s", async (value) => {
-    process.env.TRACEROOT_CODEX_CAPTURE_IMAGES = value;
-    expect((await getConfig()).captureImages).toBe(true);
-  });
-
-  it("reads capture_images from the global traceroot.json", async () => {
-    fs.writeFileSync(path.join(home, "traceroot.json"), JSON.stringify({ capture_images: true }));
-    expect((await getConfig()).captureImages).toBe(true);
-  });
-
-  /** A project dir whose checked-in .codex/traceroot.json holds `json`. */
-  function projectWith(json: Record<string, unknown>): string {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-proj-"));
-    fs.mkdirSync(path.join(dir, ".codex"));
-    fs.writeFileSync(path.join(dir, ".codex", "traceroot.json"), JSON.stringify(json));
-    return dir;
-  }
-
-  it("ignores capture_images in a project's .codex/traceroot.json", async () => {
-    expect((await getConfig(projectWith({ capture_images: true }))).captureImages).toBe(false);
-  });
-
-  it("keeps the global setting whatever the project config says", async () => {
-    fs.writeFileSync(path.join(home, "traceroot.json"), JSON.stringify({ capture_images: true }));
-    expect((await getConfig(projectWith({ capture_images: false }))).captureImages).toBe(true);
-  });
-
-  it("lets the env var turn it off over traceroot.json", async () => {
-    fs.writeFileSync(path.join(home, "traceroot.json"), JSON.stringify({ capture_images: true }));
-    process.env.TRACEROOT_CODEX_CAPTURE_IMAGES = "false";
-    expect((await getConfig()).captureImages).toBe(false);
-  });
-
   it("is passed to span planning by dispatch", async () => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-img-"));
-    const transcript = path.join(dir, "rollout.jsonl");
-    fs.copyFileSync(path.join(fixtures, "rollout-tool-image.jsonl"), transcript);
+    const transcript = await copyFixture("rollout-tool-image.jsonl");
     const png = await fixtureImage("rollout-tool-image.jsonl", "png");
-    const config: Config = {
-      enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 64, maxRequestBytes: 12 * MiB,
-      debug: false, failOnError: true, captureImages: true,
-    };
+    const config = testConfig({ maxChars: 64, captureImages: true });
     const mem = new InMemorySpanExporter();
     await dispatch({ transcript_path: transcript }, config, { buildTracing: () => memTracing(mem), getGit: async () => ({}) });
     const tool = mem.getFinishedSpans().find((s) => s.attributes["traceroot.span.type"] === "TOOL")!;

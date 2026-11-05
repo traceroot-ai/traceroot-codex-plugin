@@ -10,9 +10,12 @@ import { onTestFinished } from "vitest";
 import type { Config } from "../src/config.js";
 import { buildTracing, buildTracingWith, type Tracing } from "../src/exporter.js";
 import { PrimedIdGenerator } from "../src/ids.js";
-import type { EmitCtx } from "../src/spans.js";
+import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
+import { parseRollout, readRollout } from "../src/transcript.js";
 
 export const OK: ExportResult = { code: ExportResultCode.SUCCESS };
+
+const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 /** A failed export; `code` is the HTTP status, set on the error as the OTLP exporter does. */
 export const failed = (message: string, code?: number): ExportResult => ({
@@ -38,7 +41,7 @@ function tempDir(): string {
 /** Copies fixtures/`name` into a temp dir that is removed after the test, and returns the copy's path. */
 export async function copyFixture(name = "rollout-basic.jsonl"): Promise<string> {
   const copy = path.join(tempDir(), name);
-  fs.copyFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", name), copy);
+  fs.copyFileSync(path.join(fixturesDir, name), copy);
   return copy;
 }
 
@@ -131,6 +134,12 @@ export const GOLDEN_CONTEXTS: Record<string, EmitCtx> = {
 
 /** fixtures/spans-golden.json: each fixture's planned spans, by context name. */
 export function readGolden(): Record<string, Record<string, unknown>> {
-  const file = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "spans-golden.json");
+  const file = path.join(fixturesDir, "spans-golden.json");
   return JSON.parse(fs.readFileSync(file, "utf-8")) as Record<string, Record<string, unknown>>;
+}
+
+/** Every span planned from fixtures/`name`, turn by turn, in `ctx`. */
+export async function planFixture(name: string, ctx: EmitCtx): Promise<EmittableSpan[]> {
+  const { sessionMeta, turns } = parseRollout(await readRollout(path.join(fixturesDir, name)));
+  return turns.flatMap((turn) => planTurnSpans(sessionMeta, turn, ctx));
 }
