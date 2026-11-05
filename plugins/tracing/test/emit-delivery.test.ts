@@ -1,15 +1,12 @@
 import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { Config } from "../src/config.js";
 import { dispatch } from "../src/emit.js";
 import { buildTracing } from "../src/exporter.js";
 import { makeSpanId } from "../src/ids.js";
 import { loadEmittedSpanIds } from "../src/sidecar.js";
-import { copyFixture, failed, ids, OK, ScriptedExporter, testConfig } from "./helpers.js";
+import { copyFixture, failed, ids, OK, ScriptedExporter, testConfig, writeRollout } from "./helpers.js";
 
 const config = testConfig();
 
@@ -17,9 +14,6 @@ const config = testConfig();
 const ROOT = makeSpanId("turn-1:root");
 const STEP = makeSpanId("turn-1:step:0");
 const TOOL = makeSpanId("call-1");
-
-let dir: string;
-afterEach(async () => { if (dir) await fs.rm(dir, { recursive: true, force: true }); });
 
 const deps = (exporter: ScriptedExporter) => ({
   buildTracing: (c: Config) => buildTracing(c, exporter),
@@ -66,8 +60,6 @@ describe("dispatch with more spans than one request carries", () => {
   const TOOL_CALLS = 1100; // + root + one LLM step = 1,102 spans
 
   async function writeBigRollout(): Promise<string> {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-batches-"));
-    const transcript = path.join(dir, "rollout.jsonl");
     const lines: unknown[] = [
       { timestamp: "2026-06-30T00:00:00.000Z", type: "session_meta", payload: { id: "sess-batches" } },
       { timestamp: "2026-06-30T00:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "big" } },
@@ -84,8 +76,7 @@ describe("dispatch with more spans than one request carries", () => {
       { timestamp: "2026-06-30T00:00:04.000Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 1 } } } },
       { timestamp: "2026-06-30T00:00:05.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "big" } },
     );
-    await fs.writeFile(transcript, lines.map((l) => JSON.stringify(l)).join("\n"));
-    return transcript;
+    return writeRollout(lines);
   }
 
   it("a failed first request is left unmarked and re-sent, and dispatch fails", async () => {

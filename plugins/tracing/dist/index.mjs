@@ -29799,6 +29799,53 @@ const SDK_NAME = "traceroot-codex-plugin";
 const SDK_VERSION = "0.1.1";
 
 //#endregion
+//#region src/size.ts
+const SPAN_OVERHEAD_BYTES = 256;
+const ATTRIBUTE_OVERHEAD_BYTES = 32;
+const utf8Bytes = (s) => Buffer.byteLength(s, "utf8");
+function valueBytes(value) {
+	if (typeof value === "string") return utf8Bytes(value);
+	if (Array.isArray(value)) return value.reduce((n, v) => n + ATTRIBUTE_OVERHEAD_BYTES + valueBytes(v), 0);
+	return 10;
+}
+/** Estimated serialized size of span attributes, never below the real size. */
+function attributesBytes(attributes) {
+	let n = 0;
+	for (const [key, value] of Object.entries(attributes)) n += ATTRIBUTE_OVERHEAD_BYTES + utf8Bytes(key) + valueBytes(value);
+	return n;
+}
+const traceStateBytes = (state) => utf8Bytes(state?.serialize() ?? "");
+/** Estimated size `span` adds to an OTLP protobuf request, never below the real size. */
+function estimateSpanBytes(span) {
+	let n = SPAN_OVERHEAD_BYTES + valueBytes(span.name) + utf8Bytes(span.status.message ?? "") + traceStateBytes(span.spanContext().traceState) + attributesBytes(span.attributes);
+	for (const event of span.events) n += SPAN_OVERHEAD_BYTES + utf8Bytes(event.name) + attributesBytes(event.attributes ?? {});
+	for (const link of span.links) n += SPAN_OVERHEAD_BYTES + traceStateBytes(link.context.traceState) + attributesBytes(link.attributes ?? {});
+	return n;
+}
+/**
+* Splits `spans`, keeping their order, into groups of at most `maxSpans` spans whose
+* estimated size stays within `maxBytes`. A span larger than `maxBytes` on its own
+* forms its own group.
+*/
+function splitBySize(spans, maxBytes, maxSpans = Infinity) {
+	const groups = [];
+	let group = [];
+	let size = 0;
+	for (const span of spans) {
+		const bytes = estimateSpanBytes(span);
+		if (group.length > 0 && (group.length >= maxSpans || size + bytes > maxBytes)) {
+			groups.push(group);
+			group = [];
+			size = 0;
+		}
+		group.push(span);
+		size += bytes;
+	}
+	if (group.length > 0) groups.push(group);
+	return groups;
+}
+
+//#endregion
 //#region src/exporter.ts
 var import_src = require_src$7();
 /** Keeps every ended span, so the hook can send them all once it has ended them. */
@@ -29826,15 +29873,16 @@ function exportOnce(exporter, spans) {
 }
 const MAX_SPANS_PER_REQUEST = 1024;
 /**
-* Sends `spans` as sequential requests of at most 1,024 spans and adds the ids of
-* each accepted request to `delivered`, so a span counts as sent only once the
-* backend accepted it. A failed request fails only its own spans: every request is
-* tried, then the first failure is thrown.
+* Sends `spans` as sequential requests of at most 1,024 spans whose estimated size
+* stays within `maxBytes`, to keep each request under the ingest endpoint's size
+* limit; a span whose estimate alone passes `maxBytes` goes in a request of its own.
+* Adds the ids of each accepted request to `delivered`, so a span counts as sent
+* only once the backend accepted it. A failed request fails only its own spans:
+* every request is tried, then the first failure is thrown.
 */
-async function sendInRequests(exporter, spans, delivered) {
+async function sendInRequests(exporter, spans, maxBytes, delivered) {
 	let failure;
-	for (let i = 0; i < spans.length; i += MAX_SPANS_PER_REQUEST) {
-		const request = spans.slice(i, i + MAX_SPANS_PER_REQUEST);
+	for (const request of splitBySize(spans, maxBytes, MAX_SPANS_PER_REQUEST)) {
 		const result = await exportOnce(exporter, request);
 		if (result.code !== import_src.ExportResultCode.SUCCESS) {
 			failure ??= result;
@@ -29877,7 +29925,7 @@ function buildTracing(config, exporter = otlpExporter(config)) {
 		...buildTracingWith(collected, new PrimedIdGenerator(), delivered),
 		shutdown: async () => {
 			try {
-				await sendInRequests(exporter, collected.spans, delivered);
+				await sendInRequests(exporter, collected.spans, config.maxRequestBytes, delivered);
 			} finally {
 				await exporter.shutdown();
 			}

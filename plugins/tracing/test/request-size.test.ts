@@ -1,12 +1,10 @@
 import { type Attributes, ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api";
 import { TraceState } from "@opentelemetry/core";
-import { type ReadableSpan, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
-import { buildTracingWith } from "../src/exporter.js";
-import { PrimedIdGenerator } from "../src/ids.js";
 import { attributesBytes, estimateSpanBytes, splitBySize } from "../src/size.js";
-import { ScriptedExporter } from "./helpers.js";
+import { captureSpans } from "./helpers.js";
 
 // The protobuf serializer the OTLP exporter itself uses, resolved through it.
 const require = createRequire(import.meta.url);
@@ -31,9 +29,7 @@ type SpanSpec = {
 };
 
 /** Real ReadableSpans built from specs, through the plugin's own tracing setup. */
-async function makeSpans(specs: SpanSpec[]): Promise<ReadableSpan[]> {
-  const sink = new ScriptedExporter();
-  const tracing = buildTracingWith(new SimpleSpanProcessor(sink), new PrimedIdGenerator());
+const makeSpans = (specs: SpanSpec[]): Promise<ReadableSpan[]> => captureSpans((tracing) => {
   const traceState = (raw?: string) => (raw === undefined ? undefined : new TraceState(raw));
   for (const spec of specs) {
     const parent = spec.traceState === undefined ? ROOT_CONTEXT : trace.setSpanContext(ROOT_CONTEXT, {
@@ -52,9 +48,7 @@ async function makeSpans(specs: SpanSpec[]): Promise<ReadableSpan[]> {
     if (spec.statusMessage) span.setStatus({ code: SpanStatusCode.ERROR, message: spec.statusMessage });
     span.end();
   }
-  await tracing.shutdown();
-  return sink.calls.flat();
-}
+});
 
 describe("estimateSpanBytes", () => {
   const specs: Array<[string, SpanSpec]> = [
@@ -91,12 +85,10 @@ describe("estimateSpanBytes", () => {
   });
 
   it("estimates a span whose name isn't a string without throwing, never below its serialized size", async () => {
-    const sink = new ScriptedExporter();
-    const tracing = buildTracingWith(new SimpleSpanProcessor(sink), new PrimedIdGenerator());
-    tracing.tracer.startSpan("anchor").end();
-    for (const name of [undefined, 42, ["exec"]]) tracing.tracer.startSpan(name as unknown as string).end();
-    await tracing.shutdown();
-    const [anchor, unnamed, numbered, listed] = sink.calls.flat();
+    const [anchor, unnamed, numbered, listed] = await captureSpans((tracing) => {
+      tracing.tracer.startSpan("anchor").end();
+      for (const name of [undefined, 42, ["exec"]]) tracing.tracer.startSpan(name as unknown as string).end();
+    });
 
     // The serializer leaves a missing name out; it can't write a number or a list at all.
     const added = requestBytes([anchor!, unnamed!]) - requestBytes([anchor!]);
@@ -144,6 +136,11 @@ describe("splitBySize", () => {
       { attributes: { a: "1" } }, { attributes: { out: "h".repeat(2 * MiB) } }, { attributes: { b: "2" } },
     ]);
     expect(splitBySize([small1!, huge!, small2!], MiB)).toEqual([[small1], [huge], [small2]]);
+  });
+
+  it("closes a group at the span limit, whatever its size", async () => {
+    const spans = await makeSpans(Array.from({ length: 5 }, (_, i) => ({ attributes: { i } })));
+    expect(splitBySize(spans, MiB, 2)).toEqual([spans.slice(0, 2), spans.slice(2, 4), spans.slice(4)]);
   });
 
   it("returns no groups for no spans", () => {

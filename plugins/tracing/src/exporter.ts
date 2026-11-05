@@ -19,17 +19,6 @@ export type Tracing = {
   shutdown: () => Promise<void>;
 };
 
-/** One export call; a throwing exporter is reported as a failed export. */
-function exportSafely(
-  exporter: SpanExporter, spans: ReadableSpan[], resultCallback: (result: ExportResult) => void,
-): void {
-  try {
-    exporter.export(spans, resultCallback);
-  } catch (error) {
-    resultCallback({ code: ExportResultCode.FAILED, error: error instanceof Error ? error : new Error(String(error)) });
-  }
-}
-
 /** Keeps every ended span, so the hook can send them all once it has ended them. */
 class CollectingProcessor implements SpanProcessor {
   readonly spans: ReadableSpan[] = [];
@@ -57,17 +46,20 @@ export function exportOnce(exporter: SpanExporter, spans: ReadableSpan[]): Promi
 const MAX_SPANS_PER_REQUEST = 1024;
 
 /**
- * Sends `spans` as sequential requests of at most 1,024 spans and adds the ids of
- * each accepted request to `delivered`, so a span counts as sent only once the
- * backend accepted it. A failed request fails only its own spans: every request is
- * tried, then the first failure is thrown.
+ * Sends `spans` as sequential requests of at most 1,024 spans whose estimated size
+ * stays within `maxBytes`, to keep each request under the ingest endpoint's size
+ * limit; a span whose estimate alone passes `maxBytes` goes in a request of its own.
+ * Adds the ids of each accepted request to `delivered`, so a span counts as sent
+ * only once the backend accepted it. A failed request fails only its own spans:
+ * every request is tried, then the first failure is thrown.
  */
 export async function sendInRequests(
-  exporter: SpanExporter, spans: ReadableSpan[], delivered: Set<string>,
+  exporter: SpanExporter, spans: ReadableSpan[], maxBytes: number, delivered: Set<string>,
 ): Promise<void> {
   let failure: ExportResult | undefined;
-  for (let i = 0; i < spans.length; i += MAX_SPANS_PER_REQUEST) {
-    const request = spans.slice(i, i + MAX_SPANS_PER_REQUEST);
+  // One request at a time, so a hook has at most one request body, of up to
+  // max_request_bytes, in flight at the ingest endpoint.
+  for (const request of splitBySize(spans, maxBytes, MAX_SPANS_PER_REQUEST)) {
     const result = await exportOnce(exporter, request);
     if (result.code !== ExportResultCode.SUCCESS) {
       failure ??= result;
@@ -76,47 +68,6 @@ export async function sendInRequests(
     for (const span of request) delivered.add(span.spanContext().spanId);
   }
   if (failure) throw failure.error ?? new Error("span export failed");
-}
-
-/**
- * Sends each export call as sequential requests whose estimated size stays within
- * `maxBytes`, to keep each request under the ingest endpoint's size limit. A span
- * whose estimate alone passes `maxBytes` is still sent, in a request of its own. Each
- * request goes through `inner` on its own, so a failed request fails only its own
- * spans; the call as a whole reports the first failure, after trying every request.
- */
-export class SizeLimitedExporter implements SpanExporter {
-  // Export calls whose requests are still being sent. The batch processor exports
-  // a full batch as soon as it fills, outside its final flush, so shutdown and
-  // forceFlush wait for these before reaching `inner`.
-  private readonly inFlight = new Set<Promise<void>>();
-
-  constructor(private readonly inner: SpanExporter, private readonly maxBytes: number) {}
-
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    const call = this.exportInRequests(spans).then(resultCallback);
-    this.inFlight.add(call);
-    void call.finally(() => this.inFlight.delete(call));
-  }
-
-  private async exportInRequests(spans: ReadableSpan[]): Promise<ExportResult> {
-    let firstFailure: ExportResult | undefined;
-    for (const request of splitBySize(spans, this.maxBytes)) {
-      const result = await new Promise<ExportResult>((resolve) => exportSafely(this.inner, request, resolve));
-      if (result.code !== ExportResultCode.SUCCESS) firstFailure ??= result;
-    }
-    return firstFailure ?? { code: ExportResultCode.SUCCESS };
-  }
-
-  async shutdown(): Promise<void> {
-    await Promise.all(this.inFlight);
-    await this.inner.shutdown();
-  }
-
-  async forceFlush(): Promise<void> {
-    await Promise.all(this.inFlight);
-    await this.inner.forceFlush?.();
-  }
 }
 
 export function buildTracingWith(
@@ -158,7 +109,7 @@ export function buildTracing(config: Config, exporter: SpanExporter = otlpExport
     ...buildTracingWith(collected, new PrimedIdGenerator(), delivered),
     shutdown: async () => {
       try {
-        await sendInRequests(exporter, collected.spans, delivered);
+        await sendInRequests(exporter, collected.spans, config.maxRequestBytes, delivered);
       } finally {
         await exporter.shutdown();
       }

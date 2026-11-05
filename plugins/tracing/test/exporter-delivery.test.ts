@@ -1,31 +1,12 @@
 import { ExportResultCode } from "@opentelemetry/core";
 import { type ReadableSpan, type SpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { describe, expect, it } from "vitest";
-import { buildTracing, buildTracingWith, exportOnce, sendInRequests, type Tracing } from "../src/exporter.js";
+import { buildTracing, buildTracingWith, exportOnce, sendInRequests } from "../src/exporter.js";
 import { PrimedIdGenerator } from "../src/ids.js";
-import { failed, ids, OK, ScriptedExporter, testConfig } from "./helpers.js";
+import { distinctIds, endSpans, failed, ids, makeSpans, OK, ScriptedExporter, testConfig } from "./helpers.js";
 
 const config = testConfig({ failOnError: false });
-
-/** Ends one span per id through `tracing`, with the id primed like emitSpan does. */
-function endSpans(tracing: Tracing, spanIds: string[]): void {
-  for (const id of spanIds) {
-    tracing.idGen.nextSpanId = id;
-    tracing.tracer.startSpan(`span-${id}`).end();
-  }
-}
-
-/** `count` distinct span ids. */
-const distinctIds = (count: number): string[] => Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(16, "0"));
-
-/** Real ReadableSpans with the given ids, captured from a throwaway provider. */
-async function makeSpans(spanIds: string[]): Promise<ReadableSpan[]> {
-  const sink = new ScriptedExporter();
-  const tracing = buildTracingWith(new SimpleSpanProcessor(sink), new PrimedIdGenerator());
-  endSpans(tracing, spanIds);
-  await tracing.shutdown();
-  return sink.calls.flat();
-}
+const BUDGET = config.maxRequestBytes;
 
 describe("exportOnce", () => {
   it("reports a throwing exporter as a failed export instead of throwing", async () => {
@@ -51,7 +32,7 @@ describe("sendInRequests", () => {
     const spans = await makeSpans(["1".repeat(16), "2".repeat(16)]);
     const inner = new ScriptedExporter();
     const delivered = new Set<string>();
-    await sendInRequests(inner, spans, delivered);
+    await sendInRequests(inner, spans, BUDGET, delivered);
     expect(inner.calls).toEqual([spans]);
     expect([...delivered].sort()).toEqual(["1".repeat(16), "2".repeat(16)]);
   });
@@ -59,7 +40,7 @@ describe("sendInRequests", () => {
   it("rejects and records nothing for a failed request (e.g. a 413 or 503 from the backend)", async () => {
     const spans = await makeSpans(["3".repeat(16)]);
     const delivered = new Set<string>();
-    await expect(sendInRequests(new ScriptedExporter(() => failed("Request Entity Too Large")), spans, delivered))
+    await expect(sendInRequests(new ScriptedExporter(() => failed("Request Entity Too Large")), spans, BUDGET, delivered))
       .rejects.toThrow("Request Entity Too Large");
     expect(delivered.size).toBe(0);
   });
@@ -80,7 +61,7 @@ describe("sendInRequests", () => {
     };
     const delivered = new Set<string>();
 
-    await expect(sendInRequests(inner, spans, delivered)).rejects.toThrow("Request Entity Too Large");
+    await expect(sendInRequests(inner, spans, BUDGET, delivered)).rejects.toThrow("Request Entity Too Large");
     expect(calls.map((c) => c.length)).toEqual([1024, 1024, 1]);
     expect(maxInFlight).toBe(1);
     expect([...delivered].sort()).toEqual(ids(calls[1]!).sort());

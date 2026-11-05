@@ -1,12 +1,15 @@
 import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
-import type { InMemorySpanExporter, ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
+import {
+  type InMemorySpanExporter, type ReadableSpan, type SpanExporter, SimpleSpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { onTestFinished } from "vitest";
 import type { Config } from "../src/config.js";
-import { buildTracing, type Tracing } from "../src/exporter.js";
+import { buildTracing, buildTracingWith, type Tracing } from "../src/exporter.js";
+import { PrimedIdGenerator } from "../src/ids.js";
 
 export const OK: ExportResult = { code: ExportResultCode.SUCCESS };
 
@@ -24,13 +27,25 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   ...overrides,
 });
 
+/** A fresh temp dir, removed when the current test finishes. */
+function tempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-test-"));
+  onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
 /** Copies fixtures/`name` into a temp dir that is removed after the test, and returns the copy's path. */
 export async function copyFixture(name = "rollout-basic.jsonl"): Promise<string> {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-fixture-"));
-  onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const copy = path.join(dir, name);
+  const copy = path.join(tempDir(), name);
   fs.copyFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", name), copy);
   return copy;
+}
+
+/** Writes `lines` as a rollout in a temp dir that is removed after the test, and returns its path. */
+export async function writeRollout(lines: unknown[]): Promise<string> {
+  const file = path.join(tempDir(), "rollout.jsonl");
+  fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n"));
+  return file;
 }
 
 /**
@@ -64,6 +79,31 @@ export class ScriptedExporter implements SpanExporter {
     await Promise.all(this.inFlight);
   }
 }
+
+/** `count` distinct span ids. */
+export const distinctIds = (count: number): string[] =>
+  Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(16, "0"));
+
+/** Ends one span per id through `tracing`, primed like emitSpan does, each with `bytes` of output text. */
+export function endSpans(tracing: Tracing, spanIds: string[], bytes = 0): void {
+  for (const id of spanIds) {
+    tracing.idGen.nextSpanId = id;
+    tracing.tracer.startSpan(`span-${id}`, { attributes: { "traceroot.span.output": "x".repeat(bytes) } }).end();
+  }
+}
+
+/** The real ReadableSpans that `end` ends through a throwaway tracing. */
+export async function captureSpans(end: (tracing: Tracing) => void): Promise<ReadableSpan[]> {
+  const sink = new ScriptedExporter();
+  const tracing = buildTracingWith(new SimpleSpanProcessor(sink), new PrimedIdGenerator());
+  end(tracing);
+  await tracing.shutdown();
+  return sink.calls.flat();
+}
+
+/** Real ReadableSpans with the given ids, each with `bytes` of output text. */
+export const makeSpans = (spanIds: string[], bytes = 0): Promise<ReadableSpan[]> =>
+  captureSpans((tracing) => endSpans(tracing, spanIds, bytes));
 
 /**
  * The tracing a hook builds, sending its spans into `mem`. It never shuts `mem`
