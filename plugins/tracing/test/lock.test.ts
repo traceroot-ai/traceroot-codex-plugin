@@ -4,7 +4,6 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,43 +11,25 @@ import type { Config } from "../src/config.js";
 import { dispatch, drain } from "../src/emit.js";
 import { buildTracing } from "../src/exporter.js";
 import { makeSpanId } from "../src/ids.js";
-import { drainSession, type HandOff, type LockTimings, pathsOf, withSessionLock } from "../src/lock.js";
+import { drainSession, type HandOff, type LockTimings, withSessionLock } from "../src/lock.js";
 import { loadEmittedSpanIds } from "../src/sidecar.js";
 import type { HookInput } from "../src/types.js";
-import { deferred, failed, ids, OK, ScriptedExporter } from "./helpers.js";
+import { deferred, failed, ids, OK, rolloutPath, ScriptedExporter } from "./helpers.js";
+import { drainerOf, exists, leaveLock, lockOf, ownersOf, pendingOf } from "./lock-helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const T: LockTimings = { waitMs: 2_000, staleMs: 60_000, heartbeatMs: 1_000, rerunBudgetMs: 60_000, pollMs: 5 };
 
-let dir: string;
-afterEach(async () => {
+afterEach(() => {
   vi.useRealTimers();
-  if (dir) await fs.rm(dir, { recursive: true, force: true });
 });
 
-async function rolloutPath(): Promise<string> {
-  dir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-lock-"));
-  return path.join(dir, "rollout.jsonl");
-}
-
-const lockOf = (rollout: string) => pathsOf(rollout).lockDir;
-/** The owners in the lock: the names in its directory. */
-const ownersOf = async (rollout: string) => fs.readdir(lockOf(rollout)).catch(() => []);
-/** Leaves a lock whose only owner is `owner`, last touched `ageMs` ago. */
-async function leaveLock(rollout: string, owner: string, ageMs = 0): Promise<void> {
-  await fs.mkdir(lockOf(rollout), { recursive: true });
-  await fs.writeFile(path.join(lockOf(rollout), owner), owner);
-  const at = new Date(Date.now() - ageMs);
-  await fs.utimes(path.join(lockOf(rollout), owner), at, at);
-}
 /** Another hook takes the lock over: the current owner's entry is gone and `owner` is in its place. */
 function takeOver(rollout: string, owner: string): void {
   mkdirSync(lockOf(rollout), { recursive: true });
   for (const name of readdirSync(lockOf(rollout))) rmSync(path.join(lockOf(rollout), name), { force: true });
   writeFileSync(path.join(lockOf(rollout), owner), owner);
 }
-const pendingOf = (rollout: string) => pathsOf(rollout).pendingDir;
-const exists = (p: string) => fs.access(p).then(() => true, () => false);
 /** The requests waiting for a run: their turn ends, or NaN for one that names none. */
 const requestsOf = async (rollout: string) => {
   const names = await fs.readdir(pendingOf(rollout)).catch(() => []);
@@ -60,7 +41,6 @@ async function leaveRequest(rollout: string, turnEndedAt?: number): Promise<void
   await fs.mkdir(pendingOf(rollout), { recursive: true });
   await fs.writeFile(path.join(pendingOf(rollout), randomUUID()), turnEndedAt === undefined ? "" : String(turnEndedAt));
 }
-const drainerOf = (rollout: string) => pathsOf(rollout).drainerDir;
 /** Leaves the drainer directory naming `owner`, as a drainer serving the session does. */
 async function leaveDrainer(rollout: string, owner: string): Promise<void> {
   await fs.mkdir(drainerOf(rollout));
@@ -815,7 +795,7 @@ describe("dispatch under the session lock", () => {
       { ...depsFor("holder", events, new GatedExporter("holder", events, gate.promise, exporting.resolve), { ...T, rerunBudgetMs: 0 }), startDrainer });
     await exporting.promise;
     // The turn's last Stop hands off and exits. No hook runs after it.
-    expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop", cwd: dir }, config,
+    expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop", cwd: path.dirname(transcript) }, config,
       { ...depsFor("stop", events, new GatedExporter("stop", events), { ...T, waitMs: 0 }), startDrainer })).toEqual({ emitted: 0 });
     // The drainer holds the drainer directory and waits for the lock before the holder lets go.
     await drainerWaiting.promise;
@@ -857,7 +837,7 @@ describe("dispatch under the session lock", () => {
     });
     await exporting.promise;
     // The turn's last Stop hands off and exits. No hook runs after it.
-    expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop", cwd: dir }, config,
+    expect(await dispatch({ transcript_path: transcript, hook_event_name: "Stop", cwd: path.dirname(transcript) }, config,
       { ...depsFor("stop", events, new GatedExporter("stop", events), { ...T, waitMs: 0 }), startDrainer })).toEqual({ emitted: 0 });
     // The drainer holds the drainer directory and waits for the lock before the holder lets go.
     await drainerWaiting.promise;
@@ -867,7 +847,7 @@ describe("dispatch under the session lock", () => {
 
     // What a single Stop over the whole rollout sends.
     const reference = new ScriptedExporter();
-    const referenceRollout = path.join(dir, "reference.jsonl");
+    const referenceRollout = path.join(path.dirname(transcript), "reference.jsonl");
     await fs.copyFile(path.join(here, "fixtures", "rollout-inprogress.jsonl"), referenceRollout);
     await dispatch({ transcript_path: referenceRollout, hook_event_name: "Stop" }, config,
       { buildTracing: (c: Config) => buildTracing(c, reference), getGit: async () => ({}), lockTimings: T });

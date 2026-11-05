@@ -1,10 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { drainSession, type HandOff, type LockTimings, pathsOf, type SessionLock, withSessionLock } from "../src/lock.js";
+import { drainSession, type HandOff, type LockTimings, type SessionLock, withSessionLock } from "../src/lock.js";
 import { setDebug } from "../src/util.js";
-import { deferred } from "./helpers.js";
+import { deferred, rolloutPath } from "./helpers.js";
+import { drainerOf, exists, leaveLock, lockOf, ownersOf, pendingOf } from "./lock-helpers.js";
 
 type Op =
   | "open" | "stat" | "lstat" | "readFile" | "writeFile" | "link" | "rename" | "rm" | "mkdir" | "rmdir" | "readdir"
@@ -43,37 +43,18 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 const real = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 const T: LockTimings = { waitMs: 0, staleMs: 60_000, heartbeatMs: 1_000, rerunBudgetMs: 60_000, pollMs: 5 };
 
-let dir: string;
-afterEach(async () => {
+afterEach(() => {
   steps.before = undefined;
   steps.after = undefined;
   setDebug(false);
   vi.restoreAllMocks();
   vi.useRealTimers();
-  if (dir) await real.rm(dir, { recursive: true, force: true });
 });
 
-async function rolloutPath(): Promise<string> {
-  dir = await real.mkdtemp(path.join(os.tmpdir(), "tr-lock-race-"));
-  return path.join(dir, "rollout.jsonl");
-}
-
-const lockOf = (rollout: string) => pathsOf(rollout).lockDir;
-const pendingOf = (rollout: string) => pathsOf(rollout).pendingDir;
-const drainerOf = (rollout: string) => pathsOf(rollout).drainerDir;
-const exists = (p: string) => real.access(p).then(() => true, () => false);
-const ownersOf = (rollout: string) => real.readdir(lockOf(rollout)).catch(() => []);
-const requestsOf = (rollout: string) => real.readdir(pendingOf(rollout)).catch(() => []);
+/** The names of the requests waiting for a run. */
+const requestNamesOf = (rollout: string) => real.readdir(pendingOf(rollout)).catch(() => []);
 const isEntryOf = (rollout: string, file: unknown) => String(file).startsWith(`${lockOf(rollout)}${path.sep}`);
 const eio = () => Object.assign(new Error("EIO"), { code: "EIO" });
-
-/** Leaves a lock whose only owner is `owner`, last touched `ageMs` ago. */
-async function leaveLock(rollout: string, owner: string, ageMs = 0): Promise<void> {
-  await real.mkdir(lockOf(rollout), { recursive: true });
-  await real.writeFile(path.join(lockOf(rollout), owner), owner);
-  const at = new Date(Date.now() - ageMs);
-  await real.utimes(path.join(lockOf(rollout), owner), at, at);
-}
 
 const staleLock = (rollout: string, owner: string) => leaveLock(rollout, owner, 120_000);
 
@@ -154,7 +135,7 @@ describe("withSessionLock under exact interleavings", () => {
     }, { timings: T });
 
     expect(held).toEqual([false, true]);
-    expect(await requestsOf(rollout)).toEqual([]);
+    expect(await requestNamesOf(rollout)).toEqual([]);
     expect(await exists(lockOf(rollout))).toBe(false);
   });
 
@@ -209,7 +190,7 @@ describe("withSessionLock under exact interleavings", () => {
 
     await drainSession(rollout, async () => { ran = true; }, { timings: { ...T, waitMs: 20, rerunBudgetMs: 40 } });
     expect(ran).toBe(false);
-    expect(await requestsOf(rollout)).toEqual(["waiting"]);
+    expect(await requestNamesOf(rollout)).toEqual(["waiting"]);
     expect(await exists(drainerOf(rollout))).toBe(false);
   });
 
@@ -368,7 +349,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       const heldAfter = otherLock ? await otherLock.held() : true;
       finish.resolve();
       await other;
-      await real.rm(dir, { recursive: true, force: true });
+      await real.rm(path.dirname(rollout), { recursive: true, force: true });
 
       if (other === undefined) break; // this hook made fewer operations: every point was tried
       expect(heldAfter, `other hook lost its lock when this one paused before operation ${pauseAt}`).toBe(true);
@@ -447,7 +428,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       finish.resolve();
       await Promise.all([a, b]);
       steps.before = undefined;
-      await real.rm(dir, { recursive: true, force: true });
+      await real.rm(path.dirname(rollout), { recursive: true, force: true });
       return { dead, aPaused: state.aPaused, bPaused: state.bPaused, most: runs.most, heldAtStart };
     }
 
@@ -507,7 +488,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
     await newerRunning.promise;
     resume.resolve();
     await old;
-    const whileNewerRuns = await requestsOf(rollout);
+    const whileNewerRuns = await requestNamesOf(rollout);
     const newerHolds = await as("check", () => newerLock!.held());
     finishNewer.resolve();
     await newer;
@@ -515,7 +496,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
     expect(served).toEqual([{ turnEndedAt: 1234 }]);
     expect(newerHolds).toBe(true);
     expect(whileNewerRuns).toHaveLength(1);
-    expect(await requestsOf(rollout)).toEqual([]); // removed by the holder that claimed it last, once it finished
+    expect(await requestNamesOf(rollout)).toEqual([]); // removed by the holder that claimed it last, once it finished
   });
 
   type Arrival = (rollout: string, stop: () => Promise<void>, startDrainer: () => void, runs: ReturnType<typeof inFlight>) => Promise<unknown>;
@@ -560,10 +541,10 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       await as("drainer", () => drainSession(rollout, run, { timings: D }));
       steps.before = undefined;
       await Promise.all(drainers);
-      const left = await requestsOf(rollout);
+      const left = await requestNamesOf(rollout);
       const drainerLeft = await exists(drainerOf(rollout));
       const lockLeft = await exists(lockOf(rollout));
-      await real.rm(dir, { recursive: true, force: true });
+      await real.rm(path.dirname(rollout), { recursive: true, force: true });
 
       if (!reached) break; // the drainer made fewer operations: every point was tried
       const at = `paused before the drainer's operation ${pauseAt}`;
@@ -605,7 +586,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       steps.before = undefined;
       gate.resolve();
       await holder;
-      await real.rm(dir, { recursive: true, force: true });
+      await real.rm(path.dirname(rollout), { recursive: true, force: true });
 
       if (newer === undefined) break; // the older Stop made fewer operations: every point was tried
       const turnEnds = served.map((handOff) => handOff.turnEndedAt ?? 0);

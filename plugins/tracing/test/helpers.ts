@@ -52,6 +52,11 @@ export async function writeRollout(lines: unknown[]): Promise<string> {
   return file;
 }
 
+/** A rollout path in a temp dir that is removed after the test, with nothing written there yet. */
+export async function rolloutPath(): Promise<string> {
+  return path.join(tempDir(), "rollout.jsonl");
+}
+
 /**
  * Records every export call and answers it with `outcome(spans)` after
  * `delayMs(spans)` (a tick by default), like a network exporter would. `"throw"`
