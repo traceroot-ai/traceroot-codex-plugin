@@ -10,7 +10,8 @@ import { MAX_SPAN_BYTES, OVERSIZE_IMAGE, SPAN_TOO_LARGE_IMAGE } from "../src/ima
 import { attributesBytes } from "../src/size.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
 import type { SessionMeta, Turn } from "../src/types.js";
-import { copyFixture, GOLDEN_CONTEXTS, memTracing, planFixture, readGolden, testConfig } from "./helpers.js";
+import { GOLDEN_CONTEXTS, readGolden } from "./golden.js";
+import { copyFixture, memTracing, planFixture, testConfig } from "./helpers.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const MiB = 1024 * 1024;

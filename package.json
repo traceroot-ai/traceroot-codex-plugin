@@ -10,7 +10,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "lint:dist": "pnpm run build && git diff --exit-code -- plugins/tracing/dist/index.mjs"
+    "lint:dist": "pnpm run build && git diff --exit-code -- plugins/tracing/dist/index.mjs",
+    "regenerate:golden": "node plugins/tracing/test/regenerate-spans-golden.mjs"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
