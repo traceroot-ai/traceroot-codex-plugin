@@ -48,18 +48,20 @@ Get your API key at [app.traceroot.ai](https://app.traceroot.ai). (The plugin ru
 <details>
 <summary>Optional settings</summary>
 
-Resolved highest-precedence first: env vars → project `.codex/traceroot.json` → global `~/.codex/traceroot.json` → defaults.
+Resolved highest-precedence first: env vars → project `.codex/traceroot.json` → global `~/.codex/traceroot.json` → defaults. `api_key`, `host_url` and `capture_images` are read only from env vars or the global file, so a repository you open can't redirect your uploads or turn on image capture.
 
 | JSON key | Env var | Default | Notes |
 |----------|---------|---------|-------|
 | `enabled` | `TRACE_TO_TRACEROOT` | `false` | Turn tracing on (an API key must also be set). |
-| `api_key` | `TRACEROOT_API_KEY` | — | Required. |
-| `host_url` | `TRACEROOT_HOST_URL` | `https://app.traceroot.ai` | Point at a self-hosted instance. |
+| `api_key` | `TRACEROOT_CODEX_API_KEY` or `TRACEROOT_API_KEY` | — | Required. |
+| `host_url` | `TRACEROOT_CODEX_HOST_URL` or `TRACEROOT_HOST_URL` | `https://app.traceroot.ai` | Point at a self-hosted instance. |
+| `environment` | `TRACEROOT_ENVIRONMENT` | — | Environment recorded on each trace. |
+| `user_id` | `TRACEROOT_CODEX_USER_ID` | — | User ID recorded on each trace. |
 | `max_chars` | `TRACEROOT_CODEX_MAX_CHARS` | `20000` | Truncate long span attributes. |
-| `max_request_bytes` | `TRACEROOT_CODEX_MAX_REQUEST_BYTES` | `12582912` (12 MiB) | Target for the estimated size of one upload request. Larger batches of spans are sent as several requests. A single span larger than this is sent in a request of its own. |
+| `max_request_bytes` | `TRACEROOT_CODEX_MAX_REQUEST_BYTES` | `12582912` (12 MiB) | Target for the estimated size of one upload request. Larger batches of spans, or more than 1,024 spans, are sent as several requests. A single span larger than this is sent in a request of its own. |
 | `debug` | `TRACEROOT_CODEX_DEBUG` | `false` | Log to stderr. |
 | `fail_on_error` | `TRACEROOT_CODEX_FAIL_ON_ERROR` | `false` | Off by default — tracing never blocks a Codex turn. |
-| `capture_images` | `TRACEROOT_CODEX_CAPTURE_IMAGES` | `false` | Send screenshots from tool output and images attached to prompts. Read only from the env var or the global `~/.codex/traceroot.json`. See [Images](#images). |
+| `capture_images` | `TRACEROOT_CODEX_CAPTURE_IMAGES` | `false` | Send screenshots from tool output and images attached to prompts. See [Images](#images). |
 
 </details>
 
@@ -97,7 +99,13 @@ By default, tool output is cut at `max_chars`, which also cuts any screenshot in
 - When a tool's output is fed to the next model call, each image in it shows there as `[image: see tool call <call id>]` instead of a second copy. The tool span's metadata carries the matching `call_id`.
 - An image larger than 5 MiB is replaced with `[image omitted: larger than 5 MiB]`. If a span would still be larger than 8 MiB, its largest images are replaced with `[image omitted: span larger than 8 MiB]` until it fits. Where a placeholder would point at an image replaced this way, it shows the same text instead.
 
-Screenshots are stored as images only when your TraceRoot server has image extraction enabled for the project. On a self-hosted server, set `ATTACHMENT_ENABLED=true`, and optionally `ATTACHMENT_PROJECT_IDS` to a comma-separated list of the projects to enable it for. Without it, screenshots are stored inline in the span text.
+Screenshots are stored as images only when your TraceRoot server has image extraction enabled for the project. On a self-hosted server, set `ATTACHMENT_ENABLED=true`, and optionally `ATTACHMENT_PROJECT_IDS` to a comma-separated list of the projects to enable it for. Without it, screenshots are stored inline in the span text. See [Images in span input and output](https://traceroot.ai/docs/tracing/data-capture#images-in-span-input-and-output) for the server's own limits and placeholders, and [Self-hosting](https://traceroot.ai/docs/developer/self-hosting#image-attachments) for its settings.
+
+## Sending and retries
+
+Each hook sends what it read in requests of up to `max_request_bytes`, one at a time, and records a span as sent (in `<transcript>.traceroot`) only once TraceRoot accepts the request carrying it. A request answered with 429, 502, 503 or 504 is retried a few times within the export's 10 s timeout, following `Retry-After`. Spans that still aren't accepted are sent by the session's next hook, after the next tool call or turn end.
+
+A hook that hands its run to the lock holder starts the background drainer described in [Install](#install), as does a holder that exits with handed-off runs still waiting, because a run failed or it used its 15 s budget. Only one drainer runs per session. It retries a failed run after 1 s, 2 s, 4 s and so on, up to 15 s apart, starts no run after 90 s, and exits within 2 minutes; anything left is sent by the session's next hook. Set `debug` to see these steps on stderr.
 
 ## Privacy
 

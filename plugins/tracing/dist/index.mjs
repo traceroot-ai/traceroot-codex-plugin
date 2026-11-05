@@ -30907,8 +30907,15 @@ function parseSpawnAgentId(output) {
 	const id = obj?.agent_id;
 	return typeof id === "string" && id ? id : void 0;
 }
+/** Adds a subagent ref to `t`, or fills in the spawn call id of one already recorded. */
+function addSubagent(t, ref) {
+	const existing = (t.subagents ??= []).find((s) => s.threadId === ref.threadId);
+	if (!existing) t.subagents.push(ref);
+	else existing.spawnCallId ??= ref.spawnCallId;
+}
 function parseRollout(lines) {
 	let sessionMeta = { sessionId: "" };
+	let sawSessionMeta = false;
 	const turns = [];
 	let turn;
 	let step;
@@ -30943,6 +30950,8 @@ function parseRollout(lines) {
 	for (const line of lines) {
 		const at = ms(line.timestamp);
 		if (line.type === "session_meta") {
+			if (sawSessionMeta) continue;
+			sawSessionMeta = true;
 			sessionMeta = {
 				sessionId: line.payload.id,
 				cwd: line.payload.cwd,
@@ -30984,6 +30993,19 @@ function parseRollout(lines) {
 						const text = messageText(p.item.content);
 						if (text) appendAuthoritativeUserInput(turn, text);
 					}
+					if (turn && p.item?.type === "SubAgentActivity" && p.item.kind === "started") {
+						const { agent_thread_id: threadId, id: spawnCallId } = p.item;
+						if (typeof threadId === "string" && typeof spawnCallId === "string") addSubagent(turn, {
+							threadId,
+							spawnCallId
+						});
+					}
+					break;
+				case "sub_agent_activity":
+					if (turn && p.kind === "started" && typeof p.agent_thread_id === "string" && typeof p.event_id === "string") addSubagent(turn, {
+						threadId: p.agent_thread_id,
+						spawnCallId: p.event_id
+					});
 					break;
 				case "agent_message":
 					if (turn && typeof p.message === "string") turn.finalOutput = p.message;
@@ -31008,7 +31030,7 @@ function parseRollout(lines) {
 					if (turn && typeof p.new_thread_id === "string") {
 						const ref = { threadId: p.new_thread_id };
 						if (typeof p.call_id === "string") ref.spawnCallId = p.call_id;
-						(turn.subagents ??= []).push(ref);
+						addSubagent(turn, ref);
 					}
 					if (turn && p.type.endsWith("_end") && typeof p.call_id === "string") {
 						const tc = toolsByCallId.get(p.call_id);
@@ -31035,7 +31057,7 @@ function parseRollout(lines) {
 				}
 				if (turn && spawnAgentCallIds.has(p.call_id)) {
 					const threadId = parseSpawnAgentId(p.output);
-					if (threadId) (turn.subagents ??= []).push({
+					if (threadId) addSubagent(turn, {
 						threadId,
 						spawnCallId: p.call_id
 					});
@@ -31097,7 +31119,7 @@ function parseRollout(lines) {
 //#region src/emit.ts
 const STACK_GUARD = 32;
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
-async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, findSubagent) {
+async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, findSubagent, rolloutTurnIds) {
 	let n = 0;
 	for (const span of planTurnSpans(sessionMeta, turn, ctx, opts)) {
 		if (!span.complete) continue;
@@ -31128,7 +31150,11 @@ async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracin
 				rootParentSpanId: makeSpanId(parentSeed + sub.spawnCallId),
 				seedPrefix: sub.threadId + ":"
 			};
-			for (const childTurn of child.turns) n += await emitTurnTree(child.sessionMeta, childTurn, ctx, childOpts, visited, depth + 1, tracing, already, findSubagent);
+			const childTurnIds = new Set(child.turns.flatMap((t) => t.turnId ?? []));
+			for (const childTurn of child.turns) {
+				if (childTurn.turnId && rolloutTurnIds.has(childTurn.turnId)) continue;
+				n += await emitTurnTree(child.sessionMeta, childTurn, ctx, childOpts, visited, depth + 1, tracing, already, findSubagent, childTurnIds);
+			}
 		} catch (err) {
 			debugLog(`subagent ${sub.threadId} resolve/read/parse failed; skipping: ${String(err)}`);
 			continue;
@@ -31189,8 +31215,9 @@ async function emitSession(hook, transcript, config, lock, handOff, deps) {
 	const tracing = buildTracing();
 	let emitted = 0;
 	const visited = /* @__PURE__ */ new Set();
+	const turnIds = new Set(turns.flatMap((t) => t.turnId ?? []));
 	try {
-		for (const turn of turns) emitted += await emitTurnTree(sessionMeta, turn, ctx, {}, visited, 0, tracing, already, findSubagentFn);
+		for (const turn of turns) emitted += await emitTurnTree(sessionMeta, turn, ctx, {}, visited, 0, tracing, already, findSubagentFn, turnIds);
 	} finally {
 		try {
 			await tracing.shutdown();
