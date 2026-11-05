@@ -12,7 +12,7 @@ import { attributesBytes } from "../src/size.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
 import type { SessionMeta, Turn } from "../src/types.js";
 import { GOLDEN_CONTEXTS, readGolden } from "./golden.js";
-import { copyFixture, memExporter, planFixture, testConfig } from "./helpers.js";
+import { copyFixture, memExporter, planFixture, testConfig, withCurrentSdkVersion } from "./helpers.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const MiB = 1024 * 1024;
@@ -282,7 +282,7 @@ describe("image capture on, fixtures without images", () => {
         if (Object.keys(rest).length) span.attributes["traceroot.span.metadata"] = JSON.stringify(rest);
         else delete span.attributes["traceroot.span.metadata"];
       }
-      expect(JSON.stringify(spans)).toBe(JSON.stringify(golden[fixture]![context]));
+      expect(JSON.stringify(spans)).toBe(JSON.stringify(withCurrentSdkVersion(golden[fixture]![context])));
     },
   );
 });
