@@ -2,10 +2,11 @@ import { createRequire } from "node:module";
 import * as fs from "node:fs/promises";
 import * as os$1 from "node:os";
 import * as path from "node:path";
+import { execFile, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import * as zlib from "zlib";
 import { Readable } from "stream";
-import { createHash, randomBytes } from "node:crypto";
-import { execFile } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 
 //#region rolldown:runtime
@@ -53,6 +54,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 //#endregion
 //#region src/config.ts
+const DEFAULT_MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 async function readJson(file) {
 	try {
 		return JSON.parse(await fs.readFile(file, "utf-8"));
@@ -83,8 +85,10 @@ async function getConfig(cwd = process.cwd()) {
 		environment: envFirst("TRACEROOT_ENVIRONMENT") ?? j.environment,
 		userId: envFirst("TRACEROOT_CODEX_USER_ID") ?? j.user_id,
 		maxChars: ((n) => Number.isFinite(n) ? n : 2e4)(Number(envFirst("TRACEROOT_CODEX_MAX_CHARS") ?? j.max_chars ?? 2e4)),
+		maxRequestBytes: ((n) => Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_REQUEST_BYTES)(Number(envFirst("TRACEROOT_CODEX_MAX_REQUEST_BYTES") ?? j.max_request_bytes ?? DEFAULT_MAX_REQUEST_BYTES)),
 		debug: truthy(envFirst("TRACEROOT_CODEX_DEBUG") ?? j.debug),
 		failOnError: truthy(envFirst("TRACEROOT_CODEX_FAIL_ON_ERROR") ?? j.fail_on_error),
+		captureImages: truthy(envFirst("TRACEROOT_CODEX_CAPTURE_IMAGES") ?? globalJson.capture_images),
 		enabled: false
 	};
 	config.enabled = truthy(enabledFlag) && Boolean(apiKey);
@@ -92,126 +96,284 @@ async function getConfig(cwd = process.cwd()) {
 }
 
 //#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/OTLPExporterBase.js
-var OTLPExporterBase;
-var init_OTLPExporterBase = __esmMin((() => {
-	OTLPExporterBase = class {
-		_delegate;
-		constructor(_delegate) {
-			this._delegate = _delegate;
-		}
-		/**
-		* Export items.
-		* @param items
-		* @param resultCallback
-		*/
-		export(items, resultCallback) {
-			this._delegate.export(items, resultCallback);
-		}
-		forceFlush() {
-			return this._delegate.forceFlush();
-		}
-		shutdown() {
-			return this._delegate.shutdown();
-		}
-	};
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/types.js
-var OTLPExporterError;
-var init_types$1 = __esmMin((() => {
-	OTLPExporterError = class extends Error {
-		code;
-		name = "OTLPExporterError";
-		data;
-		constructor(message, code, data) {
-			super(message);
-			this.data = data;
-			this.code = code;
-		}
-	};
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/shared-configuration.js
-function validateTimeoutMillis(timeoutMillis) {
-	if (Number.isFinite(timeoutMillis) && timeoutMillis > 0) return timeoutMillis;
-	throw new Error(`Configuration: timeoutMillis is invalid, expected number greater than 0 (actual: '${timeoutMillis}')`);
+//#region src/util.ts
+let DEBUG = false;
+function setDebug(b) {
+	DEBUG = b;
 }
-function wrapStaticHeadersInFunction(headers) {
-	if (headers == null) return;
-	return () => headers;
+function debugLog(...args) {
+	if (DEBUG) console.error("[traceroot-codex]", ...args);
+}
+async function readStdin() {
+	const chunks = [];
+	for await (const c of process.stdin) chunks.push(c);
+	const raw = Buffer.concat(chunks).toString("utf-8").trim();
+	return JSON.parse(raw || "{}");
+}
+function truncate(s, max) {
+	if (s.length <= max) return s;
+	return `${s.slice(0, max)}…[truncated ${s.length - max} chars]`;
+}
+/** `v` as text, a string as-is and anything else as JSON, cut at `max` characters. */
+const str = (v, max) => truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
+
+//#endregion
+//#region src/drainer.ts
+/** The argument that makes the bundle drain a session instead of handling a hook. */
+const DRAIN_ARG = "--drain";
+/**
+* Starts a drainer for the hook's session (see drainSession): this bundle again, in
+* a process that keeps running after the hook exits. Codex reads a hook's output
+* until it closes and, when a hook times out, kills the hook's process group, so
+* the drainer shares neither: it has no stdio and, outside Windows, a session of
+* its own. On Windows it stays in the hook's job, which Codex keeps once the hook
+* exits normally, as a hook does right after starting it.
+*/
+function spawnDrainer(hook, entry = fileURLToPath(import.meta.url)) {
+	const session = JSON.stringify({
+		transcript_path: hook.transcript_path,
+		cwd: hook.cwd
+	});
+	try {
+		const child = spawn(process.execPath, [
+			entry,
+			DRAIN_ARG,
+			session
+		], {
+			detached: true,
+			stdio: "ignore",
+			windowsHide: true
+		});
+		child.on("error", (error) => debugLog("could not start a drainer:", error));
+		child.unref();
+	} catch (error) {
+		debugLog("could not start a drainer:", error);
+	}
+}
+
+//#endregion
+//#region src/size.ts
+const SPAN_OVERHEAD_BYTES = 256;
+const ATTRIBUTE_OVERHEAD_BYTES = 32;
+const utf8Bytes = (s) => Buffer.byteLength(s, "utf8");
+function valueBytes(value) {
+	if (typeof value === "string") return utf8Bytes(value);
+	if (Array.isArray(value)) return value.reduce((n, v) => n + ATTRIBUTE_OVERHEAD_BYTES + valueBytes(v), 0);
+	return 10;
+}
+/** Estimated serialized size of span attributes, never below the real size. */
+function attributesBytes(attributes) {
+	let n = 0;
+	for (const [key, value] of Object.entries(attributes)) n += ATTRIBUTE_OVERHEAD_BYTES + utf8Bytes(key) + valueBytes(value);
+	return n;
+}
+const traceStateBytes = (state) => utf8Bytes(state?.serialize() ?? "");
+/** Estimated size `span` adds to an OTLP protobuf request, never below the real size. */
+function estimateSpanBytes(span) {
+	let n = SPAN_OVERHEAD_BYTES + valueBytes(span.name) + utf8Bytes(span.status.message ?? "") + traceStateBytes(span.spanContext().traceState) + attributesBytes(span.attributes);
+	for (const event of span.events) n += SPAN_OVERHEAD_BYTES + utf8Bytes(event.name) + attributesBytes(event.attributes ?? {});
+	for (const link of span.links) n += SPAN_OVERHEAD_BYTES + traceStateBytes(link.context.traceState) + attributesBytes(link.attributes ?? {});
+	return n;
 }
 /**
-* @param userProvidedConfiguration  Configuration options provided by the user in code.
-* @param fallbackConfiguration Fallback to use when the {@link userProvidedConfiguration} does not specify an option.
-* @param defaultConfiguration The defaults as defined by the exporter specification
+* Splits `spans`, keeping their order, into groups of at most `maxSpans` spans whose
+* estimated size stays within `maxBytes`. A span larger than `maxBytes` on its own
+* forms its own group.
 */
-function mergeOtlpSharedConfigurationWithDefaults(userProvidedConfiguration, fallbackConfiguration, defaultConfiguration) {
-	return {
-		timeoutMillis: validateTimeoutMillis(userProvidedConfiguration.timeoutMillis ?? fallbackConfiguration.timeoutMillis ?? defaultConfiguration.timeoutMillis),
-		concurrencyLimit: userProvidedConfiguration.concurrencyLimit ?? fallbackConfiguration.concurrencyLimit ?? defaultConfiguration.concurrencyLimit,
-		compression: userProvidedConfiguration.compression ?? fallbackConfiguration.compression ?? defaultConfiguration.compression
-	};
+function splitBySize(spans, maxBytes, maxSpans = Infinity) {
+	const groups = [];
+	let group = [];
+	let size = 0;
+	for (const span of spans) {
+		const bytes = estimateSpanBytes(span);
+		if (group.length > 0 && (group.length >= maxSpans || size + bytes > maxBytes)) {
+			groups.push(group);
+			group = [];
+			size = 0;
+		}
+		group.push(span);
+		size += bytes;
+	}
+	if (group.length > 0) groups.push(group);
+	return groups;
 }
-function getSharedConfigurationDefaults() {
-	return {
-		timeoutMillis: 1e4,
-		concurrencyLimit: 30,
-		compression: "none"
-	};
-}
-var init_shared_configuration = __esmMin((() => {}));
 
 //#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/legacy-node-configuration.js
-var CompressionAlgorithm;
-var init_legacy_node_configuration = __esmMin((() => {
-	;
-	(function(CompressionAlgorithm$1) {
-		CompressionAlgorithm$1["NONE"] = "none";
-		CompressionAlgorithm$1["GZIP"] = "gzip";
-	})(CompressionAlgorithm || (CompressionAlgorithm = {}));
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/bounded-queue-export-promise-handler.js
+//#region src/images.ts
+const IMAGE_DATA_URL = /data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/]+={0,2}/g;
+const WHOLE_IMAGE_DATA_URL = /* @__PURE__ */ new RegExp(`^(?:${IMAGE_DATA_URL.source})$`);
+/** Stands in for a prompt image in the turn span, which is sent again on every hook. */
+const FIRST_CALL_IMAGE = "[image: see first model call]";
 /**
-* Promise queue for keeping track of export promises. Finished promises will be auto-dequeued.
-* Allows for awaiting all promises in the queue.
+* Stands in, in the turn span, for an image the model call with this step index
+* got with the user message before it.
 */
-function createBoundedQueueExportPromiseHandler(options) {
-	return new BoundedQueueExportPromiseHandler(options.concurrencyLimit);
+const modelCallImage = (stepIndex) => stepIndex === 0 ? FIRST_CALL_IMAGE : `[image: see model call ${stepIndex}]`;
+/** Stands in for a tool's image in the next model call's input. */
+const toolCallImage = (callId) => `[image: see tool call ${callId}]`;
+const KEPT = new RegExp(`${IMAGE_DATA_URL.source}|\\[image: see (?:first model call|model call \\d{1,9}|tool call [^\\]\\s]{1,200})\\]`, "g");
+const SPARE_CHARS_PER_IMAGE = 64;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_SPAN_BYTES = 8 * 1024 * 1024;
+const OVERSIZE_IMAGE = "[image omitted: larger than 5 MiB]";
+const SPAN_TOO_LARGE_IMAGE = "[image omitted: span larger than 8 MiB]";
+/** Whether `s` is exactly one base64 image data URL in a format kept whole. */
+const isImageDataUrl = (s) => WHOLE_IMAGE_DATA_URL.test(s);
+/** The image data URLs in a span attribute's text. */
+const imagesIn = (text) => new Set(typeof text === "string" ? text.match(IMAGE_DATA_URL) : []);
+/** Decoded size of a base64 data URL's payload, in bytes. */
+function decodedBytes(dataUrl) {
+	const payload = dataUrl.slice(dataUrl.indexOf(",") + 1);
+	const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+	return Math.floor(payload.length * 3 / 4) - padding;
 }
-var BoundedQueueExportPromiseHandler;
-var init_bounded_queue_export_promise_handler = __esmMin((() => {
-	BoundedQueueExportPromiseHandler = class {
-		_concurrencyLimit;
-		_sendingPromises = [];
-		/**
-		* @param concurrencyLimit maximum promises allowed in a queue at the same time.
-		*/
-		constructor(concurrencyLimit) {
-			this._concurrencyLimit = concurrencyLimit;
-		}
-		pushPromise(promise) {
-			if (this.hasReachedLimit()) throw new Error("Concurrency Limit reached");
-			this._sendingPromises.push(promise);
-			const popPromise = () => {
-				const index = this._sendingPromises.indexOf(promise);
-				this._sendingPromises.splice(index, 1);
-			};
-			promise.then(popPromise, popPromise);
-		}
-		hasReachedLimit() {
-			return this._sendingPromises.length >= this._concurrencyLimit;
-		}
-		async awaitAll() {
-			await Promise.all(this._sendingPromises);
-		}
+/** Applies `fn` to every string in a JSON value, keeping its shape. */
+function mapStrings(value, fn) {
+	if (typeof value === "string") return fn(value);
+	if (Array.isArray(value)) return value.map((v) => mapStrings(v, fn));
+	if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mapStrings(v, fn)]));
+	return value;
+}
+/**
+* Cuts `text` to what is left of the budget, unless the cut marker would be longer
+* than the text it drops. Once the budget is spent, that shorter form comes out of
+* the spare characters, and the text is emptied when they run out.
+*/
+function capText(text, budget) {
+	const cut = truncate(text, budget.left);
+	const shorter = cut.length < text.length ? cut : text;
+	if (budget.left > 0) {
+		budget.left = Math.max(0, budget.left - text.length);
+		return shorter;
+	}
+	if (shorter.length > budget.spare) return "";
+	budget.spare -= shorter.length;
+	return shorter;
+}
+function capString(s, budget) {
+	let out = "";
+	let at = 0;
+	for (const m of s.matchAll(KEPT)) {
+		const oversize = m[0].startsWith("data:") && decodedBytes(m[0]) > MAX_IMAGE_BYTES;
+		out += capText(s.slice(at, m.index), budget) + (oversize ? OVERSIZE_IMAGE : m[0]);
+		at = m.index + m[0].length;
+	}
+	return out + capText(s.slice(at), budget);
+}
+/** `text` parsed, when it is a serialized JSON array or object; otherwise undefined. */
+function parseJsonContainer(text) {
+	if (!/^\s*[[{]/.test(text)) return void 0;
+	try {
+		const parsed = JSON.parse(text);
+		return parsed !== null && typeof parsed === "object" ? parsed : void 0;
+	} catch {
+		return;
+	}
+}
+/**
+* `value` serialized with its strings cut one by one, so JSON stays valid. The
+* keys, numbers and punctuation around the strings count toward the budget
+* first, as they do in the plain cut. When they alone pass it, returns
+* undefined: only cutting the serialized text as one string keeps it in budget.
+*/
+function capStrings(value, budget) {
+	const structure = JSON.stringify(mapStrings(value, () => "")).length;
+	if (structure > budget.left) return void 0;
+	budget.left -= structure;
+	return JSON.stringify(mapStrings(value, (s) => capString(s, budget)));
+}
+/**
+* Serializes `value` for a span attribute and caps it at `max` characters like
+* the plain cut, but keeps image data URLs and the placeholders that point at
+* them whole: everything else counts toward `max`, and strings are cut one by
+* one so JSON stays valid. Once `max` is spent, the strings after it share 64
+* characters per image, so many short strings can't carry the text past `max`.
+* An image over 5 MiB decoded becomes a placeholder. A value without images or
+* placeholders is cut exactly as the plain cut does.
+*/
+function capWithImages(value, max) {
+	const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+	const kept = text.match(KEPT)?.length ?? 0;
+	if (kept === 0) return truncate(text, max);
+	const budget = {
+		left: max,
+		spare: kept * SPARE_CHARS_PER_IMAGE
 	};
-}));
+	const container = typeof value !== "string" ? value : text.replace(KEPT, "").length > max ? parseJsonContainer(text) : void 0;
+	return (container === void 0 ? void 0 : capStrings(container, budget)) ?? capString(text, budget);
+}
+/** What stands in for an image a span left out: over 5 MiB, or dropped so the span fits in 8 MiB. */
+const omittedImage = (url) => decodedBytes(url) > MAX_IMAGE_BYTES ? OVERSIZE_IMAGE : SPAN_TOO_LARGE_IMAGE;
+/**
+* `value` with every image data URL in it replaced by `placeholder`. Given the
+* images the span that `placeholder` points at kept, an image that span left out
+* is replaced by the reason instead, so no placeholder points at a missing image.
+*/
+function replaceImages(value, placeholder, kept) {
+	return mapStrings(value, (s) => s.replace(IMAGE_DATA_URL, (url) => kept === void 0 || kept.has(url) ? placeholder : omittedImage(url)));
+}
+/**
+* Replaces image data URLs in `attributes` with a placeholder, largest first,
+* until the attributes' estimated size is within MAX_SPAN_BYTES.
+*/
+function fitSpanImages(attributes) {
+	let size = attributesBytes(attributes);
+	if (size <= MAX_SPAN_BYTES) return;
+	const images = [];
+	for (const [key, value] of Object.entries(attributes)) {
+		if (typeof value !== "string") continue;
+		for (const m of value.matchAll(IMAGE_DATA_URL)) images.push({
+			key,
+			url: m[0]
+		});
+	}
+	images.sort((a, b) => b.url.length - a.url.length);
+	for (const { key, url } of images) {
+		if (size <= MAX_SPAN_BYTES) break;
+		attributes[key] = attributes[key].replace(url, () => SPAN_TOO_LARGE_IMAGE);
+		size -= url.length - 39;
+	}
+}
+
+//#endregion
+//#region src/content.ts
+/** Image capture off: every value takes the plain maxChars cut. */
+const textPolicy = {
+	io: str,
+	callInput: (text) => text,
+	fedBack: (tc) => tc.output,
+	turnInput: (userInput) => userInput,
+	fit: () => {},
+	toolMeta: () => {}
+};
+/** `text`, then `images` as content items like a Codex user message; just `text` without images. */
+const withImages = (text, images) => images.length === 0 ? text : [...text ? [{
+	type: "input_text",
+	text
+}] : [], ...images.map((url) => ({
+	type: "input_image",
+	image_url: url
+}))];
+/** Image capture on: images stay whole, then the largest give way until a span fits in 8 MiB. */
+const imagePolicy = {
+	io: capWithImages,
+	callInput: (text, step) => withImages(text, step.userImages ?? []),
+	fedBack: (tc, toolAttrs) => replaceImages(tc.output, toolCallImage(tc.callId), imagesIn(toolAttrs["traceroot.span.output"])),
+	turnInput(userInput, calls) {
+		const turnImages = [];
+		let firstCallImages;
+		for (const [step, attrs] of calls) {
+			const kept = imagesIn(attrs["traceroot.span.input"]);
+			if (step.index === 0) firstCallImages = kept;
+			for (const url of step.userImages ?? []) turnImages.push(kept.has(url) ? modelCallImage(step.index) : omittedImage(url));
+		}
+		return withImages(replaceImages(userInput, FIRST_CALL_IMAGE, firstCallImages), turnImages);
+	},
+	fit: fitSpanImages,
+	toolMeta: (tc, meta) => {
+		meta["call_id"] = tc.callId;
+	}
+};
 
 //#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+api@1.9.1/node_modules/@opentelemetry/api/build/esm/version.js
@@ -362,7 +524,7 @@ var init_ComponentLogger = __esmMin((() => {
 //#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+api@1.9.1/node_modules/@opentelemetry/api/build/esm/diag/types.js
 var DiagLogLevel;
-var init_types = __esmMin((() => {
+var init_types$1 = __esmMin((() => {
 	;
 	(function(DiagLogLevel$1) {
 		/** Diagnostic Logging level setting to disable all logging (except and forced logs) */
@@ -405,7 +567,7 @@ function createLogLevelDiagLogger(maxLevel, logger) {
 	};
 }
 var init_logLevelLogger = __esmMin((() => {
-	init_types();
+	init_types$1();
 }));
 
 //#endregion
@@ -414,7 +576,7 @@ var API_NAME$4, DiagAPI;
 var init_diag = __esmMin((() => {
 	init_ComponentLogger();
 	init_logLevelLogger();
-	init_types();
+	init_types$1();
 	init_global_utils();
 	API_NAME$4 = "diag";
 	DiagAPI = class DiagAPI {
@@ -1750,7 +1912,7 @@ var init_esm$2 = __esmMin((() => {
 	init_utils$2();
 	init_context$1();
 	init_consoleLogger();
-	init_types();
+	init_types$1();
 	init_NoopMeter();
 	init_Metric();
 	init_TextMapPropagator();
@@ -4599,9 +4761,9 @@ var require_ExportResult = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.ExportResultCode = void 0;
 	var ExportResultCode;
-	(function(ExportResultCode$1) {
-		ExportResultCode$1[ExportResultCode$1["SUCCESS"] = 0] = "SUCCESS";
-		ExportResultCode$1[ExportResultCode$1["FAILED"] = 1] = "FAILED";
+	(function(ExportResultCode$2) {
+		ExportResultCode$2[ExportResultCode$2["SUCCESS"] = 0] = "SUCCESS";
+		ExportResultCode$2[ExportResultCode$2["FAILED"] = 1] = "FAILED";
 	})(ExportResultCode || (exports.ExportResultCode = ExportResultCode = {}));
 }));
 
@@ -5645,6 +5807,128 @@ var require_src$7 = /* @__PURE__ */ __commonJSMin(((exports) => {
 }));
 
 //#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/OTLPExporterBase.js
+var OTLPExporterBase;
+var init_OTLPExporterBase = __esmMin((() => {
+	OTLPExporterBase = class {
+		_delegate;
+		constructor(_delegate) {
+			this._delegate = _delegate;
+		}
+		/**
+		* Export items.
+		* @param items
+		* @param resultCallback
+		*/
+		export(items, resultCallback) {
+			this._delegate.export(items, resultCallback);
+		}
+		forceFlush() {
+			return this._delegate.forceFlush();
+		}
+		shutdown() {
+			return this._delegate.shutdown();
+		}
+	};
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/types.js
+var OTLPExporterError;
+var init_types = __esmMin((() => {
+	OTLPExporterError = class extends Error {
+		code;
+		name = "OTLPExporterError";
+		data;
+		constructor(message, code, data) {
+			super(message);
+			this.data = data;
+			this.code = code;
+		}
+	};
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/shared-configuration.js
+function validateTimeoutMillis(timeoutMillis) {
+	if (Number.isFinite(timeoutMillis) && timeoutMillis > 0) return timeoutMillis;
+	throw new Error(`Configuration: timeoutMillis is invalid, expected number greater than 0 (actual: '${timeoutMillis}')`);
+}
+function wrapStaticHeadersInFunction(headers) {
+	if (headers == null) return;
+	return () => headers;
+}
+/**
+* @param userProvidedConfiguration  Configuration options provided by the user in code.
+* @param fallbackConfiguration Fallback to use when the {@link userProvidedConfiguration} does not specify an option.
+* @param defaultConfiguration The defaults as defined by the exporter specification
+*/
+function mergeOtlpSharedConfigurationWithDefaults(userProvidedConfiguration, fallbackConfiguration, defaultConfiguration) {
+	return {
+		timeoutMillis: validateTimeoutMillis(userProvidedConfiguration.timeoutMillis ?? fallbackConfiguration.timeoutMillis ?? defaultConfiguration.timeoutMillis),
+		concurrencyLimit: userProvidedConfiguration.concurrencyLimit ?? fallbackConfiguration.concurrencyLimit ?? defaultConfiguration.concurrencyLimit,
+		compression: userProvidedConfiguration.compression ?? fallbackConfiguration.compression ?? defaultConfiguration.compression
+	};
+}
+function getSharedConfigurationDefaults() {
+	return {
+		timeoutMillis: 1e4,
+		concurrencyLimit: 30,
+		compression: "none"
+	};
+}
+var init_shared_configuration = __esmMin((() => {}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/legacy-node-configuration.js
+var CompressionAlgorithm;
+var init_legacy_node_configuration = __esmMin((() => {
+	;
+	(function(CompressionAlgorithm$1) {
+		CompressionAlgorithm$1["NONE"] = "none";
+		CompressionAlgorithm$1["GZIP"] = "gzip";
+	})(CompressionAlgorithm || (CompressionAlgorithm = {}));
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/bounded-queue-export-promise-handler.js
+/**
+* Promise queue for keeping track of export promises. Finished promises will be auto-dequeued.
+* Allows for awaiting all promises in the queue.
+*/
+function createBoundedQueueExportPromiseHandler(options) {
+	return new BoundedQueueExportPromiseHandler(options.concurrencyLimit);
+}
+var BoundedQueueExportPromiseHandler;
+var init_bounded_queue_export_promise_handler = __esmMin((() => {
+	BoundedQueueExportPromiseHandler = class {
+		_concurrencyLimit;
+		_sendingPromises = [];
+		/**
+		* @param concurrencyLimit maximum promises allowed in a queue at the same time.
+		*/
+		constructor(concurrencyLimit) {
+			this._concurrencyLimit = concurrencyLimit;
+		}
+		pushPromise(promise) {
+			if (this.hasReachedLimit()) throw new Error("Concurrency Limit reached");
+			this._sendingPromises.push(promise);
+			const popPromise = () => {
+				const index = this._sendingPromises.indexOf(promise);
+				this._sendingPromises.splice(index, 1);
+			};
+			promise.then(popPromise, popPromise);
+		}
+		hasReachedLimit() {
+			return this._sendingPromises.length >= this._concurrencyLimit;
+		}
+		async awaitAll() {
+			await Promise.all(this._sendingPromises);
+		}
+	};
+}));
+
+//#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/logging-response-handler.js
 function isPartialSuccessResponse(response) {
 	return Object.prototype.hasOwnProperty.call(response, "partialSuccess");
@@ -5671,10 +5955,10 @@ var init_logging_response_handler = __esmMin((() => {
 function createOtlpExportDelegate(components, settings) {
 	return new OTLPExportDelegate(components.transport, components.serializer, createLoggingPartialSuccessResponseHandler(), components.promiseHandler, settings.timeout);
 }
-var import_src$3, OTLPExportDelegate;
+var import_src$4, OTLPExportDelegate;
 var init_otlp_export_delegate = __esmMin((() => {
-	import_src$3 = require_src$7();
-	init_types$1();
+	import_src$4 = require_src$7();
+	init_types();
 	init_logging_response_handler();
 	init_esm$2();
 	OTLPExportDelegate = class {
@@ -5696,7 +5980,7 @@ var init_otlp_export_delegate = __esmMin((() => {
 			this._diagLogger.debug("items to be sent", internalRepresentation);
 			if (this._promiseQueue.hasReachedLimit()) {
 				resultCallback({
-					code: import_src$3.ExportResultCode.FAILED,
+					code: import_src$4.ExportResultCode.FAILED,
 					error: /* @__PURE__ */ new Error("Concurrent export limit reached")
 				});
 				return;
@@ -5704,7 +5988,7 @@ var init_otlp_export_delegate = __esmMin((() => {
 			const serializedRequest = this._serializer.serializeRequest(internalRepresentation);
 			if (serializedRequest == null) {
 				resultCallback({
-					code: import_src$3.ExportResultCode.FAILED,
+					code: import_src$4.ExportResultCode.FAILED,
 					error: /* @__PURE__ */ new Error("Nothing to send")
 				});
 				return;
@@ -5716,24 +6000,24 @@ var init_otlp_export_delegate = __esmMin((() => {
 					} catch (e) {
 						this._diagLogger.warn("Export succeeded but could not deserialize response - is the response specification compliant?", e, response.data);
 					}
-					resultCallback({ code: import_src$3.ExportResultCode.SUCCESS });
+					resultCallback({ code: import_src$4.ExportResultCode.SUCCESS });
 					return;
 				} else if (response.status === "failure" && response.error) {
 					resultCallback({
-						code: import_src$3.ExportResultCode.FAILED,
+						code: import_src$4.ExportResultCode.FAILED,
 						error: response.error
 					});
 					return;
 				} else if (response.status === "retryable") resultCallback({
-					code: import_src$3.ExportResultCode.FAILED,
+					code: import_src$4.ExportResultCode.FAILED,
 					error: new OTLPExporterError("Export failed with retryable status")
 				});
 				else resultCallback({
-					code: import_src$3.ExportResultCode.FAILED,
+					code: import_src$4.ExportResultCode.FAILED,
 					error: new OTLPExporterError("Export failed with unknown error")
 				});
 			}, (reason) => resultCallback({
-				code: import_src$3.ExportResultCode.FAILED,
+				code: import_src$4.ExportResultCode.FAILED,
 				error: reason
 			})));
 		}
@@ -5774,7 +6058,7 @@ var esm_exports = /* @__PURE__ */ __exportAll({
 });
 var init_esm = __esmMin((() => {
 	init_OTLPExporterBase();
-	init_types$1();
+	init_types();
 	init_shared_configuration();
 	init_legacy_node_configuration();
 	init_otlp_network_export_delegate();
@@ -27061,7 +27345,7 @@ function readableFromUint8Array(buff) {
 }
 var init_http_transport_utils = __esmMin((() => {
 	init_is_export_retryable();
-	init_types$1();
+	init_types();
 }));
 
 //#endregion
@@ -27216,12 +27500,12 @@ var init_shared_env_configuration = __esmMin((() => {
 //#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+otlp-exporter-base@0.205.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/otlp-exporter-base/build/esm/configuration/otlp-node-http-env-configuration.js
 function getStaticHeadersFromEnv(signalIdentifier) {
-	const signalSpecificRawHeaders = (0, import_src$2.getStringFromEnv)(`OTEL_EXPORTER_OTLP_${signalIdentifier}_HEADERS`);
-	const nonSignalSpecificRawHeaders = (0, import_src$2.getStringFromEnv)("OTEL_EXPORTER_OTLP_HEADERS");
-	const signalSpecificHeaders = (0, import_src$2.parseKeyPairsIntoRecord)(signalSpecificRawHeaders);
-	const nonSignalSpecificHeaders = (0, import_src$2.parseKeyPairsIntoRecord)(nonSignalSpecificRawHeaders);
+	const signalSpecificRawHeaders = (0, import_src$3.getStringFromEnv)(`OTEL_EXPORTER_OTLP_${signalIdentifier}_HEADERS`);
+	const nonSignalSpecificRawHeaders = (0, import_src$3.getStringFromEnv)("OTEL_EXPORTER_OTLP_HEADERS");
+	const signalSpecificHeaders = (0, import_src$3.parseKeyPairsIntoRecord)(signalSpecificRawHeaders);
+	const nonSignalSpecificHeaders = (0, import_src$3.parseKeyPairsIntoRecord)(nonSignalSpecificRawHeaders);
 	if (Object.keys(signalSpecificHeaders).length === 0 && Object.keys(nonSignalSpecificHeaders).length === 0) return;
-	return Object.assign({}, (0, import_src$2.parseKeyPairsIntoRecord)(nonSignalSpecificRawHeaders), (0, import_src$2.parseKeyPairsIntoRecord)(signalSpecificRawHeaders));
+	return Object.assign({}, (0, import_src$3.parseKeyPairsIntoRecord)(nonSignalSpecificRawHeaders), (0, import_src$3.parseKeyPairsIntoRecord)(signalSpecificRawHeaders));
 }
 function appendRootPathToUrlIfNeeded(url) {
 	try {
@@ -27249,12 +27533,12 @@ function appendResourcePathToUrl(url, path$1) {
 	return url;
 }
 function getNonSpecificUrlFromEnv(signalResourcePath) {
-	const envUrl = (0, import_src$2.getStringFromEnv)("OTEL_EXPORTER_OTLP_ENDPOINT");
+	const envUrl = (0, import_src$3.getStringFromEnv)("OTEL_EXPORTER_OTLP_ENDPOINT");
 	if (envUrl === void 0) return;
 	return appendResourcePathToUrl(envUrl, signalResourcePath);
 }
 function getSpecificUrlFromEnv(signalIdentifier) {
-	const envUrl = (0, import_src$2.getStringFromEnv)(`OTEL_EXPORTER_OTLP_${signalIdentifier}_ENDPOINT`);
+	const envUrl = (0, import_src$3.getStringFromEnv)(`OTEL_EXPORTER_OTLP_${signalIdentifier}_ENDPOINT`);
 	if (envUrl === void 0) return;
 	return appendRootPathToUrlIfNeeded(envUrl);
 }
@@ -27271,9 +27555,9 @@ function getNodeHttpConfigurationFromEnvironment(signalIdentifier, signalResourc
 		headers: wrapStaticHeadersInFunction(getStaticHeadersFromEnv(signalIdentifier))
 	};
 }
-var import_src$2;
+var import_src$3;
 var init_otlp_node_http_env_configuration = __esmMin((() => {
-	import_src$2 = require_src$7();
+	import_src$3 = require_src$7();
 	init_esm$2();
 	init_shared_env_configuration();
 	init_shared_configuration();
@@ -27393,6 +27677,345 @@ var require_src$3 = /* @__PURE__ */ __commonJSMin(((exports) => {
 		enumerable: true,
 		get: function() {
 			return platform_1.OTLPTraceExporter;
+		}
+	});
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AbstractAsyncHooksContextManager.js
+var require_AbstractAsyncHooksContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
+	Object.defineProperty(exports, "__esModule", { value: true });
+	exports.AbstractAsyncHooksContextManager = void 0;
+	const events_1 = __require("events");
+	const ADD_LISTENER_METHODS = [
+		"addListener",
+		"on",
+		"once",
+		"prependListener",
+		"prependOnceListener"
+	];
+	var AbstractAsyncHooksContextManager = class {
+		/**
+		* Binds a the certain context or the active one to the target function and then returns the target
+		* @param context A context (span) to be bind to target
+		* @param target a function or event emitter. When target or one of its callbacks is called,
+		*  the provided context will be used as the active context for the duration of the call.
+		*/
+		bind(context$1, target) {
+			if (target instanceof events_1.EventEmitter) return this._bindEventEmitter(context$1, target);
+			if (typeof target === "function") return this._bindFunction(context$1, target);
+			return target;
+		}
+		_bindFunction(context$1, target) {
+			const manager = this;
+			const contextWrapper = function(...args) {
+				return manager.with(context$1, () => target.apply(this, args));
+			};
+			Object.defineProperty(contextWrapper, "length", {
+				enumerable: false,
+				configurable: true,
+				writable: false,
+				value: target.length
+			});
+			/**
+			* It isn't possible to tell Typescript that contextWrapper is the same as T
+			* so we forced to cast as any here.
+			*/
+			return contextWrapper;
+		}
+		/**
+		* By default, EventEmitter call their callback with their context, which we do
+		* not want, instead we will bind a specific context to all callbacks that
+		* go through it.
+		* @param context the context we want to bind
+		* @param ee EventEmitter an instance of EventEmitter to patch
+		*/
+		_bindEventEmitter(context$1, ee) {
+			if (this._getPatchMap(ee) !== void 0) return ee;
+			this._createPatchMap(ee);
+			ADD_LISTENER_METHODS.forEach((methodName) => {
+				if (ee[methodName] === void 0) return;
+				ee[methodName] = this._patchAddListener(ee, ee[methodName], context$1);
+			});
+			if (typeof ee.removeListener === "function") ee.removeListener = this._patchRemoveListener(ee, ee.removeListener);
+			if (typeof ee.off === "function") ee.off = this._patchRemoveListener(ee, ee.off);
+			if (typeof ee.removeAllListeners === "function") ee.removeAllListeners = this._patchRemoveAllListeners(ee, ee.removeAllListeners);
+			return ee;
+		}
+		/**
+		* Patch methods that remove a given listener so that we match the "patched"
+		* version of that listener (the one that propagate context).
+		* @param ee EventEmitter instance
+		* @param original reference to the patched method
+		*/
+		_patchRemoveListener(ee, original) {
+			const contextManager = this;
+			return function(event, listener) {
+				const events = contextManager._getPatchMap(ee)?.[event];
+				if (events === void 0) return original.call(this, event, listener);
+				const patchedListener = events.get(listener);
+				return original.call(this, event, patchedListener || listener);
+			};
+		}
+		/**
+		* Patch methods that remove all listeners so we remove our
+		* internal references for a given event.
+		* @param ee EventEmitter instance
+		* @param original reference to the patched method
+		*/
+		_patchRemoveAllListeners(ee, original) {
+			const contextManager = this;
+			return function(event) {
+				const map = contextManager._getPatchMap(ee);
+				if (map !== void 0) {
+					if (arguments.length === 0) contextManager._createPatchMap(ee);
+					else if (map[event] !== void 0) delete map[event];
+				}
+				return original.apply(this, arguments);
+			};
+		}
+		/**
+		* Patch methods on an event emitter instance that can add listeners so we
+		* can force them to propagate a given context.
+		* @param ee EventEmitter instance
+		* @param original reference to the patched method
+		* @param [context] context to propagate when calling listeners
+		*/
+		_patchAddListener(ee, original, context$1) {
+			const contextManager = this;
+			return function(event, listener) {
+				/**
+				* This check is required to prevent double-wrapping the listener.
+				* The implementation for ee.once wraps the listener and calls ee.on.
+				* Without this check, we would wrap that wrapped listener.
+				* This causes an issue because ee.removeListener depends on the onceWrapper
+				* to properly remove the listener. If we wrap their wrapper, we break
+				* that detection.
+				*/
+				if (contextManager._wrapped) return original.call(this, event, listener);
+				let map = contextManager._getPatchMap(ee);
+				if (map === void 0) map = contextManager._createPatchMap(ee);
+				let listeners = map[event];
+				if (listeners === void 0) {
+					listeners = /* @__PURE__ */ new WeakMap();
+					map[event] = listeners;
+				}
+				const patchedListener = contextManager.bind(context$1, listener);
+				listeners.set(listener, patchedListener);
+				/**
+				* See comment at the start of this function for the explanation of this property.
+				*/
+				contextManager._wrapped = true;
+				try {
+					return original.call(this, event, patchedListener);
+				} finally {
+					contextManager._wrapped = false;
+				}
+			};
+		}
+		_createPatchMap(ee) {
+			const map = Object.create(null);
+			ee[this._kOtListeners] = map;
+			return map;
+		}
+		_getPatchMap(ee) {
+			return ee[this._kOtListeners];
+		}
+		_kOtListeners = Symbol("OtListeners");
+		_wrapped = false;
+	};
+	exports.AbstractAsyncHooksContextManager = AbstractAsyncHooksContextManager;
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AsyncHooksContextManager.js
+var require_AsyncHooksContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
+	Object.defineProperty(exports, "__esModule", { value: true });
+	exports.AsyncHooksContextManager = void 0;
+	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
+	const asyncHooks = __require("async_hooks");
+	const AbstractAsyncHooksContextManager_1 = require_AbstractAsyncHooksContextManager();
+	/**
+	* @deprecated Use AsyncLocalStorageContextManager instead.
+	*/
+	var AsyncHooksContextManager = class extends AbstractAsyncHooksContextManager_1.AbstractAsyncHooksContextManager {
+		_asyncHook;
+		_contexts = /* @__PURE__ */ new Map();
+		_stack = [];
+		constructor() {
+			super();
+			this._asyncHook = asyncHooks.createHook({
+				init: this._init.bind(this),
+				before: this._before.bind(this),
+				after: this._after.bind(this),
+				destroy: this._destroy.bind(this),
+				promiseResolve: this._destroy.bind(this)
+			});
+		}
+		active() {
+			return this._stack[this._stack.length - 1] ?? api_1.ROOT_CONTEXT;
+		}
+		with(context$1, fn, thisArg, ...args) {
+			this._enterContext(context$1);
+			try {
+				return fn.call(thisArg, ...args);
+			} finally {
+				this._exitContext();
+			}
+		}
+		enable() {
+			this._asyncHook.enable();
+			return this;
+		}
+		disable() {
+			this._asyncHook.disable();
+			this._contexts.clear();
+			this._stack = [];
+			return this;
+		}
+		/**
+		* Init hook will be called when userland create a async context, setting the
+		* context as the current one if it exist.
+		* @param uid id of the async context
+		* @param type the resource type
+		*/
+		_init(uid, type) {
+			if (type === "TIMERWRAP") return;
+			const context$1 = this._stack[this._stack.length - 1];
+			if (context$1 !== void 0) this._contexts.set(uid, context$1);
+		}
+		/**
+		* Destroy hook will be called when a given context is no longer used so we can
+		* remove its attached context.
+		* @param uid uid of the async context
+		*/
+		_destroy(uid) {
+			this._contexts.delete(uid);
+		}
+		/**
+		* Before hook is called just before executing a async context.
+		* @param uid uid of the async context
+		*/
+		_before(uid) {
+			const context$1 = this._contexts.get(uid);
+			if (context$1 !== void 0) this._enterContext(context$1);
+		}
+		/**
+		* After hook is called just after completing the execution of a async context.
+		*/
+		_after() {
+			this._exitContext();
+		}
+		/**
+		* Set the given context as active
+		*/
+		_enterContext(context$1) {
+			this._stack.push(context$1);
+		}
+		/**
+		* Remove the context at the root of the stack
+		*/
+		_exitContext() {
+			this._stack.pop();
+		}
+	};
+	exports.AsyncHooksContextManager = AsyncHooksContextManager;
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AsyncLocalStorageContextManager.js
+var require_AsyncLocalStorageContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
+	Object.defineProperty(exports, "__esModule", { value: true });
+	exports.AsyncLocalStorageContextManager = void 0;
+	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
+	const async_hooks_1 = __require("async_hooks");
+	const AbstractAsyncHooksContextManager_1 = require_AbstractAsyncHooksContextManager();
+	/**
+	* Wrapper around a token and _asyncLocalStorage to mirror the behavior of
+	* a Node.js RunScope
+	*
+	* @internal not intended for direct public consumption. Will be removed once
+	* withScope is available on all supported Node.js versions
+	*/
+	var DisposeOnceToken = class {
+		_isDisposed = false;
+		_previousContext;
+		_asyncLocalStorage;
+		constructor(previousContext, asyncLocalStorage) {
+			this._previousContext = previousContext;
+			this._asyncLocalStorage = asyncLocalStorage;
+		}
+		dispose() {
+			if (this._isDisposed) return;
+			this._asyncLocalStorage.enterWith(this._previousContext);
+			this._isDisposed = true;
+		}
+	};
+	var AsyncLocalStorageContextManager = class extends AbstractAsyncHooksContextManager_1.AbstractAsyncHooksContextManager {
+		_asyncLocalStorage;
+		constructor() {
+			super();
+			this._asyncLocalStorage = new async_hooks_1.AsyncLocalStorage();
+		}
+		active() {
+			return this._asyncLocalStorage.getStore() ?? api_1.ROOT_CONTEXT;
+		}
+		with(context$1, fn, thisArg, ...args) {
+			const cb = thisArg == null ? fn : fn.bind(thisArg);
+			return this._asyncLocalStorage.run(context$1, cb, ...args);
+		}
+		enable() {
+			return this;
+		}
+		disable() {
+			this._asyncLocalStorage.disable();
+			return this;
+		}
+		/**
+		* Imperatively sets `context` as active for the current async execution chain
+		* and operations spawned from it. Returns a {@link ContextManagementToken} whose `dispose()`
+		* restores the previous context (see {@link ContextManager.attach}).
+		*
+		* On Node.js 25.9+, delegates to `AsyncLocalStorage.withScope()` which returns
+		* a native `RunScope`. On older Node.js versions, falls back to `enterWith()` with
+		* a manual token.
+		*
+		* **Caveat for async functions:** Both `withScope()` and `enterWith()` affect the
+		* entire current async execution chain. If `attach()` is called inside an async
+		* function before the first `await`, the context change will leak into the caller's
+		* context and remain active there until something else restores it. Prefer `with()`
+		* for async code.
+		*
+		* @experimental This API is experimental and may change in minor releases without prior notice.
+		*/
+		attach(context$1) {
+			const withScope = this._asyncLocalStorage.withScope;
+			if (withScope) return withScope.call(this._asyncLocalStorage, context$1);
+			const previousContext = this.active();
+			this._asyncLocalStorage.enterWith(context$1);
+			return new DisposeOnceToken(previousContext, this._asyncLocalStorage);
+		}
+	};
+	exports.AsyncLocalStorageContextManager = AsyncLocalStorageContextManager;
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/index.js
+var require_src$2 = /* @__PURE__ */ __commonJSMin(((exports) => {
+	Object.defineProperty(exports, "__esModule", { value: true });
+	exports.AsyncLocalStorageContextManager = exports.AsyncHooksContextManager = void 0;
+	var AsyncHooksContextManager_1 = require_AsyncHooksContextManager();
+	Object.defineProperty(exports, "AsyncHooksContextManager", {
+		enumerable: true,
+		get: function() {
+			return AsyncHooksContextManager_1.AsyncHooksContextManager;
+		}
+	});
+	var AsyncLocalStorageContextManager_1 = require_AsyncLocalStorageContextManager();
+	Object.defineProperty(exports, "AsyncLocalStorageContextManager", {
+		enumerable: true,
+		get: function() {
+			return AsyncLocalStorageContextManager_1.AsyncLocalStorageContextManager;
 		}
 	});
 }));
@@ -28915,7 +29538,7 @@ var require_TraceIdRatioBasedSampler = /* @__PURE__ */ __commonJSMin(((exports) 
 
 //#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+sdk-trace@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/sdk-trace/build/src/index.js
-var require_src$2 = /* @__PURE__ */ __commonJSMin(((exports) => {
+var require_src$1 = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.SamplingDecision = exports.TraceIdRatioBasedSampler = exports.ParentBasedSampler = exports.createAlwaysRecordSampler = exports.AlwaysOnSampler = exports.AlwaysOffSampler = exports.NoopSpanProcessor = exports.SimpleSpanProcessor = exports.InMemorySpanExporter = exports.ConsoleSpanExporter = exports.RandomIdGenerator = exports.BatchSpanProcessor = exports.TracerProvider = void 0;
 	var TracerProvider_1 = require_TracerProvider();
@@ -29017,7 +29640,7 @@ var require_config = /* @__PURE__ */ __commonJSMin(((exports) => {
 	exports.buildSamplerFromEnv = exports.loadDefaultConfig = void 0;
 	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
 	const core_1 = require_src$7();
-	const sdk_trace_1 = require_src$2();
+	const sdk_trace_1 = require_src$1();
 	var TracesSamplerValues;
 	(function(TracesSamplerValues) {
 		TracesSamplerValues["AlwaysOff"] = "always_off";
@@ -29121,7 +29744,7 @@ var require_BasicTracerProvider_shim = /* @__PURE__ */ __commonJSMin(((exports) 
 	const core_1 = require_src$7();
 	const config_1 = require_config();
 	const utility_1 = require_utility();
-	const sdk_trace_1 = require_src$2();
+	const sdk_trace_1 = require_src$1();
 	/**
 	* A TracerProvider implementation that reads configuration defaults from
 	* OTEL_* environment variables per
@@ -29143,7 +29766,7 @@ var require_BatchSpanProcessor_shim = /* @__PURE__ */ __commonJSMin(((exports) =
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.BatchSpanProcessor = void 0;
 	const core_1 = require_src$7();
-	const sdk_trace_1 = require_src$2();
+	const sdk_trace_1 = require_src$1();
 	/**
 	* A BatchSpanProcessor that applies `OTEL_*` environment variable fallbacks per
 	* https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
@@ -29174,7 +29797,7 @@ var require_BatchSpanProcessor_shim = /* @__PURE__ */ __commonJSMin(((exports) =
 var require_SimpleSpanProcessor_shim = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.SimpleSpanProcessor = void 0;
-	const sdk_trace_1 = require_src$2();
+	const sdk_trace_1 = require_src$1();
 	/**
 	* A SimpleSpanProcessor with the old constructor call signature that
 	* takes just a single exporter argument. This version does not support
@@ -29214,7 +29837,7 @@ var require_index_shim = /* @__PURE__ */ __commonJSMin(((exports) => {
 			return SimpleSpanProcessor_shim_1.SimpleSpanProcessor;
 		}
 	});
-	var sdk_trace_1 = require_src$2();
+	var sdk_trace_1 = require_src$1();
 	Object.defineProperty(exports, "ConsoleSpanExporter", {
 		enumerable: true,
 		get: function() {
@@ -29272,350 +29895,11 @@ var require_index_shim = /* @__PURE__ */ __commonJSMin(((exports) => {
 }));
 
 //#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AbstractAsyncHooksContextManager.js
-var require_AbstractAsyncHooksContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
-	Object.defineProperty(exports, "__esModule", { value: true });
-	exports.AbstractAsyncHooksContextManager = void 0;
-	const events_1 = __require("events");
-	const ADD_LISTENER_METHODS = [
-		"addListener",
-		"on",
-		"once",
-		"prependListener",
-		"prependOnceListener"
-	];
-	var AbstractAsyncHooksContextManager = class {
-		/**
-		* Binds a the certain context or the active one to the target function and then returns the target
-		* @param context A context (span) to be bind to target
-		* @param target a function or event emitter. When target or one of its callbacks is called,
-		*  the provided context will be used as the active context for the duration of the call.
-		*/
-		bind(context$1, target) {
-			if (target instanceof events_1.EventEmitter) return this._bindEventEmitter(context$1, target);
-			if (typeof target === "function") return this._bindFunction(context$1, target);
-			return target;
-		}
-		_bindFunction(context$1, target) {
-			const manager = this;
-			const contextWrapper = function(...args) {
-				return manager.with(context$1, () => target.apply(this, args));
-			};
-			Object.defineProperty(contextWrapper, "length", {
-				enumerable: false,
-				configurable: true,
-				writable: false,
-				value: target.length
-			});
-			/**
-			* It isn't possible to tell Typescript that contextWrapper is the same as T
-			* so we forced to cast as any here.
-			*/
-			return contextWrapper;
-		}
-		/**
-		* By default, EventEmitter call their callback with their context, which we do
-		* not want, instead we will bind a specific context to all callbacks that
-		* go through it.
-		* @param context the context we want to bind
-		* @param ee EventEmitter an instance of EventEmitter to patch
-		*/
-		_bindEventEmitter(context$1, ee) {
-			if (this._getPatchMap(ee) !== void 0) return ee;
-			this._createPatchMap(ee);
-			ADD_LISTENER_METHODS.forEach((methodName) => {
-				if (ee[methodName] === void 0) return;
-				ee[methodName] = this._patchAddListener(ee, ee[methodName], context$1);
-			});
-			if (typeof ee.removeListener === "function") ee.removeListener = this._patchRemoveListener(ee, ee.removeListener);
-			if (typeof ee.off === "function") ee.off = this._patchRemoveListener(ee, ee.off);
-			if (typeof ee.removeAllListeners === "function") ee.removeAllListeners = this._patchRemoveAllListeners(ee, ee.removeAllListeners);
-			return ee;
-		}
-		/**
-		* Patch methods that remove a given listener so that we match the "patched"
-		* version of that listener (the one that propagate context).
-		* @param ee EventEmitter instance
-		* @param original reference to the patched method
-		*/
-		_patchRemoveListener(ee, original) {
-			const contextManager = this;
-			return function(event, listener) {
-				const events = contextManager._getPatchMap(ee)?.[event];
-				if (events === void 0) return original.call(this, event, listener);
-				const patchedListener = events.get(listener);
-				return original.call(this, event, patchedListener || listener);
-			};
-		}
-		/**
-		* Patch methods that remove all listeners so we remove our
-		* internal references for a given event.
-		* @param ee EventEmitter instance
-		* @param original reference to the patched method
-		*/
-		_patchRemoveAllListeners(ee, original) {
-			const contextManager = this;
-			return function(event) {
-				const map = contextManager._getPatchMap(ee);
-				if (map !== void 0) {
-					if (arguments.length === 0) contextManager._createPatchMap(ee);
-					else if (map[event] !== void 0) delete map[event];
-				}
-				return original.apply(this, arguments);
-			};
-		}
-		/**
-		* Patch methods on an event emitter instance that can add listeners so we
-		* can force them to propagate a given context.
-		* @param ee EventEmitter instance
-		* @param original reference to the patched method
-		* @param [context] context to propagate when calling listeners
-		*/
-		_patchAddListener(ee, original, context$1) {
-			const contextManager = this;
-			return function(event, listener) {
-				/**
-				* This check is required to prevent double-wrapping the listener.
-				* The implementation for ee.once wraps the listener and calls ee.on.
-				* Without this check, we would wrap that wrapped listener.
-				* This causes an issue because ee.removeListener depends on the onceWrapper
-				* to properly remove the listener. If we wrap their wrapper, we break
-				* that detection.
-				*/
-				if (contextManager._wrapped) return original.call(this, event, listener);
-				let map = contextManager._getPatchMap(ee);
-				if (map === void 0) map = contextManager._createPatchMap(ee);
-				let listeners = map[event];
-				if (listeners === void 0) {
-					listeners = /* @__PURE__ */ new WeakMap();
-					map[event] = listeners;
-				}
-				const patchedListener = contextManager.bind(context$1, listener);
-				listeners.set(listener, patchedListener);
-				/**
-				* See comment at the start of this function for the explanation of this property.
-				*/
-				contextManager._wrapped = true;
-				try {
-					return original.call(this, event, patchedListener);
-				} finally {
-					contextManager._wrapped = false;
-				}
-			};
-		}
-		_createPatchMap(ee) {
-			const map = Object.create(null);
-			ee[this._kOtListeners] = map;
-			return map;
-		}
-		_getPatchMap(ee) {
-			return ee[this._kOtListeners];
-		}
-		_kOtListeners = Symbol("OtListeners");
-		_wrapped = false;
-	};
-	exports.AbstractAsyncHooksContextManager = AbstractAsyncHooksContextManager;
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AsyncHooksContextManager.js
-var require_AsyncHooksContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
-	Object.defineProperty(exports, "__esModule", { value: true });
-	exports.AsyncHooksContextManager = void 0;
-	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
-	const asyncHooks = __require("async_hooks");
-	const AbstractAsyncHooksContextManager_1 = require_AbstractAsyncHooksContextManager();
-	/**
-	* @deprecated Use AsyncLocalStorageContextManager instead.
-	*/
-	var AsyncHooksContextManager = class extends AbstractAsyncHooksContextManager_1.AbstractAsyncHooksContextManager {
-		_asyncHook;
-		_contexts = /* @__PURE__ */ new Map();
-		_stack = [];
-		constructor() {
-			super();
-			this._asyncHook = asyncHooks.createHook({
-				init: this._init.bind(this),
-				before: this._before.bind(this),
-				after: this._after.bind(this),
-				destroy: this._destroy.bind(this),
-				promiseResolve: this._destroy.bind(this)
-			});
-		}
-		active() {
-			return this._stack[this._stack.length - 1] ?? api_1.ROOT_CONTEXT;
-		}
-		with(context$1, fn, thisArg, ...args) {
-			this._enterContext(context$1);
-			try {
-				return fn.call(thisArg, ...args);
-			} finally {
-				this._exitContext();
-			}
-		}
-		enable() {
-			this._asyncHook.enable();
-			return this;
-		}
-		disable() {
-			this._asyncHook.disable();
-			this._contexts.clear();
-			this._stack = [];
-			return this;
-		}
-		/**
-		* Init hook will be called when userland create a async context, setting the
-		* context as the current one if it exist.
-		* @param uid id of the async context
-		* @param type the resource type
-		*/
-		_init(uid, type) {
-			if (type === "TIMERWRAP") return;
-			const context$1 = this._stack[this._stack.length - 1];
-			if (context$1 !== void 0) this._contexts.set(uid, context$1);
-		}
-		/**
-		* Destroy hook will be called when a given context is no longer used so we can
-		* remove its attached context.
-		* @param uid uid of the async context
-		*/
-		_destroy(uid) {
-			this._contexts.delete(uid);
-		}
-		/**
-		* Before hook is called just before executing a async context.
-		* @param uid uid of the async context
-		*/
-		_before(uid) {
-			const context$1 = this._contexts.get(uid);
-			if (context$1 !== void 0) this._enterContext(context$1);
-		}
-		/**
-		* After hook is called just after completing the execution of a async context.
-		*/
-		_after() {
-			this._exitContext();
-		}
-		/**
-		* Set the given context as active
-		*/
-		_enterContext(context$1) {
-			this._stack.push(context$1);
-		}
-		/**
-		* Remove the context at the root of the stack
-		*/
-		_exitContext() {
-			this._stack.pop();
-		}
-	};
-	exports.AsyncHooksContextManager = AsyncHooksContextManager;
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AsyncLocalStorageContextManager.js
-var require_AsyncLocalStorageContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
-	Object.defineProperty(exports, "__esModule", { value: true });
-	exports.AsyncLocalStorageContextManager = void 0;
-	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
-	const async_hooks_1 = __require("async_hooks");
-	const AbstractAsyncHooksContextManager_1 = require_AbstractAsyncHooksContextManager();
-	/**
-	* Wrapper around a token and _asyncLocalStorage to mirror the behavior of
-	* a Node.js RunScope
-	*
-	* @internal not intended for direct public consumption. Will be removed once
-	* withScope is available on all supported Node.js versions
-	*/
-	var DisposeOnceToken = class {
-		_isDisposed = false;
-		_previousContext;
-		_asyncLocalStorage;
-		constructor(previousContext, asyncLocalStorage) {
-			this._previousContext = previousContext;
-			this._asyncLocalStorage = asyncLocalStorage;
-		}
-		dispose() {
-			if (this._isDisposed) return;
-			this._asyncLocalStorage.enterWith(this._previousContext);
-			this._isDisposed = true;
-		}
-	};
-	var AsyncLocalStorageContextManager = class extends AbstractAsyncHooksContextManager_1.AbstractAsyncHooksContextManager {
-		_asyncLocalStorage;
-		constructor() {
-			super();
-			this._asyncLocalStorage = new async_hooks_1.AsyncLocalStorage();
-		}
-		active() {
-			return this._asyncLocalStorage.getStore() ?? api_1.ROOT_CONTEXT;
-		}
-		with(context$1, fn, thisArg, ...args) {
-			const cb = thisArg == null ? fn : fn.bind(thisArg);
-			return this._asyncLocalStorage.run(context$1, cb, ...args);
-		}
-		enable() {
-			return this;
-		}
-		disable() {
-			this._asyncLocalStorage.disable();
-			return this;
-		}
-		/**
-		* Imperatively sets `context` as active for the current async execution chain
-		* and operations spawned from it. Returns a {@link ContextManagementToken} whose `dispose()`
-		* restores the previous context (see {@link ContextManager.attach}).
-		*
-		* On Node.js 25.9+, delegates to `AsyncLocalStorage.withScope()` which returns
-		* a native `RunScope`. On older Node.js versions, falls back to `enterWith()` with
-		* a manual token.
-		*
-		* **Caveat for async functions:** Both `withScope()` and `enterWith()` affect the
-		* entire current async execution chain. If `attach()` is called inside an async
-		* function before the first `await`, the context change will leak into the caller's
-		* context and remain active there until something else restores it. Prefer `with()`
-		* for async code.
-		*
-		* @experimental This API is experimental and may change in minor releases without prior notice.
-		*/
-		attach(context$1) {
-			const withScope = this._asyncLocalStorage.withScope;
-			if (withScope) return withScope.call(this._asyncLocalStorage, context$1);
-			const previousContext = this.active();
-			this._asyncLocalStorage.enterWith(context$1);
-			return new DisposeOnceToken(previousContext, this._asyncLocalStorage);
-		}
-	};
-	exports.AsyncLocalStorageContextManager = AsyncLocalStorageContextManager;
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/index.js
-var require_src$1 = /* @__PURE__ */ __commonJSMin(((exports) => {
-	Object.defineProperty(exports, "__esModule", { value: true });
-	exports.AsyncLocalStorageContextManager = exports.AsyncHooksContextManager = void 0;
-	var AsyncHooksContextManager_1 = require_AsyncHooksContextManager();
-	Object.defineProperty(exports, "AsyncHooksContextManager", {
-		enumerable: true,
-		get: function() {
-			return AsyncHooksContextManager_1.AsyncHooksContextManager;
-		}
-	});
-	var AsyncLocalStorageContextManager_1 = require_AsyncLocalStorageContextManager();
-	Object.defineProperty(exports, "AsyncLocalStorageContextManager", {
-		enumerable: true,
-		get: function() {
-			return AsyncLocalStorageContextManager_1.AsyncLocalStorageContextManager;
-		}
-	});
-}));
-
-//#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+sdk-trace-node@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/sdk-trace-node/build/src/NodeTracerProvider.js
 var require_NodeTracerProvider = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.NodeTracerProvider = void 0;
-	const context_async_hooks_1 = require_src$1();
+	const context_async_hooks_1 = require_src$2();
 	const sdk_trace_base_1 = require_index_shim();
 	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
 	const core_1 = require_src$7();
@@ -29754,9 +30038,8 @@ var require_src = /* @__PURE__ */ __commonJSMin(((exports) => {
 
 //#endregion
 //#region src/ids.ts
-var import_src$1 = require_src();
-var import_index_shim = require_index_shim();
-var import_src = require_src$3();
+var import_src$2 = require_src();
+var import_src$1 = require_src$3();
 function hashHex(input, bytes) {
 	return createHash("sha256").update(input).digest("hex").slice(0, bytes * 2);
 }
@@ -29799,8 +30082,61 @@ const SDK_VERSION = "0.1.1";
 
 //#endregion
 //#region src/exporter.ts
+var import_src = require_src$7();
+/** Keeps every ended span, so the hook can send them all once it has ended them. */
+var CollectingProcessor = class {
+	spans = [];
+	onStart() {}
+	onEnd(span) {
+		this.spans.push(span);
+	}
+	async forceFlush() {}
+	async shutdown() {}
+};
+/** One export call; a throwing exporter is reported as a failed export. */
+function exportOnce(exporter, spans) {
+	return new Promise((resolve) => {
+		try {
+			exporter.export(spans, resolve);
+		} catch (error) {
+			resolve({
+				code: import_src.ExportResultCode.FAILED,
+				error: error instanceof Error ? error : new Error(String(error))
+			});
+		}
+	});
+}
+const MAX_SPANS_PER_REQUEST = 1024;
+/**
+* Sends `spans` as sequential requests of at most 1,024 spans whose estimated size
+* stays within `maxBytes`, to keep each request under the ingest endpoint's size
+* limit; a span whose estimate alone passes `maxBytes` goes in a request of its own.
+* Passes the ids of each accepted request to `onDelivered`, so a span counts as sent
+* only once the backend accepted it. A failed request fails only its own spans:
+* every request is tried, then the first failure is thrown. A request that
+* `stillHeld` holds back fails too, so the next hook sends its spans.
+*/
+async function sendInRequests(exporter, spans, opts) {
+	let failure;
+	for (const request of splitBySize(spans, opts.maxBytes, MAX_SPANS_PER_REQUEST)) {
+		if (opts.stillHeld && !await opts.stillHeld()) {
+			failure ??= {
+				code: import_src.ExportResultCode.FAILED,
+				error: /* @__PURE__ */ new Error("not sent: the session lock was taken over")
+			};
+			continue;
+		}
+		const result = await exportOnce(exporter, request);
+		if (result.code !== import_src.ExportResultCode.SUCCESS) {
+			failure ??= result;
+			continue;
+		}
+		await opts.onDelivered?.(request.map((span) => span.spanContext().spanId));
+	}
+	if (failure) throw failure.error ?? /* @__PURE__ */ new Error("span export failed");
+}
 function buildTracingWith(processor, idGen) {
-	const provider = new import_src$1.NodeTracerProvider({
+	const provider = new import_src$2.NodeTracerProvider({
 		idGenerator: idGen,
 		spanProcessors: [processor]
 	});
@@ -29813,8 +30149,8 @@ function buildTracingWith(processor, idGen) {
 		}
 	};
 }
-function buildTracing(config) {
-	return buildTracingWith(new import_index_shim.BatchSpanProcessor(new import_src.OTLPTraceExporter({
+function otlpExporter(config) {
+	return new import_src$1.OTLPTraceExporter({
 		url: `${config.hostUrl}/api/v1/public/traces`,
 		headers: {
 			Authorization: `Bearer ${config.apiKey ?? ""}`,
@@ -29822,11 +30158,14 @@ function buildTracing(config) {
 			"x-traceroot-sdk-version": SDK_VERSION
 		},
 		compression: "gzip"
-	}), {
-		maxQueueSize: 4096,
-		maxExportBatchSize: 1024,
-		scheduledDelayMillis: 3e4
-	}), new PrimedIdGenerator());
+	});
+}
+function buildTracing() {
+	const collected = new CollectingProcessor();
+	return {
+		...buildTracingWith(collected, new PrimedIdGenerator()),
+		spans: collected.spans
+	};
 }
 
 //#endregion
@@ -29855,23 +30194,372 @@ async function getGitContext(cwd) {
 }
 
 //#endregion
-//#region src/util.ts
-let DEBUG = false;
-function setDebug(b) {
-	DEBUG = b;
+//#region src/lock.ts
+const DEFAULT_TIMINGS = {
+	waitMs: 1e4,
+	staleMs: 3e4,
+	heartbeatMs: 5e3,
+	rerunBudgetMs: 15e3,
+	pollMs: 50
+};
+/** A drainer exits this long after it starts, whatever it is doing. */
+const DRAIN_LIFETIME_MS = 12e4;
+const DRAIN_TIMINGS = {
+	waitMs: 6e4,
+	staleMs: 3e4,
+	heartbeatMs: 5e3,
+	rerunBudgetMs: 9e4,
+	pollMs: 200,
+	retryMs: 1e3
+};
+const RETRY_MAX_MS = 15e3;
+const sleep = (ms$1) => new Promise((resolve) => setTimeout(resolve, ms$1));
+function isAlive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error.code === "EPERM";
+	}
 }
-function debugLog(...args) {
-	if (DEBUG) console.error("[traceroot-codex]", ...args);
+const newOwner = () => `${process.pid}.${randomUUID()}`;
+/** Whether an owner is gone: its process exited, or it has been silent past staleMs. */
+function isStale(owner, staleMs) {
+	if (Date.now() - owner.mtimeMs > staleMs) return true;
+	const pid = Number(owner.name.split(".")[0]);
+	return Number.isInteger(pid) && pid > 0 && !isAlive(pid);
 }
-async function readStdin() {
-	const chunks = [];
-	for await (const c of process.stdin) chunks.push(c);
-	const raw = Buffer.concat(chunks).toString("utf-8").trim();
-	return JSON.parse(raw || "{}");
+async function ownerAt(lockDir, name) {
+	const stat = await fs.stat(path.join(lockDir, name)).catch(() => void 0);
+	return stat && {
+		name,
+		mtimeMs: stat.mtimeMs
+	};
 }
-function truncate(s, max) {
-	if (s.length <= max) return s;
-	return `${s.slice(0, max)}…[truncated ${s.length - max} chars]`;
+/** The owners in the lock directory, or undefined if it can't be read. */
+async function ownersOf(lockDir) {
+	const names = await fs.readdir(lockDir).catch(() => void 0);
+	if (!names) return void 0;
+	const owners = [];
+	for (const name of names) {
+		const owner = await ownerAt(lockDir, name);
+		if (owner) owners.push(owner);
+	}
+	return owners;
+}
+/** Creates the lock with `owner` in it, in one rename. */
+async function tryCreate(lockDir, owner) {
+	const staging = `${lockDir}.${randomUUID()}.tmp`;
+	try {
+		await fs.mkdir(staging);
+		await fs.writeFile(path.join(staging, owner), owner);
+		await fs.rename(staging, lockDir);
+		return "created";
+	} catch (error) {
+		const code = error.code;
+		if (code === "ENOTEMPTY" || code === "EEXIST") return "exists";
+		return await fs.lstat(lockDir).then(() => true, () => false) ? "exists" : error;
+	} finally {
+		await fs.rm(staging, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+	}
+}
+/** One attempt to take the lock as `owner`, removing one whose holder is gone on the way. */
+async function tryLock(lockDir, owner, staleMs) {
+	for (;;) {
+		const created = await tryCreate(lockDir, owner);
+		if (created !== "exists") return created === "created" ? "held" : created;
+		const owners = await ownersOf(lockDir);
+		if (!owners || owners.some((seen) => !isStale(seen, staleMs))) return "busy";
+		for (const { name } of owners) {
+			const now = await ownerAt(lockDir, name);
+			if (now && !isStale(now, staleMs)) return "busy";
+			await fs.rm(path.join(lockDir, name), {
+				recursive: true,
+				force: true
+			}).catch(() => {});
+		}
+		if (!await fs.rmdir(lockDir).then(() => true, () => false)) return "busy";
+	}
+}
+/** The turn end a request names, if any. */
+function turnEndOf(request) {
+	const at = Number(request);
+	return request && Number.isFinite(at) ? at : void 0;
+}
+function laterTurnEnd(a, b) {
+	if (a === void 0) return b;
+	return b === void 0 ? a : Math.max(a, b);
+}
+const handOffOf = (turnEndedAt) => turnEndedAt === void 0 ? {} : { turnEndedAt };
+/**
+* Asks the holder to run again for this hook: a request file of its own in
+* `pendingDir`, written in full before it appears. A hook that ended its turn
+* writes when it arrived. No request ever replaces another, so the run that
+* claims them sees every turn end.
+*/
+async function requestRun(pendingDir, turnEndedAt) {
+	const tmp = `${pendingDir}.${randomUUID()}.tmp`;
+	try {
+		await fs.writeFile(tmp, turnEndedAt === void 0 ? "" : String(turnEndedAt));
+		await fs.mkdir(pendingDir, { recursive: true });
+		await fs.rename(tmp, path.join(pendingDir, randomUUID()));
+		return true;
+	} catch {
+		return false;
+	} finally {
+		await fs.rm(tmp, { force: true });
+	}
+}
+const hasRequests = (pendingDir) => fs.readdir(pendingDir).then((names) => names.length > 0, () => false);
+/** A request's own name, whichever run last claimed it (see claimRequests). */
+const requestOf = (name) => name.split(".")[0];
+/** The requests waiting for a run, by their own names. */
+const waitingRequests = (pendingDir) => fs.readdir(pendingDir).then((names) => names.map(requestOf), () => []);
+/**
+* Takes the requests waiting for a run, renaming each to `<request>.<owner>`.
+* Requests made after this are not among them, so they get a run of their own.
+* They stay in place until the run that claimed them has served them, so a hook
+* killed during that run, or a run whose export failed, leaves them for the next
+* one. That run claims them under its own owner, so the earlier run, should it
+* resume after losing the lock, can no longer remove them.
+*/
+async function claimRequests(pendingDir, owner) {
+	let names;
+	try {
+		names = await fs.readdir(pendingDir);
+	} catch (error) {
+		if (error.code === "ENOENT") return { requests: [] };
+		throw error;
+	}
+	const requests = [];
+	let turnEndedAt;
+	for (const name of names) {
+		const claimed = `${requestOf(name)}.${owner}`;
+		try {
+			await fs.rename(path.join(pendingDir, name), path.join(pendingDir, claimed));
+		} catch (error) {
+			if (error.code === "ENOENT") continue;
+			throw error;
+		}
+		const request = await fs.readFile(path.join(pendingDir, claimed), "utf-8").catch(() => "");
+		turnEndedAt = laterTurnEnd(turnEndedAt, turnEndOf(request));
+		requests.push(claimed);
+	}
+	return {
+		turnEndedAt,
+		requests
+	};
+}
+async function removeRequests(pendingDir, requests) {
+	for (const name of requests) await fs.rm(path.join(pendingDir, name), { force: true }).catch(() => {});
+}
+async function acquire(lockDir, pendingDir, owner, turnEndedAt, t, drainer) {
+	const deadline = Date.now() + t.waitMs;
+	let seenHeld = false;
+	const attemptLock = async () => {
+		const attempt = await tryLock(lockDir, owner, t.staleMs);
+		seenHeld ||= attempt === "busy";
+		return attempt instanceof Error && (seenHeld || drainer) ? "busy" : attempt;
+	};
+	for (;;) {
+		let attempt = await attemptLock();
+		if (attempt === "busy" && Date.now() >= deadline) {
+			if (drainer) return "timed-out";
+			const asked = await requestRun(pendingDir, turnEndedAt);
+			attempt = await attemptLock();
+			if (attempt === "busy") return asked ? "handed-off" : "not-handed-off";
+		}
+		if (attempt === "held") return "held";
+		if (attempt instanceof Error) {
+			debugLog("session lock unavailable; continuing without it:", attempt);
+			return "unlocked";
+		}
+		await (t.sleep ?? sleep)(t.pollMs);
+	}
+}
+/** The lock, hand-off and drainer directories kept next to `rolloutFile`. */
+const pathsOf = (rolloutFile) => ({
+	lockDir: `${rolloutFile}.traceroot.lock.d`,
+	pendingDir: `${rolloutFile}.traceroot.pending.d`,
+	drainerDir: `${rolloutFile}.traceroot.drainer.d`
+});
+/** Removes `owner`'s entry, then the directory if that left it empty. */
+async function releaseOwner(dir, owner) {
+	await fs.rm(path.join(dir, owner), { force: true }).catch(() => {});
+	await fs.rmdir(dir).catch(() => {});
+}
+/**
+* Whether a drainer is serving the session: the drainer directory, made like the
+* lock, names a live owner. A drainer exits within DRAIN_LIFETIME_MS, so an older
+* entry is one whose drainer died.
+*/
+async function drainerRunning(drainerDir) {
+	const owners = await ownersOf(drainerDir);
+	return !!owners && owners.some((owner) => !isStale(owner, DRAIN_LIFETIME_MS));
+}
+async function serve(rolloutFile, run$1, timings, role) {
+	const started = Date.now();
+	const { lockDir, pendingDir, drainerDir } = pathsOf(rolloutFile);
+	let owner = newOwner();
+	const turnEndedAt = role.endsTurn ? started : void 0;
+	const leaveToDrainer = async () => {
+		if (!role.startDrainer || !await hasRequests(pendingDir) || await drainerRunning(drainerDir)) return;
+		debugLog("starting a drainer for the runs this session's hooks left");
+		role.startDrainer();
+	};
+	const acquired = await acquire(lockDir, pendingDir, owner, turnEndedAt, timings, role.drainer);
+	if (acquired === "handed-off") {
+		debugLog("another hook of this session holds the lock; it runs again for this one");
+		await leaveToDrainer();
+		return;
+	}
+	if (acquired === "not-handed-off") {
+		debugLog("another hook of this session holds the lock, and this one could not ask it to run again; sending nothing");
+		return;
+	}
+	if (acquired === "timed-out") {
+		debugLog("the session lock stayed held; leaving its runs for the session's next hook");
+		return;
+	}
+	if (acquired === "unlocked") return run$1({ held: async () => true }, handOffOf(turnEndedAt));
+	const ownerPath = () => path.join(lockDir, owner);
+	let lostInRun = false;
+	const lock = { held: async () => {
+		const mine = await fs.readFile(ownerPath(), "utf-8").catch(() => "") === owner;
+		lostInRun ||= !mine;
+		return mine;
+	} };
+	const heartbeat = setInterval(() => {
+		lock.held().then((mine) => {
+			if (mine) return fs.utimes(ownerPath(), /* @__PURE__ */ new Date(), /* @__PURE__ */ new Date());
+		}).catch(() => {});
+	}, timings.heartbeatMs);
+	heartbeat.unref();
+	const budgetLeft = () => Date.now() - started < timings.rerunBudgetMs;
+	const settle = async (claim, served) => {
+		if (!await lock.held() || lostInRun) {
+			if (turnEndedAt !== void 0 || claim.requests.length === 0) await requestRun(pendingDir, turnEndedAt);
+		} else if (served) await removeRequests(pendingDir, claim.requests);
+	};
+	try {
+		for (;;) {
+			const claim = await claimRequests(pendingDir, owner);
+			if (role.drainer && claim.requests.length === 0) {
+				debugLog("nothing left to run for; the hooks served it");
+				return;
+			}
+			lostInRun = false;
+			let served = false;
+			let result;
+			try {
+				result = await run$1(lock, handOffOf(laterTurnEnd(turnEndedAt, claim.turnEndedAt)));
+				served = true;
+			} finally {
+				await settle(claim, served);
+			}
+			if (await hasRequests(pendingDir)) {
+				if (budgetLeft() && await lock.held()) {
+					debugLog("running again for a hook that handed its run to this one");
+					continue;
+				}
+				debugLog("leaving a handed-off run for a drainer or the session's next hook");
+				return result;
+			}
+			await releaseOwner(lockDir, owner);
+			if (!await hasRequests(pendingDir) || !budgetLeft()) return result;
+			owner = newOwner();
+			if (await tryLock(lockDir, owner, timings.staleMs) !== "held") return result;
+			debugLog("running again for a hook that asked while this one released");
+		}
+	} finally {
+		clearInterval(heartbeat);
+		await releaseOwner(lockDir, owner);
+		await leaveToDrainer();
+	}
+}
+/**
+* Runs `run` while holding the session's lock, a directory next to the rollout, so
+* hooks of one session (a subagent's SubagentStop beside the parent's own hooks,
+* say) read the rollout, export and record what they sent one at a time.
+*
+* A hook that can't get the lock within `waitMs` never runs on its own: it leaves
+* a request and returns undefined, and the holder runs again, reading the rollout
+* as it is then. A hook that `endsTurn` is told when it arrived in each of its
+* runs, and says so in its request, so the run that serves it is told too. The
+* holder keeps its entry in the lock fresh while it runs, so it is taken over only
+* if it exits or freezes, and `run` checks `held()` before exporting so a frozen
+* holder that resumes sends nothing. A run that throws leaves the requests it was
+* serving in place.
+*
+* A hook that exits while requests are still waiting, after handing off, as a
+* holder past its rerun budget or after a failed run, calls `startDrainer` unless
+* a drainer is already serving the session (see drainSession).
+*/
+async function withSessionLock(rolloutFile, run$1, { timings = DEFAULT_TIMINGS, endsTurn = false, startDrainer } = {}) {
+	return serve(rolloutFile, run$1, timings, {
+		endsTurn,
+		drainer: false,
+		startDrainer
+	});
+}
+/**
+* Serves the requests the session's hooks left, from a process that outlives them:
+* a drainer. It waits for the lock like a hook, but it never hands off, never runs
+* unlocked, and runs only for requests still waiting, so it adds no run when the
+* hooks served them. A failed run leaves its requests, and the drainer tries again
+* after a wait that doubles each time. It starts no run after `rerunBudgetMs`, and
+* leaves what is still waiting then for the session's next hook.
+*
+* At most one drainer serves a session: it holds the drainer directory, made and
+* removed like the lock, while it works, and one that finds it held exits. After
+* letting go it looks again, since a hook that left a request meanwhile saw it
+* running and started no drainer of its own. A request it finds then that it never
+* saw before gets `startDrainer` if its budget is spent: each request can start a
+* drainer this way only once, so drainers don't start one another without new
+* requests from the session's hooks.
+*/
+async function drainSession(rolloutFile, run$1, { timings = DRAIN_TIMINGS, startDrainer } = {}) {
+	const started = Date.now();
+	const { pendingDir, drainerDir } = pathsOf(rolloutFile);
+	const seen = /* @__PURE__ */ new Set();
+	const budgetLeft = () => timings.rerunBudgetMs - (Date.now() - started);
+	let failures = 0;
+	for (;;) {
+		const waiting = await waitingRequests(pendingDir);
+		const left = budgetLeft();
+		if (left <= 0) {
+			if (waiting.some((request) => !seen.has(request))) {
+				debugLog("starting a drainer for a run handed to this one after its last");
+				startDrainer?.();
+			}
+			return;
+		}
+		if (waiting.length === 0) return;
+		for (const request of waiting) seen.add(request);
+		const owner = newOwner();
+		if (await tryLock(drainerDir, owner, DRAIN_LIFETIME_MS) !== "held") return;
+		try {
+			await serve(rolloutFile, run$1, {
+				...timings,
+				waitMs: Math.min(timings.waitMs, left),
+				rerunBudgetMs: left
+			}, {
+				endsTurn: false,
+				drainer: true
+			});
+			failures = 0;
+		} catch (error) {
+			const wait = Math.min((timings.retryMs ?? DRAIN_TIMINGS.retryMs) * 2 ** failures, RETRY_MAX_MS, budgetLeft());
+			failures += 1;
+			debugLog(`a drainer run failed; trying again in ${Math.max(wait, 0)} ms:`, error);
+			if (wait > 0) await (timings.sleep ?? sleep)(wait);
+		} finally {
+			await releaseOwner(drainerDir, owner);
+		}
+	}
 }
 
 //#endregion
@@ -29886,9 +30574,11 @@ async function loadEmittedSpanIds(rolloutFile) {
 		return /* @__PURE__ */ new Set();
 	}
 }
-async function markSpanEmitted(rolloutFile, spanId) {
+/** Records `spanIds` as sent, in one append; an empty list writes nothing. */
+async function markSpansEmitted(rolloutFile, spanIds) {
+	if (spanIds.length === 0) return;
 	try {
-		await fs.appendFile(`${rolloutFile}${suffix}`, `${spanId}\n`, "utf-8");
+		await fs.appendFile(`${rolloutFile}${suffix}`, `${spanIds.join("\n")}\n`, "utf-8");
 	} catch {}
 }
 
@@ -29914,7 +30604,10 @@ function mapUsage(u) {
 //#region src/spans.ts
 init_esm$2();
 const ROOT_NAME = "Codex Turn";
-const str = (v, max) => truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);
+function fitted(span, content) {
+	content.fit(span.attributes);
+	return span;
+}
 function commonTrace(attrs, sessionMeta, ctx) {
 	attrs["traceroot.sdk.name"] = SDK_NAME;
 	attrs["traceroot.sdk.version"] = SDK_VERSION;
@@ -29928,13 +30621,35 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 	const traceId = opts?.traceId ?? makeTraceId(sessionMeta.sessionId, turn.turnId);
 	const rootId = makeSpanId(seed + turn.turnId + ":root");
 	const rootParentSpanId = opts?.rootParentSpanId !== void 0 ? opts.rootParentSpanId : null;
-	const out = [];
+	const turnOver = rootParentSpanId === null ? turn.completed || !!ctx.turnEnding : turn.completed;
+	const content = ctx.content ?? textPolicy;
+	const children = [];
+	const calls = [];
+	let prevToolResults;
+	for (const step of turn.steps) {
+		const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
+		const text = step.index === 0 ? turn.userInput : prevToolResults;
+		const stepSpan = fitted(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, content, content.callInput(text, step)), content);
+		children.push(stepSpan);
+		calls.push([step, stepSpan.attributes]);
+		const fed = [];
+		for (const tc of step.toolCalls) {
+			const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx, turnOver, content), content);
+			children.push(toolSpan);
+			fed.push({
+				name: tc.name,
+				output: content.fedBack(tc, toolSpan.attributes)
+			});
+		}
+		if (step.toolCalls.length) prevToolResults = content.io(fed, ctx.maxChars);
+	}
 	const rootAttrs = {
 		"traceroot.span.type": "AGENT",
 		"traceroot.span.path": [ROOT_NAME]
 	};
 	commonTrace(rootAttrs, sessionMeta, ctx);
-	if (turn.userInput) rootAttrs["traceroot.span.input"] = str(turn.userInput, ctx.maxChars);
+	const rootInput = content.turnInput(turn.userInput, calls);
+	if (rootInput) rootAttrs["traceroot.span.input"] = content.io(rootInput, ctx.maxChars);
 	if (turn.finalOutput) rootAttrs["traceroot.span.output"] = str(turn.finalOutput, ctx.maxChars);
 	rootAttrs["traceroot.span.metadata"] = JSON.stringify(pruneUndefined({
 		"codex.turn_id": turn.turnId,
@@ -29951,7 +30666,7 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		if (step.endTime > rootEnd) rootEnd = step.endTime;
 		for (const tc of step.toolCalls) if (tc.endTime !== void 0 && tc.endTime > rootEnd) rootEnd = tc.endTime;
 	}
-	out.push({
+	return [fitted({
 		spanId: rootId,
 		parentSpanId: rootParentSpanId,
 		traceId,
@@ -29960,20 +30675,8 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		startTime: turn.startTime,
 		endTime: rootEnd,
 		attributes: rootAttrs,
-		complete: rootParentSpanId === null ? turn.completed || !!ctx.turnEnding : turn.completed
-	});
-	let prevToolResults;
-	for (const step of turn.steps) {
-		const stepId = makeSpanId(seed + turn.turnId + ":step:" + step.index);
-		const input = step.index === 0 ? turn.userInput : prevToolResults;
-		out.push(planStepSpan(sessionMeta, turn, step, stepId, rootId, traceId, ctx, input));
-		for (const tc of step.toolCalls) out.push(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx));
-		if (step.toolCalls.length) prevToolResults = str(step.toolCalls.map((tc) => ({
-			name: tc.name,
-			output: tc.output
-		})), ctx.maxChars);
-	}
-	return out;
+		complete: turnOver
+	}, content), ...children];
 }
 function pruneUndefined(o) {
 	const r = {};
@@ -29992,14 +30695,14 @@ function buildStepOutput(step, max) {
 	if (Object.keys(o).length === 0) return void 0;
 	return truncate(JSON.stringify(o), max);
 }
-function planStepSpan(sessionMeta, turn, step, spanId, parentSpanId, traceId, ctx, input) {
+function planStepSpan(sessionMeta, turn, step, spanId, parentSpanId, traceId, ctx, content, input) {
 	const attrs = {
 		"traceroot.span.type": "LLM",
 		"traceroot.span.path": [ROOT_NAME, turn.model ?? "model"]
 	};
 	commonTrace(attrs, sessionMeta, ctx);
 	if (turn.model) attrs["traceroot.llm.model"] = turn.model;
-	if (input) attrs["traceroot.span.input"] = truncate(input, ctx.maxChars);
+	if (input) attrs["traceroot.span.input"] = content.io(input, ctx.maxChars);
 	const output = buildStepOutput(step, ctx.maxChars);
 	if (output) attrs["traceroot.span.output"] = output;
 	attrs["traceroot.span.metadata"] = JSON.stringify({ "codex.step_index": step.index });
@@ -30016,19 +30719,20 @@ function planStepSpan(sessionMeta, turn, step, spanId, parentSpanId, traceId, ct
 		complete: Boolean(step.usage)
 	};
 }
-function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx) {
+function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx, turnOver, content) {
 	const attrs = {
 		"traceroot.span.type": "TOOL",
 		"traceroot.span.path": [ROOT_NAME, tc.name]
 	};
 	commonTrace(attrs, sessionMeta, ctx);
 	attrs["traceroot.span.input"] = str(tc.args, ctx.maxChars);
-	if (tc.output !== void 0) attrs["traceroot.span.output"] = str(tc.output, ctx.maxChars);
+	if (tc.output !== void 0) attrs["traceroot.span.output"] = content.io(tc.output, ctx.maxChars);
 	const meta = {};
+	content.toolMeta(tc, meta);
 	if (tc.kind !== void 0) meta["tool_kind"] = tc.kind;
 	if (tc.status !== void 0) meta["status"] = tc.status;
 	if (tc.exitCode !== void 0) meta["exit_code"] = tc.exitCode;
-	if (tc.error !== void 0) meta["error"] = tc.error;
+	if (tc.error !== void 0) meta["error"] = str(tc.error, ctx.maxChars);
 	if (Object.keys(meta).length > 0) attrs["traceroot.span.metadata"] = JSON.stringify(meta);
 	return {
 		spanId: makeSpanId(seed + tc.callId),
@@ -30039,7 +30743,7 @@ function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx) {
 		startTime: tc.startTime,
 		endTime: tc.endTime ?? tc.startTime,
 		attributes: attrs,
-		complete: tc.endTime !== void 0
+		complete: tc.outputItemSeen === true || turnOver
 	};
 }
 const KIND = {
@@ -30165,6 +30869,11 @@ function messageText(content) {
 	const parts = content.filter((c) => typeof c?.text === "string").map((c) => c.text);
 	return parts.length ? parts.join("") : void 0;
 }
+/** Image data URLs, in the formats kept whole, among a message's `input_image` content parts. */
+function messageImages(content) {
+	if (!Array.isArray(content)) return [];
+	return content.filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && isImageDataUrl(c.image_url)).map((c) => c.image_url);
+}
 const INJECTED_USER_MESSAGE_TAGS = new Set([
 	"environment_context",
 	"user_instructions",
@@ -30198,8 +30907,15 @@ function parseSpawnAgentId(output) {
 	const id = obj?.agent_id;
 	return typeof id === "string" && id ? id : void 0;
 }
+/** Adds a subagent ref to `t`, or fills in the spawn call id of one already recorded. */
+function addSubagent(t, ref) {
+	const existing = (t.subagents ??= []).find((s) => s.threadId === ref.threadId);
+	if (!existing) t.subagents.push(ref);
+	else existing.spawnCallId ??= ref.spawnCallId;
+}
 function parseRollout(lines) {
 	let sessionMeta = { sessionId: "" };
+	let sawSessionMeta = false;
 	const turns = [];
 	let turn;
 	let step;
@@ -30234,6 +30950,8 @@ function parseRollout(lines) {
 	for (const line of lines) {
 		const at = ms(line.timestamp);
 		if (line.type === "session_meta") {
+			if (sawSessionMeta) continue;
+			sawSessionMeta = true;
 			sessionMeta = {
 				sessionId: line.payload.id,
 				cwd: line.payload.cwd,
@@ -30275,6 +30993,19 @@ function parseRollout(lines) {
 						const text = messageText(p.item.content);
 						if (text) appendAuthoritativeUserInput(turn, text);
 					}
+					if (turn && p.item?.type === "SubAgentActivity" && p.item.kind === "started") {
+						const { agent_thread_id: threadId, id: spawnCallId } = p.item;
+						if (typeof threadId === "string" && typeof spawnCallId === "string") addSubagent(turn, {
+							threadId,
+							spawnCallId
+						});
+					}
+					break;
+				case "sub_agent_activity":
+					if (turn && p.kind === "started" && typeof p.agent_thread_id === "string" && typeof p.event_id === "string") addSubagent(turn, {
+						threadId: p.agent_thread_id,
+						spawnCallId: p.event_id
+					});
 					break;
 				case "agent_message":
 					if (turn && typeof p.message === "string") turn.finalOutput = p.message;
@@ -30299,7 +31030,7 @@ function parseRollout(lines) {
 					if (turn && typeof p.new_thread_id === "string") {
 						const ref = { threadId: p.new_thread_id };
 						if (typeof p.call_id === "string") ref.spawnCallId = p.call_id;
-						(turn.subagents ??= []).push(ref);
+						addSubagent(turn, ref);
 					}
 					if (turn && p.type.endsWith("_end") && typeof p.call_id === "string") {
 						const tc = toolsByCallId.get(p.call_id);
@@ -30322,10 +31053,11 @@ function parseRollout(lines) {
 				if (tc) {
 					tc.endTime = at;
 					tc.output = p.output;
+					tc.outputItemSeen = true;
 				}
 				if (turn && spawnAgentCallIds.has(p.call_id)) {
 					const threadId = parseSpawnAgentId(p.output);
-					if (threadId) (turn.subagents ??= []).push({
+					if (threadId) addSubagent(turn, {
 						threadId,
 						spawnCallId: p.call_id
 					});
@@ -30338,6 +31070,9 @@ function parseRollout(lines) {
 				const text = messageText(p.content);
 				if (p.role === "user") {
 					if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) userInputFallback.set(turn, text);
+					if (!text || !isInjectedFallbackText(text)) {
+						for (const url of messageImages(p.content)) if (!turn.steps.some((t) => t.userImages?.includes(url))) (s.userImages ??= []).push(url);
+					}
 				} else if (p.role !== "developer") {
 					s.text = text;
 					if (p.role === "assistant" && text) turn.finalOutput = text;
@@ -30384,14 +31119,13 @@ function parseRollout(lines) {
 //#region src/emit.ts
 const STACK_GUARD = 32;
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
-async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, emittedIds, findSubagent) {
+async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, findSubagent, rolloutTurnIds) {
 	let n = 0;
 	for (const span of planTurnSpans(sessionMeta, turn, ctx, opts)) {
 		if (!span.complete) continue;
 		const isTraceRoot = span.parentSpanId === null;
 		if (already.has(span.spanId) && !isTraceRoot) continue;
 		emitSpan(tracing, span);
-		emittedIds.push(span.spanId);
 		already.add(span.spanId);
 		n++;
 	}
@@ -30416,7 +31150,11 @@ async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracin
 				rootParentSpanId: makeSpanId(parentSeed + sub.spawnCallId),
 				seedPrefix: sub.threadId + ":"
 			};
-			for (const childTurn of child.turns) n += await emitTurnTree(child.sessionMeta, childTurn, ctx, childOpts, visited, depth + 1, tracing, already, emittedIds, findSubagent);
+			const childTurnIds = new Set(child.turns.flatMap((t) => t.turnId ?? []));
+			for (const childTurn of child.turns) {
+				if (childTurn.turnId && rolloutTurnIds.has(childTurn.turnId)) continue;
+				n += await emitTurnTree(child.sessionMeta, childTurn, ctx, childOpts, visited, depth + 1, tracing, already, findSubagent, childTurnIds);
+			}
 		} catch (err) {
 			debugLog(`subagent ${sub.threadId} resolve/read/parse failed; skipping: ${String(err)}`);
 			continue;
@@ -30430,11 +31168,31 @@ async function dispatch(hook, config, deps) {
 		debugLog("no transcript_path; skipping");
 		return { emitted: 0 };
 	}
-	const buildTracingFn = deps?.buildTracing ?? buildTracing;
+	return await withSessionLock(transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), {
+		timings: deps?.lockTimings,
+		endsTurn: hook.hook_event_name === "Stop",
+		startDrainer: () => (deps?.startDrainer ?? spawnDrainer)(hook)
+	}) ?? { emitted: 0 };
+}
+/** Serves, as a drainer, the runs the session's hooks left behind (see drainSession). */
+async function drain(hook, config, deps) {
+	const transcript = hook.transcript_path;
+	if (!transcript) return;
+	const session = {
+		transcript_path: transcript,
+		cwd: hook.cwd
+	};
+	await drainSession(transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), {
+		timings: deps?.drainTimings,
+		startDrainer: () => (deps?.startDrainer ?? spawnDrainer)(session)
+	});
+}
+async function emitSession(hook, transcript, config, lock, handOff, deps) {
 	const getGit = deps?.getGit ?? getGitContext;
 	const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
-	const turnEnding = hook.hook_event_name === "Stop";
 	const { sessionMeta, turns } = parseRollout(await readRollout(transcript));
+	const latest = turns.at(-1);
+	const turnEnding = handOff.turnEndedAt !== void 0 && !!latest && latest.startTime <= handOff.turnEndedAt;
 	if (sessionMeta.threadSource === "subagent" || sessionMeta.parentThreadId) {
 		debugLog(`subagent session ${sessionMeta.sessionId}; skipping standalone emit (nested under parent)`);
 		return { emitted: 0 };
@@ -30445,19 +31203,33 @@ async function dispatch(hook, config, deps) {
 		userId: config.userId,
 		git,
 		maxChars: config.maxChars,
-		turnEnding
+		turnEnding,
+		content: config.captureImages ? imagePolicy : textPolicy
 	};
 	const already = await loadEmittedSpanIds(transcript);
-	const tracing = buildTracingFn(config);
-	let emitted = 0;
-	const emittedIds = [];
-	const visited = /* @__PURE__ */ new Set();
-	try {
-		for (const turn of turns) emitted += await emitTurnTree(sessionMeta, turn, ctx, {}, visited, 0, tracing, already, emittedIds, findSubagentFn);
-	} finally {
-		await tracing.shutdown();
+	if (!await lock.held()) {
+		debugLog("session lock lost before export; skipping");
+		return { emitted: 0 };
 	}
-	for (const id of emittedIds) await markSpanEmitted(transcript, id);
+	const exporter = (deps?.exporter ?? otlpExporter)(config);
+	const tracing = buildTracing();
+	let emitted = 0;
+	const visited = /* @__PURE__ */ new Set();
+	const turnIds = new Set(turns.flatMap((t) => t.turnId ?? []));
+	try {
+		for (const turn of turns) emitted += await emitTurnTree(sessionMeta, turn, ctx, {}, visited, 0, tracing, already, findSubagentFn, turnIds);
+	} finally {
+		try {
+			await tracing.shutdown();
+			await sendInRequests(exporter, tracing.spans, {
+				maxBytes: config.maxRequestBytes,
+				stillHeld: lock.held,
+				onDelivered: (ids) => markSpansEmitted(transcript, ids)
+			});
+		} finally {
+			await exporter.shutdown();
+		}
+	}
 	debugLog(`emitted ${emitted} spans`);
 	return { emitted };
 }
@@ -30491,10 +31263,33 @@ async function runHook() {
 		}
 	}
 }
-runHook().catch((error) => {
+/**
+* Runs a drainer a hook started for its session: `session` names the rollout and
+* the cwd. Nothing reads its output or exit code. It stops at DRAIN_LIFETIME_MS
+* whatever it is doing; requests a run had not finished stay for the next hook.
+*/
+async function runDrainer(session, exit = () => process.exit()) {
+	setTimeout(exit, DRAIN_LIFETIME_MS).unref();
+	let hook;
+	try {
+		hook = JSON.parse(session ?? "");
+	} catch {
+		return;
+	}
+	const config = await getConfig(hook.cwd);
+	setDebug(config.debug);
+	if (!config.enabled || !hook.transcript_path) return;
+	try {
+		await drain(hook, config);
+	} catch (error) {
+		debugLog("drain failed:", error);
+	}
+}
+if (process.argv[2] === DRAIN_ARG) runDrainer(process.argv[3]).catch(() => {});
+else runHook().catch((error) => {
 	if (process.env.TRACEROOT_CODEX_DEBUG === "true") console.error("[traceroot-codex] fatal:", error);
 	if (process.env.TRACEROOT_CODEX_FAIL_ON_ERROR === "true") process.exitCode = 1;
 });
 
 //#endregion
-export { runHook };
+export { runDrainer, runHook };

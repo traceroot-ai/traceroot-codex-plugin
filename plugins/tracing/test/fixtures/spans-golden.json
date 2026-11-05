@@ -1,0 +1,1348 @@
+{
+  "rollout-basic.jsonl": {
+    "full": [
+      {
+        "spanId": "13c588320b4db391",
+        "parentSpanId": null,
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782256892930,
+        "endTime": 1782256896100,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "list the files",
+          "traceroot.span.output": "There are two files: a.txt and b.txt.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-1\",\"codex.thread_id\":\"sess-abc\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":1}",
+          "traceroot.git.repo": "traceroot-ai/traceroot",
+          "traceroot.git.ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "d6893d0ab6838e0f",
+        "parentSpanId": "13c588320b4db391",
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782256894000,
+        "endTime": 1782256896050,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "list the files",
+          "traceroot.span.output": "{\"content\":\"There are two files: a.txt and b.txt.\",\"reasoning\":\"I'll run ls.\",\"tool_calls\":[{\"name\":\"exec_command\",\"args\":{\"cmd\":\"ls\"}}]}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 1200,
+          "llm.token_count.completion": 40,
+          "llm.token_count.prompt_details.cache_read": 1000,
+          "llm.token_count.completion_details.reasoning": 10
+        },
+        "complete": true
+      },
+      {
+        "spanId": "ac5d3016e54f5759",
+        "parentSpanId": "d6893d0ab6838e0f",
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "TOOL",
+        "name": "exec_command",
+        "startTime": 1782256894500,
+        "endTime": 1782256895000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec_command"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "{\"cmd\":\"ls\"}",
+          "traceroot.span.output": "a.txt\nb.txt"
+        },
+        "complete": true
+      }
+    ],
+    "tight": [
+      {
+        "spanId": "13c588320b4db391",
+        "parentSpanId": null,
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782256892930,
+        "endTime": 1782256896100,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.span.input": "list the files",
+          "traceroot.span.output": "There are two files: a.txt and b.txt.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-1\",\"codex.thread_id\":\"sess-abc\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":1}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "d6893d0ab6838e0f",
+        "parentSpanId": "13c588320b4db391",
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782256894000,
+        "endTime": 1782256896050,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "list the files",
+          "traceroot.span.output": "{\"content\":\"There are two files: a.txt and b.txt.\",\"reasoning\":\"…[truncated 73 chars]",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 1200,
+          "llm.token_count.completion": 40,
+          "llm.token_count.prompt_details.cache_read": 1000,
+          "llm.token_count.completion_details.reasoning": 10
+        },
+        "complete": true
+      },
+      {
+        "spanId": "ac5d3016e54f5759",
+        "parentSpanId": "d6893d0ab6838e0f",
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "TOOL",
+        "name": "exec_command",
+        "startTime": 1782256894500,
+        "endTime": 1782256895000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec_command"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.span.input": "{\"cmd\":\"ls\"}",
+          "traceroot.span.output": "a.txt\nb.txt"
+        },
+        "complete": true
+      }
+    ]
+  },
+  "rollout-child-spawner.jsonl": {
+    "full": [
+      {
+        "spanId": "bbf9bf33b8bdb2a1",
+        "parentSpanId": null,
+        "traceId": "8cca2eb5a9cf98324cda81db9fc32876",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782777661000,
+        "endTime": 1782777669000,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-spawner-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "do a task and re-spawn",
+          "traceroot.span.output": "Done, cycled.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"cs-turn-1\",\"codex.thread_id\":\"child-spawner-sess\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":2}",
+          "traceroot.git.repo": "traceroot-ai/traceroot",
+          "traceroot.git.ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "7f6a3ea25db33d1f",
+        "parentSpanId": "bbf9bf33b8bdb2a1",
+        "traceId": "8cca2eb5a9cf98324cda81db9fc32876",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782777663000,
+        "endTime": 1782777668000,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-spawner-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "do a task and re-spawn",
+          "traceroot.span.output": "{\"content\":\"Done, cycled.\",\"tool_calls\":[{\"name\":\"spawn_agent\",\"args\":{\"prompt\":\"cycle back\"}},{\"name\":\"exec_command\",\"args\":{\"cmd\":\"ls\"}}]}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 300,
+          "llm.token_count.completion": 25
+        },
+        "complete": true
+      },
+      {
+        "spanId": "0e98d1b964c25842",
+        "parentSpanId": "7f6a3ea25db33d1f",
+        "traceId": "8cca2eb5a9cf98324cda81db9fc32876",
+        "kind": "TOOL",
+        "name": "spawn_agent",
+        "startTime": 1782777663000,
+        "endTime": 1782777664000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "spawn_agent"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-spawner-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "{\"prompt\":\"cycle back\"}",
+          "traceroot.span.metadata": "{\"tool_kind\":\"spawn\",\"status\":\"completed\"}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "409c51f2516a7c56",
+        "parentSpanId": "7f6a3ea25db33d1f",
+        "traceId": "8cca2eb5a9cf98324cda81db9fc32876",
+        "kind": "TOOL",
+        "name": "exec_command",
+        "startTime": 1782777665000,
+        "endTime": 1782777666000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec_command"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-spawner-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "{\"cmd\":\"ls\"}",
+          "traceroot.span.output": "file.txt",
+          "traceroot.span.metadata": "{\"tool_kind\":\"exec\",\"status\":\"completed\",\"exit_code\":0}"
+        },
+        "complete": true
+      }
+    ],
+    "tight": [
+      {
+        "spanId": "bbf9bf33b8bdb2a1",
+        "parentSpanId": null,
+        "traceId": "8cca2eb5a9cf98324cda81db9fc32876",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782777661000,
+        "endTime": 1782777669000,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-spawner-sess",
+          "traceroot.span.input": "do a task and re-spawn",
+          "traceroot.span.output": "Done, cycled.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"cs-turn-1\",\"codex.thread_id\":\"child-spawner-sess\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":2}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "7f6a3ea25db33d1f",
+        "parentSpanId": "bbf9bf33b8bdb2a1",
+        "traceId": "8cca2eb5a9cf98324cda81db9fc32876",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782777663000,
+        "endTime": 1782777668000,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-spawner-sess",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "do a task and re-spawn",
+          "traceroot.span.output": "{\"content\":\"Done, cycled.\",\"tool_calls\":[{\"name\":\"spawn_agent\",\"…[truncated 76 chars]",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 300,
+          "llm.token_count.completion": 25
+        },
+        "complete": true
+      },
+      {
+        "spanId": "0e98d1b964c25842",
+        "parentSpanId": "7f6a3ea25db33d1f",
+        "traceId": "8cca2eb5a9cf98324cda81db9fc32876",
+        "kind": "TOOL",
+        "name": "spawn_agent",
+        "startTime": 1782777663000,
+        "endTime": 1782777664000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "spawn_agent"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-spawner-sess",
+          "traceroot.span.input": "{\"prompt\":\"cycle back\"}",
+          "traceroot.span.metadata": "{\"tool_kind\":\"spawn\",\"status\":\"completed\"}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "409c51f2516a7c56",
+        "parentSpanId": "7f6a3ea25db33d1f",
+        "traceId": "8cca2eb5a9cf98324cda81db9fc32876",
+        "kind": "TOOL",
+        "name": "exec_command",
+        "startTime": 1782777665000,
+        "endTime": 1782777666000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec_command"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-spawner-sess",
+          "traceroot.span.input": "{\"cmd\":\"ls\"}",
+          "traceroot.span.output": "file.txt",
+          "traceroot.span.metadata": "{\"tool_kind\":\"exec\",\"status\":\"completed\",\"exit_code\":0}"
+        },
+        "complete": true
+      }
+    ]
+  },
+  "rollout-child-thread-1.jsonl": {
+    "full": [
+      {
+        "spanId": "fc95bc5c8a8b885b",
+        "parentSpanId": null,
+        "traceId": "5bf1210379210732dcbf20ced1a943cb",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782777611000,
+        "endTime": 1782777617000,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "do a task",
+          "traceroot.span.output": "Done.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"child-turn-1\",\"codex.thread_id\":\"child-sess\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":1}",
+          "traceroot.git.repo": "traceroot-ai/traceroot",
+          "traceroot.git.ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "d5ed5ccc85b0251a",
+        "parentSpanId": "fc95bc5c8a8b885b",
+        "traceId": "5bf1210379210732dcbf20ced1a943cb",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782777613000,
+        "endTime": 1782777616000,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "do a task",
+          "traceroot.span.output": "{\"content\":\"Done.\",\"tool_calls\":[{\"name\":\"exec_command\",\"args\":{\"cmd\":\"ls\"}}]}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 200,
+          "llm.token_count.completion": 20
+        },
+        "complete": true
+      },
+      {
+        "spanId": "ecf1fa3f9e7faee6",
+        "parentSpanId": "d5ed5ccc85b0251a",
+        "traceId": "5bf1210379210732dcbf20ced1a943cb",
+        "kind": "TOOL",
+        "name": "exec_command",
+        "startTime": 1782777613000,
+        "endTime": 1782777614000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec_command"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "{\"cmd\":\"ls\"}",
+          "traceroot.span.output": "file.txt",
+          "traceroot.span.metadata": "{\"tool_kind\":\"exec\",\"status\":\"completed\",\"exit_code\":0}"
+        },
+        "complete": true
+      }
+    ],
+    "tight": [
+      {
+        "spanId": "fc95bc5c8a8b885b",
+        "parentSpanId": null,
+        "traceId": "5bf1210379210732dcbf20ced1a943cb",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782777611000,
+        "endTime": 1782777617000,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-sess",
+          "traceroot.span.input": "do a task",
+          "traceroot.span.output": "Done.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"child-turn-1\",\"codex.thread_id\":\"child-sess\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":1}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "d5ed5ccc85b0251a",
+        "parentSpanId": "fc95bc5c8a8b885b",
+        "traceId": "5bf1210379210732dcbf20ced1a943cb",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782777613000,
+        "endTime": 1782777616000,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-sess",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "do a task",
+          "traceroot.span.output": "{\"content\":\"Done.\",\"tool_calls\":[{\"name\":\"exec_command\",\"args\":{…[truncated 14 chars]",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 200,
+          "llm.token_count.completion": 20
+        },
+        "complete": true
+      },
+      {
+        "spanId": "ecf1fa3f9e7faee6",
+        "parentSpanId": "d5ed5ccc85b0251a",
+        "traceId": "5bf1210379210732dcbf20ced1a943cb",
+        "kind": "TOOL",
+        "name": "exec_command",
+        "startTime": 1782777613000,
+        "endTime": 1782777614000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec_command"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "child-sess",
+          "traceroot.span.input": "{\"cmd\":\"ls\"}",
+          "traceroot.span.output": "file.txt",
+          "traceroot.span.metadata": "{\"tool_kind\":\"exec\",\"status\":\"completed\",\"exit_code\":0}"
+        },
+        "complete": true
+      }
+    ]
+  },
+  "rollout-inprogress.jsonl": {
+    "full": [
+      {
+        "spanId": "13c588320b4db391",
+        "parentSpanId": null,
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782256892930,
+        "endTime": 1782256896050,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "list the files",
+          "traceroot.span.output": "There are two files: a.txt and b.txt.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-1\",\"codex.thread_id\":\"sess-abc\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":1}",
+          "traceroot.git.repo": "traceroot-ai/traceroot",
+          "traceroot.git.ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "d6893d0ab6838e0f",
+        "parentSpanId": "13c588320b4db391",
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782256894000,
+        "endTime": 1782256896050,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "list the files",
+          "traceroot.span.output": "{\"content\":\"There are two files: a.txt and b.txt.\",\"reasoning\":\"I'll run ls.\",\"tool_calls\":[{\"name\":\"exec_command\",\"args\":{\"cmd\":\"ls\"}}]}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 1200,
+          "llm.token_count.completion": 40,
+          "llm.token_count.prompt_details.cache_read": 1000,
+          "llm.token_count.completion_details.reasoning": 10
+        },
+        "complete": true
+      },
+      {
+        "spanId": "ac5d3016e54f5759",
+        "parentSpanId": "d6893d0ab6838e0f",
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "TOOL",
+        "name": "exec_command",
+        "startTime": 1782256894500,
+        "endTime": 1782256895000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec_command"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "{\"cmd\":\"ls\"}",
+          "traceroot.span.output": "a.txt\nb.txt"
+        },
+        "complete": true
+      }
+    ],
+    "tight": [
+      {
+        "spanId": "13c588320b4db391",
+        "parentSpanId": null,
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782256892930,
+        "endTime": 1782256896050,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.span.input": "list the files",
+          "traceroot.span.output": "There are two files: a.txt and b.txt.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-1\",\"codex.thread_id\":\"sess-abc\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":1}"
+        },
+        "complete": false
+      },
+      {
+        "spanId": "d6893d0ab6838e0f",
+        "parentSpanId": "13c588320b4db391",
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782256894000,
+        "endTime": 1782256896050,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "list the files",
+          "traceroot.span.output": "{\"content\":\"There are two files: a.txt and b.txt.\",\"reasoning\":\"…[truncated 73 chars]",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 1200,
+          "llm.token_count.completion": 40,
+          "llm.token_count.prompt_details.cache_read": 1000,
+          "llm.token_count.completion_details.reasoning": 10
+        },
+        "complete": true
+      },
+      {
+        "spanId": "ac5d3016e54f5759",
+        "parentSpanId": "d6893d0ab6838e0f",
+        "traceId": "248d7ad1935d12e97fee218d2988e549",
+        "kind": "TOOL",
+        "name": "exec_command",
+        "startTime": 1782256894500,
+        "endTime": 1782256895000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec_command"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-abc",
+          "traceroot.span.input": "{\"cmd\":\"ls\"}",
+          "traceroot.span.output": "a.txt\nb.txt"
+        },
+        "complete": true
+      }
+    ]
+  },
+  "rollout-tool-detail.jsonl": {
+    "full": [
+      {
+        "spanId": "cc529a99fc305963",
+        "parentSpanId": null,
+        "traceId": "3ec293b5b5815d2d884a017ef51ab1c5",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782727201000,
+        "endTime": 1782727210000,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-detail",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "run two commands",
+          "traceroot.span.output": "Done.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-td\",\"codex.thread_id\":\"sess-tool-detail\",\"codex.model\":\"gpt-5.5\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":2}",
+          "traceroot.git.repo": "traceroot-ai/traceroot",
+          "traceroot.git.ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "8466e40bf09ce376",
+        "parentSpanId": "cc529a99fc305963",
+        "traceId": "3ec293b5b5815d2d884a017ef51ab1c5",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782727204000,
+        "endTime": 1782727209000,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-detail",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "run two commands",
+          "traceroot.span.output": "{\"content\":\"Done.\",\"tool_calls\":[{\"name\":\"exec\",\"args\":{\"cmd\":\"echo ok\"}},{\"name\":\"exec\",\"args\":{\"cmd\":\"false\"}}]}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 100,
+          "llm.token_count.completion": 10
+        },
+        "complete": true
+      },
+      {
+        "spanId": "0ddc7ab2b803ab51",
+        "parentSpanId": "8466e40bf09ce376",
+        "traceId": "3ec293b5b5815d2d884a017ef51ab1c5",
+        "kind": "TOOL",
+        "name": "exec",
+        "startTime": 1782727204000,
+        "endTime": 1782727205000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-detail",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "{\"cmd\":\"echo ok\"}",
+          "traceroot.span.output": "ok",
+          "traceroot.span.metadata": "{\"tool_kind\":\"exec\",\"status\":\"completed\",\"exit_code\":0}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "b74f44c7b8fdcfb7",
+        "parentSpanId": "8466e40bf09ce376",
+        "traceId": "3ec293b5b5815d2d884a017ef51ab1c5",
+        "kind": "TOOL",
+        "name": "exec",
+        "startTime": 1782727206000,
+        "endTime": 1782727207000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-detail",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "{\"cmd\":\"false\"}",
+          "traceroot.span.metadata": "{\"tool_kind\":\"exec\",\"status\":\"failed\",\"exit_code\":1,\"error\":\"boom\"}"
+        },
+        "complete": true
+      }
+    ],
+    "tight": [
+      {
+        "spanId": "cc529a99fc305963",
+        "parentSpanId": null,
+        "traceId": "3ec293b5b5815d2d884a017ef51ab1c5",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782727201000,
+        "endTime": 1782727210000,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-detail",
+          "traceroot.span.input": "run two commands",
+          "traceroot.span.output": "Done.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-td\",\"codex.thread_id\":\"sess-tool-detail\",\"codex.model\":\"gpt-5.5\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":2}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "8466e40bf09ce376",
+        "parentSpanId": "cc529a99fc305963",
+        "traceId": "3ec293b5b5815d2d884a017ef51ab1c5",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782727204000,
+        "endTime": 1782727209000,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-detail",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "run two commands",
+          "traceroot.span.output": "{\"content\":\"Done.\",\"tool_calls\":[{\"name\":\"exec\",\"args\":{\"cmd\":\"e…[truncated 50 chars]",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 100,
+          "llm.token_count.completion": 10
+        },
+        "complete": true
+      },
+      {
+        "spanId": "0ddc7ab2b803ab51",
+        "parentSpanId": "8466e40bf09ce376",
+        "traceId": "3ec293b5b5815d2d884a017ef51ab1c5",
+        "kind": "TOOL",
+        "name": "exec",
+        "startTime": 1782727204000,
+        "endTime": 1782727205000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-detail",
+          "traceroot.span.input": "{\"cmd\":\"echo ok\"}",
+          "traceroot.span.output": "ok",
+          "traceroot.span.metadata": "{\"tool_kind\":\"exec\",\"status\":\"completed\",\"exit_code\":0}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "b74f44c7b8fdcfb7",
+        "parentSpanId": "8466e40bf09ce376",
+        "traceId": "3ec293b5b5815d2d884a017ef51ab1c5",
+        "kind": "TOOL",
+        "name": "exec",
+        "startTime": 1782727206000,
+        "endTime": 1782727207000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-detail",
+          "traceroot.span.input": "{\"cmd\":\"false\"}",
+          "traceroot.span.metadata": "{\"tool_kind\":\"exec\",\"status\":\"failed\",\"exit_code\":1,\"error\":\"boom\"}"
+        },
+        "complete": true
+      }
+    ]
+  },
+  "rollout-with-subagent.jsonl": {
+    "full": [
+      {
+        "spanId": "80f178687ff470b5",
+        "parentSpanId": null,
+        "traceId": "559531831446f56cf217b8965b9c1bf5",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782777601000,
+        "endTime": 1782777607000,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "parent-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "spawn a subagent",
+          "traceroot.span.output": "Subagent finished.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"parent-turn-1\",\"codex.thread_id\":\"parent-sess\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":1}",
+          "traceroot.git.repo": "traceroot-ai/traceroot",
+          "traceroot.git.ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "4a1a781819127e33",
+        "parentSpanId": "80f178687ff470b5",
+        "traceId": "559531831446f56cf217b8965b9c1bf5",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782777603000,
+        "endTime": 1782777606000,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "parent-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "spawn a subagent",
+          "traceroot.span.output": "{\"content\":\"Subagent finished.\",\"tool_calls\":[{\"name\":\"spawn_agent\",\"args\":{\"prompt\":\"do a task\"}}]}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 500,
+          "llm.token_count.completion": 30
+        },
+        "complete": true
+      },
+      {
+        "spanId": "788810aa8806a079",
+        "parentSpanId": "4a1a781819127e33",
+        "traceId": "559531831446f56cf217b8965b9c1bf5",
+        "kind": "TOOL",
+        "name": "spawn_agent",
+        "startTime": 1782777603000,
+        "endTime": 1782777604000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "spawn_agent"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "parent-sess",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "{\"prompt\":\"do a task\"}",
+          "traceroot.span.metadata": "{\"tool_kind\":\"spawn\",\"status\":\"completed\"}"
+        },
+        "complete": true
+      }
+    ],
+    "tight": [
+      {
+        "spanId": "80f178687ff470b5",
+        "parentSpanId": null,
+        "traceId": "559531831446f56cf217b8965b9c1bf5",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782777601000,
+        "endTime": 1782777607000,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "parent-sess",
+          "traceroot.span.input": "spawn a subagent",
+          "traceroot.span.output": "Subagent finished.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"parent-turn-1\",\"codex.thread_id\":\"parent-sess\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.140.0\",\"codex.tool_call_count\":1}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "4a1a781819127e33",
+        "parentSpanId": "80f178687ff470b5",
+        "traceId": "559531831446f56cf217b8965b9c1bf5",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782777603000,
+        "endTime": 1782777606000,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "parent-sess",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "spawn a subagent",
+          "traceroot.span.output": "{\"content\":\"Subagent finished.\",\"tool_calls\":[{\"name\":\"spawn_age…[truncated 36 chars]",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 500,
+          "llm.token_count.completion": 30
+        },
+        "complete": true
+      },
+      {
+        "spanId": "788810aa8806a079",
+        "parentSpanId": "4a1a781819127e33",
+        "traceId": "559531831446f56cf217b8965b9c1bf5",
+        "kind": "TOOL",
+        "name": "spawn_agent",
+        "startTime": 1782777603000,
+        "endTime": 1782777604000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "spawn_agent"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "parent-sess",
+          "traceroot.span.input": "{\"prompt\":\"do a task\"}",
+          "traceroot.span.metadata": "{\"tool_kind\":\"spawn\",\"status\":\"completed\"}"
+        },
+        "complete": true
+      }
+    ]
+  },
+  "rollout-tool-image.jsonl": {
+    "full": [
+      {
+        "spanId": "ffdf7074c8b71e5f",
+        "parentSpanId": null,
+        "traceId": "b9a69f791480e571ed55233d625b3d16",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782900000010,
+        "endTime": 1782900003100,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-image",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "take a screenshot of the page",
+          "traceroot.span.output": "The page is a solid red square.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-shot\",\"codex.thread_id\":\"sess-tool-image\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.165.0\",\"codex.tool_call_count\":1}",
+          "traceroot.git.repo": "traceroot-ai/traceroot",
+          "traceroot.git.ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "0fecbd569dd5b49c",
+        "parentSpanId": "ffdf7074c8b71e5f",
+        "traceId": "b9a69f791480e571ed55233d625b3d16",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782900001000,
+        "endTime": 1782900001600,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-image",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "take a screenshot of the page",
+          "traceroot.span.output": "{\"reasoning\":\"I'll capture the page.\",\"tool_calls\":[{\"name\":\"exec\",\"args\":\"browser.screenshot()\"}]}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 900,
+          "llm.token_count.completion": 30
+        },
+        "complete": true
+      },
+      {
+        "spanId": "911b9e5d9cc1fb0d",
+        "parentSpanId": "0fecbd569dd5b49c",
+        "traceId": "b9a69f791480e571ed55233d625b3d16",
+        "kind": "TOOL",
+        "name": "exec",
+        "startTime": 1782900001500,
+        "endTime": 1782900002000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-image",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "browser.screenshot()",
+          "traceroot.span.output": "[{\"type\":\"input_text\",\"text\":\"Captured a 4x4 screenshot.\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGO4IycHRwzEcQDTIxGBFNCZswAAAABJRU5ErkJggg==\"}]"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "87738dcdd19fbb72",
+        "parentSpanId": "ffdf7074c8b71e5f",
+        "traceId": "b9a69f791480e571ed55233d625b3d16",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782900003000,
+        "endTime": 1782900003050,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-image",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "[{\"name\":\"exec\",\"output\":[{\"type\":\"input_text\",\"text\":\"Captured a 4x4 screenshot.\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGO4IycHRwzEcQDTIxGBFNCZswAAAABJRU5ErkJggg==\"}]}]",
+          "traceroot.span.output": "{\"content\":\"The page is a solid red square.\"}",
+          "traceroot.span.metadata": "{\"codex.step_index\":1}",
+          "llm.token_count.prompt": 1100,
+          "llm.token_count.completion": 12
+        },
+        "complete": true
+      }
+    ],
+    "tight": [
+      {
+        "spanId": "ffdf7074c8b71e5f",
+        "parentSpanId": null,
+        "traceId": "b9a69f791480e571ed55233d625b3d16",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782900000010,
+        "endTime": 1782900003100,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-image",
+          "traceroot.span.input": "take a screenshot of the page",
+          "traceroot.span.output": "The page is a solid red square.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-shot\",\"codex.thread_id\":\"sess-tool-image\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.165.0\",\"codex.tool_call_count\":1}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "0fecbd569dd5b49c",
+        "parentSpanId": "ffdf7074c8b71e5f",
+        "traceId": "b9a69f791480e571ed55233d625b3d16",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782900001000,
+        "endTime": 1782900001600,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-image",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "take a screenshot of the page",
+          "traceroot.span.output": "{\"reasoning\":\"I'll capture the page.\",\"tool_calls\":[{\"name\":\"exe…[truncated 35 chars]",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 900,
+          "llm.token_count.completion": 30
+        },
+        "complete": true
+      },
+      {
+        "spanId": "911b9e5d9cc1fb0d",
+        "parentSpanId": "0fecbd569dd5b49c",
+        "traceId": "b9a69f791480e571ed55233d625b3d16",
+        "kind": "TOOL",
+        "name": "exec",
+        "startTime": 1782900001500,
+        "endTime": 1782900002000,
+        "attributes": {
+          "traceroot.span.type": "TOOL",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "exec"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-image",
+          "traceroot.span.input": "browser.screenshot()",
+          "traceroot.span.output": "[{\"type\":\"input_text\",\"text\":\"Captured a 4x4 screenshot.\"},{\"typ…[truncated 155 chars]"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "87738dcdd19fbb72",
+        "parentSpanId": "ffdf7074c8b71e5f",
+        "traceId": "b9a69f791480e571ed55233d625b3d16",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782900003000,
+        "endTime": 1782900003050,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-tool-image",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "[{\"name\":\"exec\",\"output\":[{\"type\":\"input_text\",\"text\":\"Captured …[truncated 22 chars]",
+          "traceroot.span.output": "{\"content\":\"The page is a solid red square.\"}",
+          "traceroot.span.metadata": "{\"codex.step_index\":1}",
+          "llm.token_count.prompt": 1100,
+          "llm.token_count.completion": 12
+        },
+        "complete": true
+      }
+    ]
+  },
+  "rollout-prompt-image.jsonl": {
+    "full": [
+      {
+        "spanId": "645737d1d553045c",
+        "parentSpanId": null,
+        "traceId": "da0929c85663e4e17dc4718106af2805",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782903600010,
+        "endTime": 1782903601100,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-prompt-image",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.span.input": "what colour is this image?",
+          "traceroot.span.output": "It is blue.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-look\",\"codex.thread_id\":\"sess-prompt-image\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.165.0\",\"codex.tool_call_count\":0}",
+          "traceroot.git.repo": "traceroot-ai/traceroot",
+          "traceroot.git.ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "bc321c1233756515",
+        "parentSpanId": "645737d1d553045c",
+        "traceId": "da0929c85663e4e17dc4718106af2805",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782903600030,
+        "endTime": 1782903601050,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-prompt-image",
+          "traceroot.trace.user_id": "user-1",
+          "traceroot.environment": "dev",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "what colour is this image?",
+          "traceroot.span.output": "{\"content\":\"It is blue.\"}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 700,
+          "llm.token_count.completion": 5
+        },
+        "complete": true
+      }
+    ],
+    "tight": [
+      {
+        "spanId": "645737d1d553045c",
+        "parentSpanId": null,
+        "traceId": "da0929c85663e4e17dc4718106af2805",
+        "kind": "AGENT",
+        "name": "Codex Turn",
+        "startTime": 1782903600010,
+        "endTime": 1782903601100,
+        "attributes": {
+          "traceroot.span.type": "AGENT",
+          "traceroot.span.path": [
+            "Codex Turn"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-prompt-image",
+          "traceroot.span.input": "what colour is this image?",
+          "traceroot.span.output": "It is blue.",
+          "traceroot.span.metadata": "{\"codex.turn_id\":\"turn-look\",\"codex.thread_id\":\"sess-prompt-image\",\"codex.model\":\"gpt-5.5\",\"codex.model_provider\":\"openai\",\"codex.cli_version\":\"0.165.0\",\"codex.tool_call_count\":0}"
+        },
+        "complete": true
+      },
+      {
+        "spanId": "bc321c1233756515",
+        "parentSpanId": "645737d1d553045c",
+        "traceId": "da0929c85663e4e17dc4718106af2805",
+        "kind": "LLM",
+        "name": "gpt-5.5",
+        "startTime": 1782903600030,
+        "endTime": 1782903601050,
+        "attributes": {
+          "traceroot.span.type": "LLM",
+          "traceroot.span.path": [
+            "Codex Turn",
+            "gpt-5.5"
+          ],
+          "traceroot.sdk.name": "traceroot-codex-plugin",
+          "traceroot.sdk.version": "0.1.1",
+          "traceroot.trace.session_id": "sess-prompt-image",
+          "traceroot.llm.model": "gpt-5.5",
+          "traceroot.span.input": "what colour is this image?",
+          "traceroot.span.output": "{\"content\":\"It is blue.\"}",
+          "traceroot.span.metadata": "{\"codex.step_index\":0}",
+          "llm.token_count.prompt": 700,
+          "llm.token_count.completion": 5
+        },
+        "complete": true
+      }
+    ]
+  }
+}

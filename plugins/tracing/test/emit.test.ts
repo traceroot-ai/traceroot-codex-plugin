@@ -1,42 +1,22 @@
-import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildTracingWith } from "../src/exporter.js";
-import { PrimedIdGenerator } from "../src/ids.js";
 import { dispatch } from "../src/emit.js";
-import type { Config } from "../src/config.js";
+import { copyFixture, memExporter, testConfig } from "./helpers.js";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const config: Config = {
-  enabled: true, apiKey: "tr-x", hostUrl: "http://x", maxChars: 20000, debug: false, failOnError: true,
-};
+const config = testConfig();
 
 let dir: string;
 afterEach(async () => { if (dir) await fs.rm(dir, { recursive: true, force: true }); });
-
-async function copyFixture(): Promise<string> {
-  dir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-emit-"));
-  const dst = path.join(dir, "rollout.jsonl");
-  await fs.copyFile(path.join(here, "fixtures", "rollout-basic.jsonl"), dst);
-  return dst;
-}
 
 describe("dispatch", () => {
   it("emits AGENT+LLM+TOOL once, and is idempotent on a second run", async () => {
     const transcript = await copyFixture();
     const mem = new InMemorySpanExporter();
-    // dispatch() calls tracing.shutdown() internally, and provider.shutdown()
-    // clears InMemorySpanExporter. Override shutdown with a no-op so the
-    // exporter retains the spans for assertions (SimpleSpanProcessor already
-    // exported them on span.end()).
     const deps = {
-      buildTracing: () => ({
-        ...buildTracingWith(new SimpleSpanProcessor(mem), new PrimedIdGenerator()),
-        shutdown: async () => {},
-      }),
+      exporter: () => memExporter(mem),
       getGit: async () => ({ repo: "traceroot-ai/traceroot", ref: "a".repeat(40) }),
     };
 
@@ -51,18 +31,13 @@ describe("dispatch", () => {
   });
 
   it("live: completed LLM/TOOL stream mid-turn with NO root (trace stays live); Stop emits the root", async () => {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-live-"));
-    const transcript = path.join(dir, "rollout.jsonl");
-    await fs.copyFile(path.join(here, "fixtures", "rollout-inprogress.jsonl"), transcript);
+    const transcript = await copyFixture("rollout-inprogress.jsonl");
 
     const mem = new InMemorySpanExporter();
-    // no-op shutdown so the InMemory exporter keeps spans across dispatch() calls
-    // (dispatch calls provider.shutdown() internally, which would clear it).
+    // memExporter never shuts the InMemory exporter down, so it keeps spans
+    // across dispatch() calls.
     const deps = {
-      buildTracing: () => ({
-        ...buildTracingWith(new SimpleSpanProcessor(mem), new PrimedIdGenerator()),
-        shutdown: async () => {},
-      }),
+      exporter: () => memExporter(mem),
       getGit: async () => ({}),
     };
 
@@ -97,7 +72,7 @@ describe("dispatch", () => {
     await fs.writeFile(transcript, lines);
     const mem = new InMemorySpanExporter();
     const deps = {
-      buildTracing: () => ({ ...buildTracingWith(new SimpleSpanProcessor(mem), new PrimedIdGenerator()), shutdown: async () => {} }),
+      exporter: () => memExporter(mem),
       getGit: async () => ({}),
     };
     const r = await dispatch({ transcript_path: transcript }, config, deps);

@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { isImageDataUrl } from "./images.js";
 import type {
   EventMsgPayload, ModelStep, ResponseItem, RolloutLine, SessionMeta, SubagentRef, ToolCall, Turn, TurnContextPayload,
 } from "./types.js";
@@ -56,6 +57,14 @@ function messageText(content: unknown): string | undefined {
   return parts.length ? parts.join("") : undefined;
 }
 
+/** Image data URLs, in the formats kept whole, among a message's `input_image` content parts. */
+function messageImages(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  return (content as Array<{ type?: string; image_url?: unknown }>)
+    .filter((c) => c?.type === "input_image" && typeof c.image_url === "string" && isImageDataUrl(c.image_url))
+    .map((c) => c.image_url as string);
+}
+
 // Codex and plugins reuse role:"user" for synthetic context blocks. These can
 // appear before or after the real prompt and must not become trace input. This
 // denylist is best-effort: third-party plugins may introduce new wrapper tags.
@@ -97,8 +106,16 @@ function parseSpawnAgentId(output: unknown): string | undefined {
   return typeof id === "string" && id ? id : undefined;
 }
 
+/** Adds a subagent ref to `t`, or fills in the spawn call id of one already recorded. */
+function addSubagent(t: Turn, ref: SubagentRef): void {
+  const existing = (t.subagents ??= []).find((s) => s.threadId === ref.threadId);
+  if (!existing) t.subagents.push(ref);
+  else existing.spawnCallId ??= ref.spawnCallId;
+}
+
 export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; turns: Turn[] } {
   let sessionMeta: SessionMeta = { sessionId: "" };
+  let sawSessionMeta = false;
   const turns: Turn[] = [];
   let turn: Turn | undefined;
   let step: ModelStep | undefined;
@@ -131,6 +148,9 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
   for (const line of lines) {
     const at = ms(line.timestamp);
     if (line.type === "session_meta") {
+      // A forked child rollout copies its parent's session_meta after its own; keep the first.
+      if (sawSessionMeta) continue;
+      sawSessionMeta = true;
       sessionMeta = {
         sessionId: (line.payload as { id: string }).id,
         cwd: (line.payload as { cwd?: string }).cwd,
@@ -173,6 +193,17 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
             const text = messageText(p.item.content);
             if (text) appendAuthoritativeUserInput(turn, text);
           }
+          // Codex 0.166+, paginated history: the spawn's call_id is the item's id.
+          if (turn && p.item?.type === "SubAgentActivity" && p.item.kind === "started") {
+            const { agent_thread_id: threadId, id: spawnCallId } = p.item;
+            if (typeof threadId === "string" && typeof spawnCallId === "string") addSubagent(turn, { threadId, spawnCallId });
+          }
+          break;
+        case "sub_agent_activity":
+          // Codex 0.166+, legacy history: the spawn's call_id is the event_id.
+          if (turn && p.kind === "started" && typeof p.agent_thread_id === "string" && typeof p.event_id === "string") {
+            addSubagent(turn, { threadId: p.agent_thread_id, spawnCallId: p.event_id });
+          }
           break;
         case "agent_message":
           // Older Codex versions emit this before task_complete. Keep it as a
@@ -202,7 +233,7 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
           if (turn && typeof p.new_thread_id === "string") {
             const ref: SubagentRef = { threadId: p.new_thread_id };
             if (typeof p.call_id === "string") ref.spawnCallId = p.call_id;
-            (turn.subagents ??= []).push(ref);
+            addSubagent(turn, ref);
           }
           if (turn && p.type.endsWith("_end") && typeof p.call_id === "string") {
             const tc = toolsByCallId.get(p.call_id);
@@ -225,13 +256,13 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
         // Tool output can arrive after token_count closed the step; never open a new
         // step for it — just attach to the toolCall recorded in its original step.
         const tc = toolsByCallId.get(p.call_id);
-        if (tc) { tc.endTime = at; tc.output = p.output; }
+        if (tc) { tc.endTime = at; tc.output = p.output; tc.outputItemSeen = true; }
         // spawn_agent's output carries the child thread id: {"agent_id":"...."}.
         // Record it (with the spawn tool's call_id) so the subagent's spans nest
         // under this spawn_agent TOOL span, in the same trace.
         if (turn && spawnAgentCallIds.has(p.call_id)) {
           const threadId = parseSpawnAgentId(p.output);
-          if (threadId) (turn.subagents ??= []).push({ threadId, spawnCallId: p.call_id });
+          if (threadId) addSubagent(turn, { threadId, spawnCallId: p.call_id });
         }
         continue;
       }
@@ -246,6 +277,15 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
           // clean user_message or item_completed/UserMessage representation.
           if (text && !isInjectedFallbackText(text) && !userInputFallback.has(turn)) {
             userInputFallback.set(turn, text);
+          }
+          // Images attached to a user message are read from here, whichever event
+          // carried its text, and belong to the model call that follows it: the
+          // prompt's to the first call, a message sent while the turn runs to a
+          // later one.
+          if (!text || !isInjectedFallbackText(text)) {
+            for (const url of messageImages(p.content)) {
+              if (!turn.steps.some((t) => t.userImages?.includes(url))) (s.userImages ??= []).push(url);
+            }
           }
         } else if (p.role !== "developer") {
           s.text = text;

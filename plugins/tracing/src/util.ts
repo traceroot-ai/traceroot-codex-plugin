@@ -15,3 +15,7 @@ export function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return `${s.slice(0, max)}…[truncated ${s.length - max} chars]`;
 }
+
+/** `v` as text, a string as-is and anything else as JSON, cut at `max` characters. */
+export const str = (v: unknown, max: number): string =>
+  truncate(typeof v === "string" ? v : JSON.stringify(v ?? ""), max);

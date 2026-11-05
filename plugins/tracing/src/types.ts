@@ -63,7 +63,7 @@ export type EventMsgPayload = {
   last_agent_message?: string | null;
   info?: { total_token_usage?: TokenUsage; last_token_usage?: TokenUsage; model_context_window?: number } | null;
   /** item_completed */
-  item?: { type?: string; content?: MessageContentPart[] } | null;
+  item?: { type?: string; content?: MessageContentPart[]; [key: string]: unknown } | null;
   // *_end event fields
   status?: string;
   exit_code?: number;
@@ -90,6 +90,8 @@ export type ToolCall = {
   startTime: number;
   endTime?: number;
   output?: unknown;
+  /** The function_call_output / custom_tool_call_output item was read. */
+  outputItemSeen?: boolean;
   error?: string;
   // enriched from *_end event_msg
   kind?: string;
@@ -105,6 +107,11 @@ export type ModelStep = {
   text?: string;
   toolCalls: ToolCall[];
   usage?: TokenUsage;
+  /**
+   * Image data URLs from the user messages before this model call, in order,
+   * leaving out any that an earlier call of the turn already has.
+   */
+  userImages?: string[];
 };
 
 export type SubagentRef = { threadId: string; spawnCallId?: string };
