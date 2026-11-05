@@ -32,7 +32,7 @@ describe("sendInRequests", () => {
     const spans = await makeSpans(["1".repeat(16), "2".repeat(16)]);
     const inner = new ScriptedExporter();
     const delivered = new Set<string>();
-    await sendInRequests(inner, spans, BUDGET, delivered);
+    await sendInRequests(inner, spans, { maxBytes: BUDGET }, delivered);
     expect(inner.calls).toEqual([spans]);
     expect([...delivered].sort()).toEqual(["1".repeat(16), "2".repeat(16)]);
   });
@@ -40,7 +40,7 @@ describe("sendInRequests", () => {
   it("rejects and records nothing for a failed request (e.g. a 413 or 503 from the backend)", async () => {
     const spans = await makeSpans(["3".repeat(16)]);
     const delivered = new Set<string>();
-    await expect(sendInRequests(new ScriptedExporter(() => failed("Request Entity Too Large")), spans, BUDGET, delivered))
+    await expect(sendInRequests(new ScriptedExporter(() => failed("Request Entity Too Large")), spans, { maxBytes: BUDGET }, delivered))
       .rejects.toThrow("Request Entity Too Large");
     expect(delivered.size).toBe(0);
   });
@@ -61,7 +61,7 @@ describe("sendInRequests", () => {
     };
     const delivered = new Set<string>();
 
-    await expect(sendInRequests(inner, spans, BUDGET, delivered)).rejects.toThrow("Request Entity Too Large");
+    await expect(sendInRequests(inner, spans, { maxBytes: BUDGET }, delivered)).rejects.toThrow("Request Entity Too Large");
     expect(calls.map((c) => c.length)).toEqual([1024, 1024, 1]);
     expect(maxInFlight).toBe(1);
     expect([...delivered].sort()).toEqual(ids(calls[1]!).sort());

@@ -2,8 +2,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { drainSession, type HandOff, type LockTimings, type SessionLock, withSessionLock } from "../src/lock.js";
+import { drainSession, type HandOff, type LockTimings, pathsOf, type SessionLock, withSessionLock } from "../src/lock.js";
 import { setDebug } from "../src/util.js";
+import { deferred } from "./helpers.js";
 
 type Op =
   | "open" | "stat" | "lstat" | "readFile" | "writeFile" | "link" | "rename" | "rm" | "mkdir" | "rmdir" | "readdir"
@@ -57,9 +58,9 @@ async function rolloutPath(): Promise<string> {
   return path.join(dir, "rollout.jsonl");
 }
 
-const lockOf = (rollout: string) => `${rollout}.traceroot.lock.d`;
-const pendingOf = (rollout: string) => `${rollout}.traceroot.pending.d`;
-const drainerOf = (rollout: string) => `${rollout}.traceroot.drainer.d`;
+const lockOf = (rollout: string) => pathsOf(rollout).lockDir;
+const pendingOf = (rollout: string) => pathsOf(rollout).pendingDir;
+const drainerOf = (rollout: string) => pathsOf(rollout).drainerDir;
 const exists = (p: string) => real.access(p).then(() => true, () => false);
 const ownersOf = (rollout: string) => real.readdir(lockOf(rollout)).catch(() => []);
 const requestsOf = (rollout: string) => real.readdir(pendingOf(rollout)).catch(() => []);
@@ -82,12 +83,6 @@ async function replaceLock(rollout: string, owner: string): Promise<void> {
   await leaveLock(rollout, owner);
 }
 
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((r) => { resolve = r; });
-  return { promise, resolve };
-}
-
 describe("withSessionLock under exact interleavings", () => {
   it("does not remove a lock that another hook took over just before this hook released", async () => {
     const rollout = await rolloutPath();
@@ -101,7 +96,7 @@ describe("withSessionLock under exact interleavings", () => {
         fired = true;
         await replaceLock(rollout, other);
       };
-    }, T);
+    }, { timings: T });
 
     expect(await ownersOf(rollout)).toEqual([other]);
   });
@@ -121,7 +116,7 @@ describe("withSessionLock under exact interleavings", () => {
     };
     let ran = false;
 
-    expect(await withSessionLock(rollout, async () => { ran = true; }, T)).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => { ran = true; }, { timings: T })).toBeUndefined();
     expect(ran).toBe(false);
     expect(await ownersOf(rollout)).toEqual([live]);
   });
@@ -137,7 +132,7 @@ describe("withSessionLock under exact interleavings", () => {
     };
     let ran = false;
 
-    expect(await withSessionLock(rollout, async () => { ran = true; }, T)).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => { ran = true; }, { timings: T })).toBeUndefined();
     expect(looks).toBeGreaterThanOrEqual(2);
     expect(ran).toBe(false);
     expect(await ownersOf(rollout)).toEqual([holder]);
@@ -156,7 +151,7 @@ describe("withSessionLock under exact interleavings", () => {
         };
       }
       held.push(await lock.held()); // a run that finds its lock gone sends nothing
-    }, T);
+    }, { timings: T });
 
     expect(held).toEqual([false, true]);
     expect(await requestsOf(rollout)).toEqual([]);
@@ -183,7 +178,7 @@ describe("withSessionLock under exact interleavings", () => {
     const sleep = async () => { if (++sleeps === 1) await released(); };
     const locked: boolean[] = [];
 
-    await withSessionLock(rollout, async () => { locked.push(await exists(lockOf(rollout))); }, { ...T, waitMs, sleep });
+    await withSessionLock(rollout, async () => { locked.push(await exists(lockOf(rollout))); }, { timings: { ...T, waitMs, sleep } });
 
     expect(tries).toBeGreaterThanOrEqual(2);
     expect(locked).not.toContain(false);
@@ -198,7 +193,7 @@ describe("withSessionLock under exact interleavings", () => {
     };
     let ran = false;
 
-    await expect(withSessionLock(rollout, async () => { ran = true; }, T)).rejects.toThrow("EIO");
+    await expect(withSessionLock(rollout, async () => { ran = true; }, { timings: T })).rejects.toThrow("EIO");
     expect(ran).toBe(false);
     expect(await exists(lockOf(rollout))).toBe(false);
   });
@@ -212,7 +207,7 @@ describe("withSessionLock under exact interleavings", () => {
     };
     let ran = false;
 
-    await drainSession(rollout, async () => { ran = true; }, { ...T, waitMs: 20, rerunBudgetMs: 40 });
+    await drainSession(rollout, async () => { ran = true; }, { timings: { ...T, waitMs: 20, rerunBudgetMs: 40 } });
     expect(ran).toBe(false);
     expect(await requestsOf(rollout)).toEqual(["waiting"]);
     expect(await exists(drainerOf(rollout))).toBe(false);
@@ -229,7 +224,9 @@ describe("withSessionLock under exact interleavings", () => {
     let ran = false;
     let drainers = 0;
 
-    expect(await withSessionLock(rollout, async () => { ran = true; }, T, false, () => { drainers += 1; })).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => { ran = true; }, {
+      timings: T, startDrainer: () => { drainers += 1; },
+    })).toBeUndefined();
     expect(ran).toBe(false);
     expect(drainers).toBe(0); // it left nothing to serve
     expect(await exists(pendingOf(rollout))).toBe(false);
@@ -272,9 +269,12 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       await resume[who].promise;
     };
 
-    const a = as("a", () => withSessionLock(rollout, () => runs.run(async () => { runningA.resolve(); await finish.promise; }), T));
+    const a = as("a", () => withSessionLock(rollout, () => runs.run(async () => {
+      runningA.resolve();
+      await finish.promise;
+    }), { timings: T }));
     await paused.a.promise;
-    const b = as("b", () => withSessionLock(rollout, () => runs.run(), T));
+    const b = as("b", () => withSessionLock(rollout, () => runs.run(), { timings: T }));
     await paused.b.promise;
     resume.a.resolve();
     await runningA.promise; // A removed the entry and the emptied lock, then took the lock
@@ -316,18 +316,18 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       }
       stepping = true;
       heldByHolder.push(await as("check", () => holderLock!.held()));
-      await as("newcomer", () => withSessionLock(rollout, () => runs.run(), T));
+      await as("newcomer", () => withSessionLock(rollout, () => runs.run(), { timings: T }));
       stepping = false;
     };
 
-    const breaker = as("breaker", () => withSessionLock(rollout, () => runs.run(), T));
+    const breaker = as("breaker", () => withSessionLock(rollout, () => runs.run(), { timings: T }));
     await looked.promise;
     const holder = as("holder", () => withSessionLock(rollout, (lock) => runs.run(async () => {
       if (holderLock) return;
       holderLock = lock;
       running.resolve();
       await finish.promise;
-    }), T));
+    }), { timings: T }));
     await running.promise;
     resume.resolve();
     await breaker;
@@ -360,10 +360,10 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
           otherLock = lock;
           running.resolve();
           await finish.promise;
-        }), T));
+        }), { timings: T }));
         await Promise.race([running.promise, other]);
       };
-      await as("slow", () => withSessionLock(rollout, () => runs.run(), T));
+      await as("slow", () => withSessionLock(rollout, () => runs.run(), { timings: T }));
       steps.before = undefined;
       const heldAfter = otherLock ? await otherLock.held() : true;
       finish.resolve();
@@ -429,15 +429,15 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       const dying = as("dying", () => withSessionLock(rollout, async () => {
         if (dieAt === 0) { died.resolve(); await never; }
         state.releasing = true;
-      }, quiet));
+      }, { timings: quiet }));
       Object.defineProperty(process, "pid", pid);
       const dead = await Promise.race([died.promise.then(() => true), dying.then(() => false)]);
 
-      const a = as("a", () => withSessionLock(rollout, runOf("a"), quiet));
+      const a = as("a", () => withSessionLock(rollout, runOf("a"), { timings: quiet }));
       await Promise.race([paused.a.promise, started.a.promise, a]);
       let b: Promise<unknown> = Promise.resolve();
       if (state.aPaused) {
-        b = as("b", () => withSessionLock(rollout, runOf("b"), quiet));
+        b = as("b", () => withSessionLock(rollout, runOf("b"), { timings: quiet }));
         await Promise.race([paused.b.promise, started.b.promise, b]);
         resume.a.resolve();
         await Promise.race([started.a.promise, a]);
@@ -490,7 +490,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       await resume.promise;
     };
 
-    const old = as("old", () => withSessionLock(rollout, async () => {}, quiet));
+    const old = as("old", () => withSessionLock(rollout, async () => {}, { timings: quiet }));
     await paused.promise;
     // It stays silent past the stale limit, and a newer hook takes the lock over and claims the request.
     const [owner] = await ownersOf(rollout);
@@ -503,7 +503,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       served.push(handOff);
       newerRunning.resolve();
       await finishNewer.promise;
-    }, quiet));
+    }, { timings: quiet }));
     await newerRunning.promise;
     resume.resolve();
     await old;
@@ -525,7 +525,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
     // The Stop hands off to a hook that took the lock as the drainer let go of it,
     // and that hook exits past its budget: both may find the drainer still serving.
     ["a hook takes the lock, and the Stop hands off to it and exits", (rollout, stop, startDrainer, runs) =>
-      as("holder", () => withSessionLock(rollout, () => runs.run(stop), { ...T, rerunBudgetMs: 0 }, false, startDrainer)), 2],
+      as("holder", () => withSessionLock(rollout, () => runs.run(stop), { timings: { ...T, rerunBudgetMs: 0 }, startDrainer })), 2],
   ])("leaves no run unserved when, wherever a drainer pauses, %s", async (_label, arrive, hooks) => {
     // Drainers wait for the lock as they would for a hook's run.
     const D: LockTimings = { ...T, waitMs: 2_000 };
@@ -537,13 +537,15 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       const served: HandOff[] = [];
       const run = (_lock: SessionLock, handOff: HandOff) => runs.run(async () => { served.push(handOff); });
       const drainers: Promise<void>[] = [];
-      const startDrainer = () => { drainers.push(as("another drainer", () => drainSession(rollout, run, D))); };
+      const startDrainer = () => { drainers.push(as("another drainer", () => drainSession(rollout, run, { timings: D }))); };
       let reached = false;
       let stopRan = false;
       let stopAt: number | undefined;
       const stop = async () => {
         stopAt = Date.now();
-        await as("stop", () => withSessionLock(rollout, () => runs.run(async () => { stopRan = true; }), T, true, startDrainer));
+        await as("stop", () => withSessionLock(rollout, () => runs.run(async () => { stopRan = true; }), {
+          timings: T, endsTurn: true, startDrainer,
+        }));
       };
 
       // Right before the drainer's operation number `pauseAt`, the hooks arrive. A
@@ -555,7 +557,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
         reached = true;
         await arrive(rollout, stop, startDrainer, runs);
       };
-      await as("drainer", () => drainSession(rollout, run, D));
+      await as("drainer", () => drainSession(rollout, run, { timings: D }));
       steps.before = undefined;
       await Promise.all(drainers);
       const left = await requestsOf(rollout);
@@ -587,7 +589,7 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
       const holder = as("holder", () => withSessionLock(rollout, async (_lock, handOff) => {
         served.push(handOff);
         if (served.length === 1) { started.resolve(); await gate.promise; }
-      }, T));
+      }, { timings: T }));
       await started.promise;
 
       // Right before the older Stop's operation number `pauseAt`, a newer Stop hands off in full.
@@ -597,9 +599,9 @@ describe("withSessionLock with one hook stepped at every file operation", () => 
         if (actor.getStore() !== "older" || ++ops !== pauseAt) return;
         vi.setSystemTime(Date.now() + 1_000);
         newer = Date.now();
-        expect(await as("newer", () => withSessionLock(rollout, async () => {}, T, true))).toBeUndefined();
+        expect(await as("newer", () => withSessionLock(rollout, async () => {}, { timings: T, endsTurn: true }))).toBeUndefined();
       };
-      expect(await as("older", () => withSessionLock(rollout, async () => {}, T, true))).toBeUndefined();
+      expect(await as("older", () => withSessionLock(rollout, async () => {}, { timings: T, endsTurn: true }))).toBeUndefined();
       steps.before = undefined;
       gate.resolve();
       await holder;

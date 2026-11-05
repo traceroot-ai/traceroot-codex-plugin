@@ -33,9 +33,6 @@ export type Deps = {
   startDrainer: (hook: HookInput) => void;
 };
 
-const buildLockedTracing: Deps["buildTracing"] = (c, stillHeld, onDelivered) =>
-  defaultBuildTracing(c, undefined, stillHeld, onDelivered);
-
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
 async function emitTurnTree(
   sessionMeta: SessionMeta,
@@ -121,8 +118,11 @@ export async function dispatch(
   // Reading the rollout, exporting and recording what was sent run under the
   // session's lock, so concurrent hooks of one session deliver in the order they read.
   const result = await withSessionLock(
-    transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), deps?.lockTimings,
-    hook.hook_event_name === "Stop", () => (deps?.startDrainer ?? spawnDrainer)(hook),
+    transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), {
+      timings: deps?.lockTimings,
+      endsTurn: hook.hook_event_name === "Stop",
+      startDrainer: () => (deps?.startDrainer ?? spawnDrainer)(hook),
+    },
   );
   // undefined: the hook holding the lock runs again for this one, or this one couldn't ask it to.
   return result ?? { emitted: 0 };
@@ -135,15 +135,16 @@ export async function drain(hook: HookInput, config: Config, deps?: Partial<Deps
   // No hook event of its own: it ends a turn only for a Stop among the runs it serves.
   const session: HookInput = { transcript_path: transcript, cwd: hook.cwd };
   await drainSession(
-    transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), deps?.drainTimings,
-    () => (deps?.startDrainer ?? spawnDrainer)(session),
+    transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), {
+      timings: deps?.drainTimings,
+      startDrainer: () => (deps?.startDrainer ?? spawnDrainer)(session),
+    },
   );
 }
 
 async function emitSession(
   hook: HookInput, transcript: string, config: Config, lock: SessionLock, handOff: HandOff, deps?: Partial<Deps>,
 ): Promise<{ emitted: number }> {
-  const buildTracingFn = deps?.buildTracing ?? buildLockedTracing;
   const getGit = deps?.getGit ?? getGitContext;
   const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
 
@@ -187,7 +188,9 @@ async function emitSession(
     for (const id of fresh) marked.add(id);
     await markSpansEmitted(transcript, fresh);
   };
-  const tracing = buildTracingFn(config, lock.held, record);
+  const tracing = deps?.buildTracing
+    ? deps.buildTracing(config, lock.held, record)
+    : defaultBuildTracing(config, undefined, lock.held, record);
   let emitted = 0;
   const emittedIds: string[] = [];
 

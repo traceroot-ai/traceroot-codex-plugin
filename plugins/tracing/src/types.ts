@@ -90,6 +90,8 @@ export type ToolCall = {
   startTime: number;
   endTime?: number;
   output?: unknown;
+  /** The function_call_output / custom_tool_call_output item was read. */
+  outputItemSeen?: boolean;
   error?: string;
   // enriched from *_end event_msg
   kind?: string;

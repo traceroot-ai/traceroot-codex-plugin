@@ -234,7 +234,7 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
         // Tool output can arrive after token_count closed the step; never open a new
         // step for it — just attach to the toolCall recorded in its original step.
         const tc = toolsByCallId.get(p.call_id);
-        if (tc) { tc.endTime = at; tc.output = p.output; }
+        if (tc) { tc.endTime = at; tc.output = p.output; tc.outputItemSeen = true; }
         // spawn_agent's output carries the child thread id: {"agent_id":"...."}.
         // Record it (with the spawn tool's call_id) so the subagent's spans nest
         // under this spawn_agent TOOL span, in the same trace.

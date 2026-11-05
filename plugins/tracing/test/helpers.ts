@@ -84,6 +84,13 @@ export class ScriptedExporter implements SpanExporter {
   }
 }
 
+/** A promise and the function that resolves it, for a test to release a step it holds. */
+export function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
 /** `count` distinct span ids. */
 export const distinctIds = (count: number): string[] =>
   Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(16, "0"));

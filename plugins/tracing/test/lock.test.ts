@@ -12,10 +12,10 @@ import type { Config } from "../src/config.js";
 import { dispatch, drain } from "../src/emit.js";
 import { buildTracing } from "../src/exporter.js";
 import { makeSpanId } from "../src/ids.js";
-import { drainSession, type HandOff, type LockTimings, withSessionLock } from "../src/lock.js";
+import { drainSession, type HandOff, type LockTimings, pathsOf, withSessionLock } from "../src/lock.js";
 import { loadEmittedSpanIds } from "../src/sidecar.js";
 import type { HookInput } from "../src/types.js";
-import { failed, ids, OK, ScriptedExporter } from "./helpers.js";
+import { deferred, failed, ids, OK, ScriptedExporter } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const T: LockTimings = { waitMs: 2_000, staleMs: 60_000, heartbeatMs: 1_000, rerunBudgetMs: 60_000, pollMs: 5 };
@@ -31,7 +31,7 @@ async function rolloutPath(): Promise<string> {
   return path.join(dir, "rollout.jsonl");
 }
 
-const lockOf = (rollout: string) => `${rollout}.traceroot.lock.d`;
+const lockOf = (rollout: string) => pathsOf(rollout).lockDir;
 /** The owners in the lock: the names in its directory. */
 const ownersOf = async (rollout: string) => fs.readdir(lockOf(rollout)).catch(() => []);
 /** Leaves a lock whose only owner is `owner`, last touched `ageMs` ago. */
@@ -47,7 +47,7 @@ function takeOver(rollout: string, owner: string): void {
   for (const name of readdirSync(lockOf(rollout))) rmSync(path.join(lockOf(rollout), name), { force: true });
   writeFileSync(path.join(lockOf(rollout), owner), owner);
 }
-const pendingOf = (rollout: string) => `${rollout}.traceroot.pending.d`;
+const pendingOf = (rollout: string) => pathsOf(rollout).pendingDir;
 const exists = (p: string) => fs.access(p).then(() => true, () => false);
 /** The requests waiting for a run: their turn ends, or NaN for one that names none. */
 const requestsOf = async (rollout: string) => {
@@ -60,7 +60,7 @@ async function leaveRequest(rollout: string, turnEndedAt?: number): Promise<void
   await fs.mkdir(pendingOf(rollout), { recursive: true });
   await fs.writeFile(path.join(pendingOf(rollout), randomUUID()), turnEndedAt === undefined ? "" : String(turnEndedAt));
 }
-const drainerOf = (rollout: string) => `${rollout}.traceroot.drainer.d`;
+const drainerOf = (rollout: string) => pathsOf(rollout).drainerDir;
 /** Leaves the drainer directory naming `owner`, as a drainer serving the session does. */
 async function leaveDrainer(rollout: string, owner: string): Promise<void> {
   await fs.mkdir(drainerOf(rollout));
@@ -83,12 +83,6 @@ function die(pid: number, ...dirs: string[]): void {
 }
 const never = new Promise<void>(() => {});
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((r) => { resolve = r; });
-  return { promise, resolve };
-}
 
 /** Timings whose hook resolves `waiting` once it has found the lock held and starts waiting. */
 function waitingTimings(timings: LockTimings, waiting: { resolve: () => void }): LockTimings {
@@ -135,9 +129,9 @@ describe("withSessionLock", () => {
       started.resolve();
       await gate.promise;
       events.push("first:end");
-    }, T);
+    }, { timings: T });
     await started.promise;
-    const second = withSessionLock(rollout, async () => { events.push("second:start"); }, waitingTimings(T, waiting));
+    const second = withSessionLock(rollout, async () => { events.push("second:start"); }, { timings: waitingTimings(T, waiting) });
     await waiting.promise; // the second hook found the lock held
     expect(events).toEqual(["first:start"]);
 
@@ -159,10 +153,10 @@ describe("withSessionLock", () => {
       holderRuns += 1;
       if (holderRuns === 1) { started.resolve(); await gate.promise; }
       return holderRuns;
-    }), T);
+    }), { timings: T });
     await started.promise;
     const arrived = performance.now();
-    const waiter = await withSessionLock(rollout, async () => { waiterRan = true; }, { ...T, waitMs: 0 });
+    const waiter = await withSessionLock(rollout, async () => { waiterRan = true; }, { timings: { ...T, waitMs: 0 } });
 
     expect(waiter).toBeUndefined();
     expect(waiterRan).toBe(false);
@@ -188,11 +182,11 @@ describe("withSessionLock", () => {
     const holder = withSessionLock(rollout, async (_lock, handOff) => {
       served.push(handOff);
       if (served.length === 1) { started.resolve(); await gate.promise; }
-    }, T);
+    }, { timings: T });
     await started.promise;
     const firstArrived = Date.now();
     for (const ends of endsTurn) {
-      expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, ends)).toBeUndefined();
+      expect(await withSessionLock(rollout, async () => {}, { timings: { ...T, waitMs: 0 }, endsTurn: ends })).toBeUndefined();
     }
     const lastArrived = Date.now();
     gate.resolve();
@@ -213,7 +207,9 @@ describe("withSessionLock", () => {
     const hooks = Array.from({ length: 12 }, (_, i) => (async () => {
       await sleep((i * 37) % 120);
       arrivals.push(performance.now());
-      return withSessionLock(rollout, () => run(() => sleep(15 + ((i * 7) % 20))), { ...T, waitMs: 25 }, i % 3 === 0);
+      return withSessionLock(rollout, () => run(() => sleep(15 + ((i * 7) % 20))), {
+        timings: { ...T, waitMs: 25 }, endsTurn: i % 3 === 0,
+      });
     })());
 
     await Promise.all(hooks);
@@ -230,7 +226,7 @@ describe("withSessionLock", () => {
     await leaveLock(rollout, owner);
     let ran = false;
 
-    expect(await withSessionLock(rollout, async () => { ran = true; }, { ...T, waitMs: 0 })).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => { ran = true; }, { timings: { ...T, waitMs: 0 } })).toBeUndefined();
     expect(ran).toBe(false);
     expect(await ownersOf(rollout)).toEqual([owner]);
   });
@@ -244,7 +240,7 @@ describe("withSessionLock", () => {
     const rollout = await rolloutPath();
     await leave(rollout);
 
-    expect(await withSessionLock(rollout, async () => "ran", { ...T, waitMs: 0 })).toBe("ran");
+    expect(await withSessionLock(rollout, async () => "ran", { timings: { ...T, waitMs: 0 } })).toBe("ran");
     expect(await exists(lockOf(rollout))).toBe(false);
   });
 
@@ -255,7 +251,7 @@ describe("withSessionLock", () => {
     const started = deferred();
     const gate = deferred();
 
-    const holder = withSessionLock(rollout, () => run(async () => { started.resolve(); await gate.promise; }), timings);
+    const holder = withSessionLock(rollout, () => run(async () => { started.resolve(); await gate.promise; }), { timings });
     await started.promise;
     // Age the lock as if the holder had run past the stale limit, then wait for its next touch.
     const [owner] = await ownersOf(rollout);
@@ -264,7 +260,7 @@ describe("withSessionLock", () => {
     await fs.utimes(entry, old / 1000, old / 1000);
     await until(async () => (await fs.stat(entry)).mtimeMs > old + 60_000, "the holder to touch its lock");
 
-    expect(await withSessionLock(rollout, () => run(async () => {}), { ...timings, waitMs: 0 })).toBeUndefined();
+    expect(await withSessionLock(rollout, () => run(async () => {}), { timings: { ...timings, waitMs: 0 } })).toBeUndefined();
     gate.resolve();
     await holder;
     expect(t.max).toBe(1);
@@ -279,7 +275,7 @@ describe("withSessionLock", () => {
       seen.push(await lock.held());
       takeOver(rollout, `${process.pid}.someone-else`);
       seen.push(await lock.held());
-    }, T);
+    }, { timings: T });
 
     expect(seen).toEqual([true, false]);
     expect(await ownersOf(rollout)).toEqual([`${process.pid}.someone-else`]);
@@ -295,9 +291,9 @@ describe("withSessionLock", () => {
       served.push(handOff);
       if (served.length === 1) { started.resolve(); await gate.promise; return; }
       takeOver(rollout, `${process.pid}.someone-else`); // taken over while serving the Stop
-    }, T);
+    }, { timings: T });
     await started.promise;
-    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true)).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => {}, { timings: { ...T, waitMs: 0 }, endsTurn: true })).toBeUndefined();
     gate.resolve();
     await holder;
 
@@ -311,7 +307,7 @@ describe("withSessionLock", () => {
 
     await withSessionLock(rollout, async () => {
       takeOver(rollout, `${process.pid}.someone-else`);
-    }, T, true);
+    }, { timings: T, endsTurn: true });
 
     const [request] = await requestsOf(rollout);
     expect(request).toBeGreaterThanOrEqual(arrived);
@@ -325,13 +321,13 @@ describe("withSessionLock", () => {
     const holder = withSessionLock(rollout, async (_lock, handOff) => {
       served.push(handOff);
       if (served.length === 1) { started.resolve(); await gate.promise; }
-    }, T);
+    }, { timings: T });
     await started.promise;
     const later = Date.now() + 60_000;
     await fs.mkdir(pendingOf(rollout));
     await fs.writeFile(path.join(pendingOf(rollout), "waiting"), String(later));
 
-    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true)).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => {}, { timings: { ...T, waitMs: 0 }, endsTurn: true })).toBeUndefined();
     expect(await requestsOf(rollout)).toHaveLength(2);
     gate.resolve();
     await holder;
@@ -348,9 +344,9 @@ describe("withSessionLock", () => {
       holderRuns += 1;
       started.resolve();
       await gate.promise;
-    }, { ...T, rerunBudgetMs: 0 });
+    }, { timings: { ...T, rerunBudgetMs: 0 } });
     await started.promise;
-    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 })).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => {}, { timings: { ...T, waitMs: 0 } })).toBeUndefined();
     gate.resolve();
     await holder;
 
@@ -363,7 +359,7 @@ describe("withSessionLock", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const started = deferred();
     const gate = deferred();
-    const first = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, T);
+    const first = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, { timings: T });
     await started.promise;
     let runs = 0;
 
@@ -371,11 +367,13 @@ describe("withSessionLock", () => {
     await withSessionLock(rollout, async () => {
       runs += 1;
       if (runs > 1) return;
-      expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 })).toBeUndefined();
+      expect(await withSessionLock(rollout, async () => {}, { timings: { ...T, waitMs: 0 } })).toBeUndefined();
       vi.setSystemTime(Date.now() + 6_000);
     }, {
-      ...T, waitMs: 60_000, rerunBudgetMs: 15_000,
-      sleep: async () => { vi.setSystemTime(Date.now() + 10_000); gate.resolve(); await first; },
+      timings: {
+        ...T, waitMs: 60_000, rerunBudgetMs: 15_000,
+        sleep: async () => { vi.setSystemTime(Date.now() + 10_000); gate.resolve(); await first; },
+      },
     });
 
     expect(runs).toBe(1);
@@ -384,7 +382,7 @@ describe("withSessionLock", () => {
 
   it("releases the lock when the run throws, and passes the error on", async () => {
     const rollout = await rolloutPath();
-    await expect(withSessionLock(rollout, async () => { throw new Error("boom"); }, T)).rejects.toThrow("boom");
+    await expect(withSessionLock(rollout, async () => { throw new Error("boom"); }, { timings: T })).rejects.toThrow("boom");
     expect(await exists(lockOf(rollout))).toBe(false);
   });
 
@@ -393,8 +391,9 @@ describe("withSessionLock", () => {
     await leaveRequest(rollout, 1234);
     let starts = 0;
 
-    await expect(withSessionLock(rollout, async () => { throw new Error("export failed"); }, T, false, () => { starts += 1; }))
-      .rejects.toThrow("export failed");
+    await expect(withSessionLock(rollout, async () => { throw new Error("export failed"); }, {
+      timings: T, startDrainer: () => { starts += 1; },
+    })).rejects.toThrow("export failed");
     expect(await requestsOf(rollout)).toEqual([1234]);
     expect(starts).toBe(1);
     expect(await exists(lockOf(rollout))).toBe(false);
@@ -404,17 +403,17 @@ describe("withSessionLock", () => {
     const rollout = await rolloutPath();
     const started = deferred();
     const gate = deferred();
-    const first = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, T);
+    const first = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, { timings: T });
     await started.promise;
 
-    await expect(withSessionLock(`${rollout}.other`, async () => "ran", T)).resolves.toBe("ran");
+    await expect(withSessionLock(`${rollout}.other`, async () => "ran", { timings: T })).resolves.toBe("ran");
     gate.resolve();
     await first;
   });
 
   it("runs without a lock when the lock file cannot be created", async () => {
     const rollout = path.join(await rolloutPath(), "missing-dir", "rollout.jsonl");
-    await expect(withSessionLock(rollout, async (lock) => lock.held(), T)).resolves.toBe(true);
+    await expect(withSessionLock(rollout, async (lock) => lock.held(), { timings: T })).resolves.toBe(true);
   });
 });
 
@@ -426,9 +425,9 @@ describe("drainers", () => {
     let starts = 0;
     const startDrainer = () => { starts += 1; };
 
-    const holder = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, T, false, startDrainer);
+    const holder = withSessionLock(rollout, async () => { started.resolve(); await gate.promise; }, { timings: T, startDrainer });
     await started.promise;
-    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, startDrainer)).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => {}, { timings: { ...T, waitMs: 0 }, endsTurn: true, startDrainer })).toBeUndefined();
     expect(starts).toBe(1);
     gate.resolve();
     await holder;
@@ -445,7 +444,9 @@ describe("drainers", () => {
     await before?.(rollout);
     let started = 0;
 
-    await withSessionLock(rollout, () => leaveRequest(rollout), { ...T, rerunBudgetMs: 0 }, false, () => { started += 1; });
+    await withSessionLock(rollout, () => leaveRequest(rollout), {
+      timings: { ...T, rerunBudgetMs: 0 }, startDrainer: () => { started += 1; },
+    });
     expect(started).toBe(starts);
     expect(await hasRequest(rollout)).toBe(true);
   });
@@ -460,14 +461,14 @@ describe("drainers", () => {
     const drainerWaiting = deferred();
     const startDrainer = () => {
       drainers.push(drainSession(rollout, (_lock, handOff) => run(async () => { served.push(handOff); }),
-        waitingTimings(T, drainerWaiting)));
+        { timings: waitingTimings(T, drainerWaiting) }));
     };
 
     const holder = withSessionLock(rollout, () => run(async () => { started.resolve(); await gate.promise; }),
-      { ...T, rerunBudgetMs: 0 }, false, startDrainer);
+      { timings: { ...T, rerunBudgetMs: 0 }, startDrainer });
     await started.promise;
     const arrived = Date.now();
-    expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, startDrainer)).toBeUndefined();
+    expect(await withSessionLock(rollout, async () => {}, { timings: { ...T, waitMs: 0 }, endsTurn: true, startDrainer })).toBeUndefined();
     // The drainer holds the drainer directory and waits for the lock before the holder lets go.
     await drainerWaiting.promise;
     gate.resolve();
@@ -491,10 +492,14 @@ describe("drainers", () => {
     const holder = withSessionLock(rollout, async () => {
       runs.push("holder");
       if (runs.length === 1) { started.resolve(); await gate.promise; }
-    }, T);
+    }, { timings: T });
     await started.promise;
-    await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, () => {
-      drainers.push(drainSession(rollout, async () => { runs.push("drainer"); }, T));
+    await withSessionLock(rollout, async () => {}, {
+      timings: { ...T, waitMs: 0 },
+      endsTurn: true,
+      startDrainer: () => {
+        drainers.push(drainSession(rollout, async () => { runs.push("drainer"); }, { timings: T }));
+      },
     });
     gate.resolve();
     await holder;
@@ -521,11 +526,15 @@ describe("drainers", () => {
       die(killed, lockOf(rollout)); // killed while running for the Stop it claimed
       claimed.resolve();
       await never;
-    }, T);
+    }, { timings: T });
     await started.promise;
     const arrived = Date.now();
-    await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, () => {
-      drainers.push(drainSession(rollout, async (_lock, handOff) => { served.push(handOff); }, T));
+    await withSessionLock(rollout, async () => {}, {
+      timings: { ...T, waitMs: 0 },
+      endsTurn: true,
+      startDrainer: () => {
+        drainers.push(drainSession(rollout, async (_lock, handOff) => { served.push(handOff); }, { timings: T }));
+      },
     });
     gate.resolve();
     await claimed.promise;
@@ -545,11 +554,11 @@ describe("drainers", () => {
       die(killed, lockOf(rollout), drainerOf(rollout));
       running.resolve();
       await never;
-    }, T);
+    }, { timings: T });
     await running.promise; // it died in its run, holding the lock and the drainer directory
     const served: HandOff[] = [];
 
-    await drainSession(rollout, async (_lock, handOff) => { served.push(handOff); }, T);
+    await drainSession(rollout, async (_lock, handOff) => { served.push(handOff); }, { timings: T });
     expect(served).toEqual([{ turnEndedAt: 1234 }]);
     await settled(rollout);
   });
@@ -562,9 +571,9 @@ describe("drainers", () => {
     const run = async (_lock: unknown, handOff: HandOff) => { served.push(handOff); };
     const waiting = deferred();
 
-    const first = drainSession(rollout, run, waitingTimings(T, waiting));
+    const first = drainSession(rollout, run, { timings: waitingTimings(T, waiting) });
     await waiting.promise; // it holds the drainer directory and waits for the lock
-    await drainSession(rollout, run, { ...T, sleep: async () => { throw new Error("waited for the lock"); } });
+    await drainSession(rollout, run, { timings: { ...T, sleep: async () => { throw new Error("waited for the lock"); } } });
     expect(served).toEqual([]);
     await fs.rm(lockOf(rollout), { recursive: true }); // the holder lets go without running for it
     await first;
@@ -579,7 +588,7 @@ describe("drainers", () => {
     await leaveRequest(rollout);
     let ran = false;
 
-    await drainSession(rollout, async () => { ran = true; }, { ...T, waitMs: 20, rerunBudgetMs: 50 });
+    await drainSession(rollout, async () => { ran = true; }, { timings: { ...T, waitMs: 20, rerunBudgetMs: 50 } });
     expect(ran).toBe(false);
     expect(await requestsOf(rollout)).toHaveLength(1);
     expect(await exists(drainerOf(rollout))).toBe(false);
@@ -594,7 +603,7 @@ describe("drainers", () => {
     await drainSession(rollout, async (_lock, handOff) => {
       if (++tries === 1) throw new Error("export failed");
       served.push(handOff);
-    }, { ...T, retryMs: 1 });
+    }, { timings: { ...T, retryMs: 1 } });
     expect(tries).toBe(2);
     expect(served).toEqual([{ turnEndedAt: 1234 }]);
     await settled(rollout);
@@ -612,9 +621,12 @@ describe("drainers", () => {
       tries += 1;
       throw new Error("export failed");
     }, {
-      ...T, rerunBudgetMs: 30_000, retryMs: 1_000,
-      sleep: async (ms) => { waits.push(ms); vi.setSystemTime(Date.now() + ms); },
-    }, () => { starts += 1; });
+      timings: {
+        ...T, rerunBudgetMs: 30_000, retryMs: 1_000,
+        sleep: async (ms) => { waits.push(ms); vi.setSystemTime(Date.now() + ms); },
+      },
+      startDrainer: () => { starts += 1; },
+    });
 
     expect(waits.slice(0, 4)).toEqual([1_000, 2_000, 4_000, 8_000]);
     expect(waits.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(30_000);
@@ -631,7 +643,7 @@ describe("drainers", () => {
     const served: HandOff[] = [];
     const drainers: Promise<void>[] = [];
     const run = async (_lock: unknown, handOff: HandOff) => { served.push(handOff); };
-    const startDrainer = () => { drainers.push(drainSession(rollout, run, T)); };
+    const startDrainer = () => { drainers.push(drainSession(rollout, run, { timings: T })); };
     let arrived = 0;
 
     // The drainer's run outlasts its budget, and the turn's last Stop hands off to
@@ -640,9 +652,11 @@ describe("drainers", () => {
       await run(lock, handOff);
       await sleep(60);
       arrived = Date.now();
-      expect(await withSessionLock(rollout, async () => {}, { ...T, waitMs: 0 }, true, startDrainer)).toBeUndefined();
+      expect(await withSessionLock(rollout, async () => {}, {
+        timings: { ...T, waitMs: 0 }, endsTurn: true, startDrainer,
+      })).toBeUndefined();
       expect(drainers).toHaveLength(0);
-    }, { ...T, rerunBudgetMs: 50 }, startDrainer);
+    }, { timings: { ...T, rerunBudgetMs: 50 }, startDrainer });
     await Promise.all(drainers);
 
     expect(drainers).toHaveLength(1);
@@ -655,7 +669,7 @@ describe("drainers", () => {
     const rollout = await rolloutPath();
     let ran = false;
 
-    await drainSession(rollout, async () => { ran = true; }, { ...T, sleep: async () => { throw new Error("waited"); } });
+    await drainSession(rollout, async () => { ran = true; }, { timings: { ...T, sleep: async () => { throw new Error("waited"); } } });
     expect(ran).toBe(false);
     expect(await exists(drainerOf(rollout))).toBe(false);
     expect(await exists(lockOf(rollout))).toBe(false);

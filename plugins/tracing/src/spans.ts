@@ -99,6 +99,9 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
   const traceId = opts?.traceId ?? makeTraceId(sessionMeta.sessionId, turn.turnId);
   const rootId = makeSpanId(seed + turn.turnId + ":root");
   const rootParentSpanId = opts?.rootParentSpanId !== undefined ? opts.rootParentSpanId : null;
+  // The session's own turn is over once it completes or the Stop hook ends it; a
+  // subagent's turn only once it completes, since it can outlive the parent's turn.
+  const turnOver = rootParentSpanId === null ? turn.completed || !!ctx.turnEnding : turn.completed;
 
   // LLM-step input is the user prompt (first step) or the prior step's tool
   // results fed back to the model (continuation steps) — like the conversation
@@ -125,7 +128,7 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
     }
     const fed: Array<{ name: string; output: unknown }> = [];
     for (const tc of step.toolCalls) {
-      const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx), ctx);
+      const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx, turnOver), ctx);
       children.push(toolSpan);
       fed.push({ name: tc.name, output: fedBackOutput(tc, toolSpan, ctx) });
     }
@@ -176,7 +179,7 @@ export function planTurnSpans(sessionMeta: SessionMeta, turn: Turn, ctx: EmitCtx
     // stop updating until refresh). Deferring it keeps the trace live while the turn
     // runs; meanwhile traceroot.span.path keeps the title "Codex Turn". Subagent roots
     // (rootParentSpanId !== null) stay gated on their own completion.
-    complete: rootParentSpanId === null ? (turn.completed || !!ctx.turnEnding) : turn.completed,
+    complete: turnOver,
   }, ctx);
   return [root, ...children];
 }
@@ -224,6 +227,7 @@ function planStepSpan(
 
 function planToolSpan(
   sessionMeta: SessionMeta, tc: ToolCall, seed: string, parentSpanId: string, traceId: string, ctx: EmitCtx,
+  turnOver: boolean,
 ): EmittableSpan {
   const attrs: SpanAttrs = {
     "traceroot.span.type": "TOOL",
@@ -244,7 +248,11 @@ function planToolSpan(
   return {
     spanId: makeSpanId(seed + tc.callId), parentSpanId, traceId, kind: "TOOL",
     name: tc.name, startTime: tc.startTime, endTime: tc.endTime ?? tc.startTime,
-    attributes: attrs, complete: tc.endTime !== undefined,
+    // Complete once the output item is read, not at an end event: a resumed session
+    // with legacy history records an MCP call's end event before the output item, and
+    // the output, images included, comes only with the item. A call whose output
+    // never comes, as in an interrupted turn, goes out once its turn is over.
+    attributes: attrs, complete: tc.outputItemSeen === true || turnOver,
   };
 }
 

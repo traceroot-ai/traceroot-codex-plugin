@@ -19,14 +19,14 @@ describe("sendInRequests splits by size", () => {
   it("sends 1,024 small spans as one request", async () => {
     const spans = await makeSpans(distinctIds(1024), 100);
     const inner = new ScriptedExporter();
-    await sendInRequests(inner, spans, BUDGET, new Set());
+    await sendInRequests(inner, spans, { maxBytes: BUDGET }, new Set());
     expect(inner.calls).toEqual([spans]);
   });
 
   it("sends spans totalling 30 MiB as three or more requests, each under the budget", async () => {
     const spans = await makeSpans(distinctIds(30), MiB);
     const inner = new ScriptedExporter();
-    await sendInRequests(inner, spans, BUDGET, new Set());
+    await sendInRequests(inner, spans, { maxBytes: BUDGET }, new Set());
     expect(inner.calls.length).toBeGreaterThanOrEqual(3);
     for (const request of inner.calls) expect(sizeOf(request)).toBeLessThanOrEqual(BUDGET);
     expect(inner.calls.flat()).toEqual(spans);
@@ -35,7 +35,7 @@ describe("sendInRequests splits by size", () => {
   it("sends a span larger than the budget on its own", async () => {
     const [small, huge] = [await makeSpans(["1".repeat(16)], 10), await makeSpans(["2".repeat(16)], 2 * MiB)];
     const inner = new ScriptedExporter();
-    await sendInRequests(inner, [...small, ...huge, ...small], MiB, new Set());
+    await sendInRequests(inner, [...small, ...huge, ...small], { maxBytes: MiB }, new Set());
     expect(inner.calls).toEqual([small, huge, small]);
   });
 
@@ -45,7 +45,7 @@ describe("sendInRequests splits by size", () => {
     const inner = new ScriptedExporter(() => (++call === 2 ? failed("Request Entity Too Large") : OK));
     const delivered = new Set<string>();
 
-    await expect(sendInRequests(inner, spans, BUDGET, delivered)).rejects.toThrow("Request Entity Too Large");
+    await expect(sendInRequests(inner, spans, { maxBytes: BUDGET }, delivered)).rejects.toThrow("Request Entity Too Large");
 
     expect(inner.calls.length).toBeGreaterThanOrEqual(3);
     const failedIds = ids(inner.calls[1]!);
@@ -56,13 +56,13 @@ describe("sendInRequests splits by size", () => {
     const spans = await makeSpans(distinctIds(3), MiB);
     let call = 0;
     const inner = new ScriptedExporter(() => (++call === 1 ? "throw" : failed("Service Unavailable")));
-    await expect(sendInRequests(inner, spans, MiB + 1024, new Set())).rejects.toThrow("exporter crashed");
+    await expect(sendInRequests(inner, spans, { maxBytes: MiB + 1024 }, new Set())).rejects.toThrow("exporter crashed");
     expect(inner.calls).toHaveLength(3);
   });
 
   it("succeeds without a request when there are no spans", async () => {
     const inner = new ScriptedExporter();
-    await sendInRequests(inner, [], BUDGET, new Set());
+    await sendInRequests(inner, [], { maxBytes: BUDGET }, new Set());
     expect(inner.calls).toHaveLength(0);
   });
 });

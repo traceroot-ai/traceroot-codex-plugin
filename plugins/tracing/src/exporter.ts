@@ -31,16 +31,6 @@ class CollectingProcessor implements SpanProcessor {
 }
 
 /** One export call; a throwing exporter is reported as a failed export. */
-function exportSafely(
-  exporter: SpanExporter, spans: ReadableSpan[], resultCallback: (result: ExportResult) => void,
-): void {
-  try {
-    exporter.export(spans, resultCallback);
-  } catch (error) {
-    resultCallback({ code: ExportResultCode.FAILED, error: error instanceof Error ? error : new Error(String(error)) });
-  }
-}
-
 export function exportOnce(exporter: SpanExporter, spans: ReadableSpan[]): Promise<ExportResult> {
   return new Promise((resolve) => {
     try {
@@ -55,53 +45,45 @@ export function exportOnce(exporter: SpanExporter, spans: ReadableSpan[]): Promi
 // endpoint never gets an unbounded number of spans in one request.
 const MAX_SPANS_PER_REQUEST = 1024;
 
+export type SendOptions = {
+  maxBytes: number;
+  /** Whether this hook still holds the session's lock, checked right before each request. */
+  stillHeld?: () => Promise<boolean>;
+  /** Records the span ids of an accepted request, before the next request goes out. */
+  onDelivered?: (ids: string[]) => Promise<void>;
+};
+
 /**
  * Sends `spans` as sequential requests of at most 1,024 spans whose estimated size
  * stays within `maxBytes`, to keep each request under the ingest endpoint's size
  * limit; a span whose estimate alone passes `maxBytes` goes in a request of its own.
  * Adds the ids of each accepted request to `delivered`, so a span counts as sent
  * only once the backend accepted it. A failed request fails only its own spans:
- * every request is tried, then the first failure is thrown.
+ * every request is tried, then the first failure is thrown. A request that
+ * `stillHeld` holds back fails too, so the next hook sends its spans.
  */
 export async function sendInRequests(
-  exporter: SpanExporter, spans: ReadableSpan[], maxBytes: number, delivered: Set<string>,
+  exporter: SpanExporter, spans: ReadableSpan[], opts: SendOptions, delivered: Set<string>,
 ): Promise<void> {
   let failure: ExportResult | undefined;
   // One request at a time, so a hook has at most one request body, of up to
   // max_request_bytes, in flight at the ingest endpoint.
-  for (const request of splitBySize(spans, maxBytes, MAX_SPANS_PER_REQUEST)) {
+  for (const request of splitBySize(spans, opts.maxBytes, MAX_SPANS_PER_REQUEST)) {
+    // A hook that froze and lost the session's lock must not send what it read.
+    if (opts.stillHeld && !(await opts.stillHeld())) {
+      failure ??= { code: ExportResultCode.FAILED, error: new Error("not sent: the session lock was taken over") };
+      continue;
+    }
     const result = await exportOnce(exporter, request);
     if (result.code !== ExportResultCode.SUCCESS) {
       failure ??= result;
       continue;
     }
-    for (const span of request) delivered.add(span.spanContext().spanId);
+    const ids = request.map((span) => span.spanContext().spanId);
+    for (const id of ids) delivered.add(id);
+    await opts.onDelivered?.(ids);
   }
   if (failure) throw failure.error ?? new Error("span export failed");
-}
-
-/**
- * Sends a request only if `stillHeld()` says this hook still holds the session's
- * lock, checked right before each request. A request held back is reported as
- * failed, so its spans are not recorded as delivered and the next hook sends them.
- */
-export class LockGuardedExporter implements SpanExporter {
-  constructor(private readonly inner: SpanExporter, private readonly stillHeld: () => Promise<boolean>) {}
-
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    void this.stillHeld().catch(() => false).then((held) => {
-      if (held) exportSafely(this.inner, spans, resultCallback);
-      else resultCallback({ code: ExportResultCode.FAILED, error: new Error("not sent: the session lock was taken over") });
-    });
-  }
-
-  shutdown(): Promise<void> {
-    return this.inner.shutdown();
-  }
-
-  forceFlush(): Promise<void> {
-    return this.inner.forceFlush?.() ?? Promise.resolve();
-  }
 }
 
 export function buildTracingWith(
@@ -133,7 +115,10 @@ function otlpExporter(config: Config): SpanExporter {
   });
 }
 
-export function buildTracing(config: Config, exporter: SpanExporter = otlpExporter(config)): Tracing {
+export function buildTracing(
+  config: Config, exporter: SpanExporter = otlpExporter(config), stillHeld?: () => Promise<boolean>,
+  onDelivered?: (ids: string[]) => Promise<void>,
+): Tracing {
   // A hook ends every span before it sends any, so the spans are collected and
   // sent at shutdown, one request at a time. Nothing goes out earlier and nothing
   // is dropped, and shutdown sees the result of every request.
@@ -143,7 +128,9 @@ export function buildTracing(config: Config, exporter: SpanExporter = otlpExport
     ...buildTracingWith(collected, new PrimedIdGenerator(), delivered),
     shutdown: async () => {
       try {
-        await sendInRequests(exporter, collected.spans, config.maxRequestBytes, delivered);
+        await sendInRequests(
+          exporter, collected.spans, { maxBytes: config.maxRequestBytes, stillHeld, onDelivered }, delivered,
+        );
       } finally {
         await exporter.shutdown();
       }

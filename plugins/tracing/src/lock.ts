@@ -256,7 +256,8 @@ async function acquire(
   }
 }
 
-const pathsOf = (rolloutFile: string) => ({
+/** The lock, hand-off and drainer directories kept next to `rolloutFile`. */
+export const pathsOf = (rolloutFile: string) => ({
   lockDir: `${rolloutFile}.traceroot.lock.d`,
   pendingDir: `${rolloutFile}.traceroot.pending.d`,
   drainerDir: `${rolloutFile}.traceroot.drainer.d`,
@@ -277,6 +278,14 @@ async function drainerRunning(drainerDir: string): Promise<boolean> {
   const owners = await ownersOf(drainerDir);
   return !!owners && owners.some((owner) => !isStale(owner, DRAIN_LIFETIME_MS));
 }
+
+export type LockOptions = {
+  timings?: LockTimings;
+  /** This hook ends its turn, as a Stop hook does (see withSessionLock). */
+  endsTurn?: boolean;
+  /** Called when this hook exits leaving requests and no drainer is serving the session. */
+  startDrainer?: () => void;
+};
 
 type Role = {
   endsTurn: boolean;
@@ -412,9 +421,7 @@ async function serve<T>(
 export async function withSessionLock<T>(
   rolloutFile: string,
   run: (lock: SessionLock, handOff: HandOff) => Promise<T>,
-  timings: LockTimings = DEFAULT_TIMINGS,
-  endsTurn = false,
-  startDrainer?: () => void,
+  { timings = DEFAULT_TIMINGS, endsTurn = false, startDrainer }: LockOptions = {},
 ): Promise<T | undefined> {
   return serve(rolloutFile, run, timings, { endsTurn, drainer: false, startDrainer });
 }
@@ -438,8 +445,7 @@ export async function withSessionLock<T>(
 export async function drainSession<T>(
   rolloutFile: string,
   run: (lock: SessionLock, handOff: HandOff) => Promise<T>,
-  timings: LockTimings = DRAIN_TIMINGS,
-  startDrainer?: () => void,
+  { timings = DRAIN_TIMINGS, startDrainer }: Omit<LockOptions, "endsTurn"> = {},
 ): Promise<void> {
   const started = Date.now();
   const { pendingDir, drainerDir } = pathsOf(rolloutFile);

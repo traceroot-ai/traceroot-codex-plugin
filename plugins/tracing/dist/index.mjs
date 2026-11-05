@@ -29914,6 +29914,7 @@ var CollectingProcessor = class {
 	async forceFlush() {}
 	async shutdown() {}
 };
+/** One export call; a throwing exporter is reported as a failed export. */
 function exportOnce(exporter, spans) {
 	return new Promise((resolve) => {
 		try {
@@ -29933,17 +29934,27 @@ const MAX_SPANS_PER_REQUEST = 1024;
 * limit; a span whose estimate alone passes `maxBytes` goes in a request of its own.
 * Adds the ids of each accepted request to `delivered`, so a span counts as sent
 * only once the backend accepted it. A failed request fails only its own spans:
-* every request is tried, then the first failure is thrown.
+* every request is tried, then the first failure is thrown. A request that
+* `stillHeld` holds back fails too, so the next hook sends its spans.
 */
-async function sendInRequests(exporter, spans, maxBytes, delivered) {
+async function sendInRequests(exporter, spans, opts, delivered) {
 	let failure;
-	for (const request of splitBySize(spans, maxBytes, MAX_SPANS_PER_REQUEST)) {
+	for (const request of splitBySize(spans, opts.maxBytes, MAX_SPANS_PER_REQUEST)) {
+		if (opts.stillHeld && !await opts.stillHeld()) {
+			failure ??= {
+				code: import_src.ExportResultCode.FAILED,
+				error: /* @__PURE__ */ new Error("not sent: the session lock was taken over")
+			};
+			continue;
+		}
 		const result = await exportOnce(exporter, request);
 		if (result.code !== import_src.ExportResultCode.SUCCESS) {
 			failure ??= result;
 			continue;
 		}
-		for (const span of request) delivered.add(span.spanContext().spanId);
+		const ids = request.map((span) => span.spanContext().spanId);
+		for (const id of ids) delivered.add(id);
+		await opts.onDelivered?.(ids);
 	}
 	if (failure) throw failure.error ?? /* @__PURE__ */ new Error("span export failed");
 }
@@ -29973,14 +29984,18 @@ function otlpExporter(config) {
 		compression: "gzip"
 	});
 }
-function buildTracing(config, exporter = otlpExporter(config)) {
+function buildTracing(config, exporter = otlpExporter(config), stillHeld, onDelivered) {
 	const collected = new CollectingProcessor();
 	const delivered = /* @__PURE__ */ new Set();
 	return {
 		...buildTracingWith(collected, new PrimedIdGenerator(), delivered),
 		shutdown: async () => {
 			try {
-				await sendInRequests(exporter, collected.spans, config.maxRequestBytes, delivered);
+				await sendInRequests(exporter, collected.spans, {
+					maxBytes: config.maxRequestBytes,
+					stillHeld,
+					onDelivered
+				}, delivered);
 			} finally {
 				await exporter.shutdown();
 			}
@@ -30200,6 +30215,7 @@ async function acquire(lockDir, pendingDir, owner, turnEndedAt, t, drainer) {
 		await (t.sleep ?? sleep)(t.pollMs);
 	}
 }
+/** The lock, hand-off and drainer directories kept next to `rolloutFile`. */
 const pathsOf = (rolloutFile) => ({
 	lockDir: `${rolloutFile}.traceroot.lock.d`,
 	pendingDir: `${rolloutFile}.traceroot.pending.d`,
@@ -30317,7 +30333,7 @@ async function serve(rolloutFile, run$1, timings, role) {
 * holder past its rerun budget or after a failed run, calls `startDrainer` unless
 * a drainer is already serving the session (see drainSession).
 */
-async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS, endsTurn = false, startDrainer) {
+async function withSessionLock(rolloutFile, run$1, { timings = DEFAULT_TIMINGS, endsTurn = false, startDrainer } = {}) {
 	return serve(rolloutFile, run$1, timings, {
 		endsTurn,
 		drainer: false,
@@ -30340,7 +30356,7 @@ async function withSessionLock(rolloutFile, run$1, timings = DEFAULT_TIMINGS, en
 * drainer this way only once, so drainers don't start one another without new
 * requests from the session's hooks.
 */
-async function drainSession(rolloutFile, run$1, timings = DRAIN_TIMINGS, startDrainer) {
+async function drainSession(rolloutFile, run$1, { timings = DRAIN_TIMINGS, startDrainer } = {}) {
 	const started = Date.now();
 	const { pendingDir, drainerDir } = pathsOf(rolloutFile);
 	const seen = /* @__PURE__ */ new Set();
@@ -30596,6 +30612,7 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 	const traceId = opts?.traceId ?? makeTraceId(sessionMeta.sessionId, turn.turnId);
 	const rootId = makeSpanId(seed + turn.turnId + ":root");
 	const rootParentSpanId = opts?.rootParentSpanId !== void 0 ? opts.rootParentSpanId : null;
+	const turnOver = rootParentSpanId === null ? turn.completed || !!ctx.turnEnding : turn.completed;
 	const children = [];
 	const turnImages = [];
 	let firstCallImages;
@@ -30611,7 +30628,7 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		}
 		const fed = [];
 		for (const tc of step.toolCalls) {
-			const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx), ctx);
+			const toolSpan = fitted(planToolSpan(sessionMeta, tc, seed, stepId, traceId, ctx, turnOver), ctx);
 			children.push(toolSpan);
 			fed.push({
 				name: tc.name,
@@ -30652,7 +30669,7 @@ function planTurnSpans(sessionMeta, turn, ctx, opts) {
 		startTime: turn.startTime,
 		endTime: rootEnd,
 		attributes: rootAttrs,
-		complete: rootParentSpanId === null ? turn.completed || !!ctx.turnEnding : turn.completed
+		complete: turnOver
 	}, ctx), ...children];
 }
 function pruneUndefined(o) {
@@ -30696,7 +30713,7 @@ function planStepSpan(sessionMeta, turn, step, spanId, parentSpanId, traceId, ct
 		complete: Boolean(step.usage)
 	};
 }
-function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx) {
+function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx, turnOver) {
 	const attrs = {
 		"traceroot.span.type": "TOOL",
 		"traceroot.span.path": [ROOT_NAME, tc.name]
@@ -30720,7 +30737,7 @@ function planToolSpan(sessionMeta, tc, seed, parentSpanId, traceId, ctx) {
 		startTime: tc.startTime,
 		endTime: tc.endTime ?? tc.startTime,
 		attributes: attrs,
-		complete: tc.endTime !== void 0
+		complete: tc.outputItemSeen === true || turnOver
 	};
 }
 const KIND = {
@@ -31008,6 +31025,7 @@ function parseRollout(lines) {
 				if (tc) {
 					tc.endTime = at;
 					tc.output = p.output;
+					tc.outputItemSeen = true;
 				}
 				if (turn && spawnAgentCallIds.has(p.call_id)) {
 					const threadId = parseSpawnAgentId(p.output);
@@ -31072,7 +31090,6 @@ function parseRollout(lines) {
 //#endregion
 //#region src/emit.ts
 const STACK_GUARD = 32;
-const buildLockedTracing = (c, stillHeld, onDelivered) => buildTracing(c, void 0, stillHeld, onDelivered);
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
 async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, emittedIds, findSubagent) {
 	let n = 0;
@@ -31120,7 +31137,11 @@ async function dispatch(hook, config, deps) {
 		debugLog("no transcript_path; skipping");
 		return { emitted: 0 };
 	}
-	return await withSessionLock(transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), deps?.lockTimings, hook.hook_event_name === "Stop", () => (deps?.startDrainer ?? spawnDrainer)(hook)) ?? { emitted: 0 };
+	return await withSessionLock(transcript, (lock, handOff) => emitSession(hook, transcript, config, lock, handOff, deps), {
+		timings: deps?.lockTimings,
+		endsTurn: hook.hook_event_name === "Stop",
+		startDrainer: () => (deps?.startDrainer ?? spawnDrainer)(hook)
+	}) ?? { emitted: 0 };
 }
 /** Serves, as a drainer, the runs the session's hooks left behind (see drainSession). */
 async function drain(hook, config, deps) {
@@ -31130,10 +31151,12 @@ async function drain(hook, config, deps) {
 		transcript_path: transcript,
 		cwd: hook.cwd
 	};
-	await drainSession(transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), deps?.drainTimings, () => (deps?.startDrainer ?? spawnDrainer)(session));
+	await drainSession(transcript, (lock, handOff) => emitSession(session, transcript, config, lock, handOff, deps), {
+		timings: deps?.drainTimings,
+		startDrainer: () => (deps?.startDrainer ?? spawnDrainer)(session)
+	});
 }
 async function emitSession(hook, transcript, config, lock, handOff, deps) {
-	const buildTracingFn = deps?.buildTracing ?? buildLockedTracing;
 	const getGit = deps?.getGit ?? getGitContext;
 	const findSubagentFn = deps?.findSubagent ?? locateSubagentRollout;
 	const { sessionMeta, turns } = parseRollout(await readRollout(transcript));
@@ -31163,7 +31186,7 @@ async function emitSession(hook, transcript, config, lock, handOff, deps) {
 		for (const id of fresh) marked.add(id);
 		await markSpansEmitted(transcript, fresh);
 	};
-	const tracing = buildTracingFn(config, lock.held, record);
+	const tracing = deps?.buildTracing ? deps.buildTracing(config, lock.held, record) : buildTracing(config, void 0, lock.held, record);
 	let emitted = 0;
 	const emittedIds = [];
 	const visited = /* @__PURE__ */ new Set();
