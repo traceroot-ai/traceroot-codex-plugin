@@ -1,62 +1,19 @@
-import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
-import {
-  type ReadableSpan, type SpanExporter, BatchSpanProcessor, SimpleSpanProcessor,
-} from "@opentelemetry/sdk-trace-base";
-import { describe, expect, it, vi } from "vitest";
-import type { Config } from "../src/config.js";
-import { buildTracing, buildTracingWith, DeliveryTrackingExporter, type Tracing } from "../src/exporter.js";
+import { ExportResultCode } from "@opentelemetry/core";
+import { type ReadableSpan, type SpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { describe, expect, it } from "vitest";
+import { buildTracing, buildTracingWith, exportOnce, sendInRequests } from "../src/exporter.js";
 import { PrimedIdGenerator } from "../src/ids.js";
-import { failed, ids, OK, ScriptedExporter } from "./helpers.js";
+import { distinctIds, endSpans, failed, ids, makeSpans, OK, ScriptedExporter, testConfig } from "./helpers.js";
 
-const config: Config = {
-  enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: false, captureImages: false,
-};
+const config = testConfig({ failOnError: false });
+const BUDGET = config.maxRequestBytes;
 
-/** Ends one span per id through `tracing`, with the id primed like emitSpan does. */
-function endSpans(tracing: Tracing, spanIds: string[]): void {
-  for (const id of spanIds) {
-    tracing.idGen.nextSpanId = id;
-    tracing.tracer.startSpan(`span-${id}`).end();
-  }
-}
-
-function exportOnce(exporter: SpanExporter, spans: ReadableSpan[]): Promise<ExportResult> {
-  return new Promise((resolve) => exporter.export(spans, resolve));
-}
-
-/** Real ReadableSpans with the given ids, captured from a throwaway provider. */
-async function makeSpans(spanIds: string[]): Promise<ReadableSpan[]> {
-  const sink = new ScriptedExporter();
-  const tracing = buildTracingWith(new SimpleSpanProcessor(sink), new PrimedIdGenerator());
-  endSpans(tracing, spanIds);
-  await tracing.shutdown();
-  return sink.calls.flat();
-}
-
-describe("DeliveryTrackingExporter", () => {
-  it("records the ids of a successful export and passes the result through", async () => {
-    const spans = await makeSpans(["1".repeat(16), "2".repeat(16)]);
-    const tracked = new DeliveryTrackingExporter(new ScriptedExporter());
-    expect(await exportOnce(tracked, spans)).toEqual(OK);
-    expect([...tracked.delivered].sort()).toEqual(["1".repeat(16), "2".repeat(16)]);
-  });
-
-  it("records nothing for a failed export (e.g. a 413 or 503 from the backend)", async () => {
-    const spans = await makeSpans(["3".repeat(16)]);
-    const tracked = new DeliveryTrackingExporter(new ScriptedExporter(() => failed("Request Entity Too Large")));
-    const result = await exportOnce(tracked, spans);
-    expect(result.code).toBe(ExportResultCode.FAILED);
-    expect(result.error?.message).toBe("Request Entity Too Large");
-    expect(tracked.delivered.size).toBe(0);
-  });
-
+describe("exportOnce", () => {
   it("reports a throwing exporter as a failed export instead of throwing", async () => {
     const spans = await makeSpans(["4".repeat(16)]);
-    const tracked = new DeliveryTrackingExporter(new ScriptedExporter(() => "throw"));
-    const result = await exportOnce(tracked, spans);
+    const result = await exportOnce(new ScriptedExporter(() => "throw"), spans);
     expect(result.code).toBe(ExportResultCode.FAILED);
     expect(result.error?.message).toBe("exporter crashed");
-    expect(tracked.delivered.size).toBe(0);
   });
 
   it("wraps a non-Error throw in an Error", async () => {
@@ -64,23 +21,50 @@ describe("DeliveryTrackingExporter", () => {
       export: () => { throw "boom"; },
       shutdown: async () => {},
     };
-    const result = await exportOnce(new DeliveryTrackingExporter(inner), []);
+    const result = await exportOnce(inner, []);
     expect(result.error).toBeInstanceOf(Error);
     expect(result.error?.message).toBe("boom");
   });
+});
 
-  it("forwards shutdown and forceFlush to the wrapped exporter", async () => {
-    const inner = { export: vi.fn(), shutdown: vi.fn(async () => {}), forceFlush: vi.fn(async () => {}) };
-    const tracked = new DeliveryTrackingExporter(inner);
-    await tracked.forceFlush();
-    await tracked.shutdown();
-    expect(inner.forceFlush).toHaveBeenCalledTimes(1);
-    expect(inner.shutdown).toHaveBeenCalledTimes(1);
+describe("sendInRequests", () => {
+  it("records the ids of an accepted request", async () => {
+    const spans = await makeSpans(["1".repeat(16), "2".repeat(16)]);
+    const inner = new ScriptedExporter();
+    const delivered = new Set<string>();
+    await sendInRequests(inner, spans, BUDGET, delivered);
+    expect(inner.calls).toEqual([spans]);
+    expect([...delivered].sort()).toEqual(["1".repeat(16), "2".repeat(16)]);
   });
 
-  it("forceFlush resolves when the wrapped exporter has none", async () => {
-    const tracked = new DeliveryTrackingExporter({ export: vi.fn(), shutdown: async () => {} });
-    await expect(tracked.forceFlush()).resolves.toBeUndefined();
+  it("rejects and records nothing for a failed request (e.g. a 413 or 503 from the backend)", async () => {
+    const spans = await makeSpans(["3".repeat(16)]);
+    const delivered = new Set<string>();
+    await expect(sendInRequests(new ScriptedExporter(() => failed("Request Entity Too Large")), spans, BUDGET, delivered))
+      .rejects.toThrow("Request Entity Too Large");
+    expect(delivered.size).toBe(0);
+  });
+
+  it("tries every request, one at a time, then rejects with the first failure", async () => {
+    const spans = await makeSpans(distinctIds(2049));
+    const outcomes = [failed("Request Entity Too Large"), OK, failed("Service Unavailable")];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const calls: ReadableSpan[][] = [];
+    const inner: SpanExporter = {
+      export: (request, resultCallback) => {
+        const outcome = outcomes[calls.push(request) - 1]!;
+        maxInFlight = Math.max(maxInFlight, ++inFlight);
+        setTimeout(() => { inFlight--; resultCallback(outcome); }, 1);
+      },
+      shutdown: async () => {},
+    };
+    const delivered = new Set<string>();
+
+    await expect(sendInRequests(inner, spans, BUDGET, delivered)).rejects.toThrow("Request Entity Too Large");
+    expect(calls.map((c) => c.length)).toEqual([1024, 1024, 1]);
+    expect(maxInFlight).toBe(1);
+    expect([...delivered].sort()).toEqual(ids(calls[1]!).sort());
   });
 });
 
@@ -101,27 +85,36 @@ describe("buildTracing delivery tracking", () => {
     expect(tracing.delivered.size).toBe(0);
   });
 
+  it("sends nothing before shutdown, then every span in requests of at most 1,024", async () => {
+    const sink = new ScriptedExporter();
+    const tracing = buildTracing(config, sink);
+    const sent = distinctIds(2049);
+    endSpans(tracing, sent);
+    expect(sink.calls).toHaveLength(0);
+
+    await tracing.shutdown();
+    expect(sink.calls.map((c) => c.length)).toEqual([1024, 1024, 1]);
+    expect(ids(sink.calls.flat())).toEqual(sent);
+    expect(tracing.delivered.size).toBe(2049);
+  });
+
+  it.each([["succeeds", OK], ["fails", failed("Service Unavailable")]])(
+    "shuts the exporter down after the last request, when it %s",
+    async (_label, outcome) => {
+      const order: string[] = [];
+      const inner: SpanExporter = {
+        export: (_spans, resultCallback) => { order.push("export"); setTimeout(() => resultCallback(outcome), 1); },
+        shutdown: async () => { order.push("shutdown"); },
+      };
+      const tracing = buildTracing(config, inner);
+      endSpans(tracing, ["d".repeat(16)]);
+      await tracing.shutdown().catch(() => {});
+      expect(order).toEqual(["export", "shutdown"]);
+    },
+  );
+
   it("buildTracingWith without a delivery set reports nothing as delivered", () => {
     const tracing = buildTracingWith(new SimpleSpanProcessor(new ScriptedExporter()), new PrimedIdGenerator());
     expect(tracing.delivered.size).toBe(0);
-  });
-
-  it("shutdown rejects on a failed batch only after the exports still in flight are answered", async () => {
-    const [a, b, c] = ["d".repeat(16), "e".repeat(16), "f".repeat(16)];
-    // `a` fills a one-span batch and is exported at once; `b` and `c` are flushed
-    // as two concurrent batches. `b` fails at once, `a` and `c` succeed later.
-    const sink = new ScriptedExporter(
-      (spans) => (ids(spans).includes(b) ? failed("Request Entity Too Large") : OK),
-      (spans) => (ids(spans).includes(b) ? 0 : 20),
-    );
-    const tracked = new DeliveryTrackingExporter(sink);
-    const tracing = buildTracingWith(
-      new BatchSpanProcessor(tracked, { maxExportBatchSize: 1 }), new PrimedIdGenerator(), tracked.delivered,
-    );
-    endSpans(tracing, [a, b, c]);
-
-    await expect(tracing.shutdown()).rejects.toBeDefined();
-    expect(sink.calls).toHaveLength(3);
-    expect([...tracing.delivered].sort()).toEqual([a, c]);
   });
 });

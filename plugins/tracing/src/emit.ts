@@ -2,7 +2,7 @@ import type { Config } from "./config.js";
 import { buildTracing as defaultBuildTracing, type Tracing } from "./exporter.js";
 import { getGitContext } from "./git.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
-import { loadEmittedSpanIds, markSpanEmitted } from "./sidecar.js";
+import { loadEmittedSpanIds, markSpansEmitted } from "./sidecar.js";
 import { emitSpan, planTurnSpans, type EmitCtx, type PlanOpts } from "./spans.js";
 import { locateSubagentRollout } from "./subagents.js";
 import { parseRollout, readRollout } from "./transcript.js";
@@ -161,9 +161,7 @@ export async function dispatch(
     } finally {
       // Mark only the spans the backend accepted, even when shutdown reports a
       // failed export: anything left unmarked is sent again on the next hook.
-      for (const id of emittedIds) {
-        if (tracing.delivered.has(id)) await markSpanEmitted(transcript, id);
-      }
+      await markSpansEmitted(transcript, emittedIds.filter((id) => tracing.delivered.has(id)));
     }
   }
   debugLog(`emitted ${emitted} spans`);

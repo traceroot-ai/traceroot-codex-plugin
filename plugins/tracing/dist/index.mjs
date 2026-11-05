@@ -27401,6 +27401,345 @@ var require_src$3 = /* @__PURE__ */ __commonJSMin(((exports) => {
 }));
 
 //#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AbstractAsyncHooksContextManager.js
+var require_AbstractAsyncHooksContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
+	Object.defineProperty(exports, "__esModule", { value: true });
+	exports.AbstractAsyncHooksContextManager = void 0;
+	const events_1 = __require("events");
+	const ADD_LISTENER_METHODS = [
+		"addListener",
+		"on",
+		"once",
+		"prependListener",
+		"prependOnceListener"
+	];
+	var AbstractAsyncHooksContextManager = class {
+		/**
+		* Binds a the certain context or the active one to the target function and then returns the target
+		* @param context A context (span) to be bind to target
+		* @param target a function or event emitter. When target or one of its callbacks is called,
+		*  the provided context will be used as the active context for the duration of the call.
+		*/
+		bind(context$1, target) {
+			if (target instanceof events_1.EventEmitter) return this._bindEventEmitter(context$1, target);
+			if (typeof target === "function") return this._bindFunction(context$1, target);
+			return target;
+		}
+		_bindFunction(context$1, target) {
+			const manager = this;
+			const contextWrapper = function(...args) {
+				return manager.with(context$1, () => target.apply(this, args));
+			};
+			Object.defineProperty(contextWrapper, "length", {
+				enumerable: false,
+				configurable: true,
+				writable: false,
+				value: target.length
+			});
+			/**
+			* It isn't possible to tell Typescript that contextWrapper is the same as T
+			* so we forced to cast as any here.
+			*/
+			return contextWrapper;
+		}
+		/**
+		* By default, EventEmitter call their callback with their context, which we do
+		* not want, instead we will bind a specific context to all callbacks that
+		* go through it.
+		* @param context the context we want to bind
+		* @param ee EventEmitter an instance of EventEmitter to patch
+		*/
+		_bindEventEmitter(context$1, ee) {
+			if (this._getPatchMap(ee) !== void 0) return ee;
+			this._createPatchMap(ee);
+			ADD_LISTENER_METHODS.forEach((methodName) => {
+				if (ee[methodName] === void 0) return;
+				ee[methodName] = this._patchAddListener(ee, ee[methodName], context$1);
+			});
+			if (typeof ee.removeListener === "function") ee.removeListener = this._patchRemoveListener(ee, ee.removeListener);
+			if (typeof ee.off === "function") ee.off = this._patchRemoveListener(ee, ee.off);
+			if (typeof ee.removeAllListeners === "function") ee.removeAllListeners = this._patchRemoveAllListeners(ee, ee.removeAllListeners);
+			return ee;
+		}
+		/**
+		* Patch methods that remove a given listener so that we match the "patched"
+		* version of that listener (the one that propagate context).
+		* @param ee EventEmitter instance
+		* @param original reference to the patched method
+		*/
+		_patchRemoveListener(ee, original) {
+			const contextManager = this;
+			return function(event, listener) {
+				const events = contextManager._getPatchMap(ee)?.[event];
+				if (events === void 0) return original.call(this, event, listener);
+				const patchedListener = events.get(listener);
+				return original.call(this, event, patchedListener || listener);
+			};
+		}
+		/**
+		* Patch methods that remove all listeners so we remove our
+		* internal references for a given event.
+		* @param ee EventEmitter instance
+		* @param original reference to the patched method
+		*/
+		_patchRemoveAllListeners(ee, original) {
+			const contextManager = this;
+			return function(event) {
+				const map = contextManager._getPatchMap(ee);
+				if (map !== void 0) {
+					if (arguments.length === 0) contextManager._createPatchMap(ee);
+					else if (map[event] !== void 0) delete map[event];
+				}
+				return original.apply(this, arguments);
+			};
+		}
+		/**
+		* Patch methods on an event emitter instance that can add listeners so we
+		* can force them to propagate a given context.
+		* @param ee EventEmitter instance
+		* @param original reference to the patched method
+		* @param [context] context to propagate when calling listeners
+		*/
+		_patchAddListener(ee, original, context$1) {
+			const contextManager = this;
+			return function(event, listener) {
+				/**
+				* This check is required to prevent double-wrapping the listener.
+				* The implementation for ee.once wraps the listener and calls ee.on.
+				* Without this check, we would wrap that wrapped listener.
+				* This causes an issue because ee.removeListener depends on the onceWrapper
+				* to properly remove the listener. If we wrap their wrapper, we break
+				* that detection.
+				*/
+				if (contextManager._wrapped) return original.call(this, event, listener);
+				let map = contextManager._getPatchMap(ee);
+				if (map === void 0) map = contextManager._createPatchMap(ee);
+				let listeners = map[event];
+				if (listeners === void 0) {
+					listeners = /* @__PURE__ */ new WeakMap();
+					map[event] = listeners;
+				}
+				const patchedListener = contextManager.bind(context$1, listener);
+				listeners.set(listener, patchedListener);
+				/**
+				* See comment at the start of this function for the explanation of this property.
+				*/
+				contextManager._wrapped = true;
+				try {
+					return original.call(this, event, patchedListener);
+				} finally {
+					contextManager._wrapped = false;
+				}
+			};
+		}
+		_createPatchMap(ee) {
+			const map = Object.create(null);
+			ee[this._kOtListeners] = map;
+			return map;
+		}
+		_getPatchMap(ee) {
+			return ee[this._kOtListeners];
+		}
+		_kOtListeners = Symbol("OtListeners");
+		_wrapped = false;
+	};
+	exports.AbstractAsyncHooksContextManager = AbstractAsyncHooksContextManager;
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AsyncHooksContextManager.js
+var require_AsyncHooksContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
+	Object.defineProperty(exports, "__esModule", { value: true });
+	exports.AsyncHooksContextManager = void 0;
+	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
+	const asyncHooks = __require("async_hooks");
+	const AbstractAsyncHooksContextManager_1 = require_AbstractAsyncHooksContextManager();
+	/**
+	* @deprecated Use AsyncLocalStorageContextManager instead.
+	*/
+	var AsyncHooksContextManager = class extends AbstractAsyncHooksContextManager_1.AbstractAsyncHooksContextManager {
+		_asyncHook;
+		_contexts = /* @__PURE__ */ new Map();
+		_stack = [];
+		constructor() {
+			super();
+			this._asyncHook = asyncHooks.createHook({
+				init: this._init.bind(this),
+				before: this._before.bind(this),
+				after: this._after.bind(this),
+				destroy: this._destroy.bind(this),
+				promiseResolve: this._destroy.bind(this)
+			});
+		}
+		active() {
+			return this._stack[this._stack.length - 1] ?? api_1.ROOT_CONTEXT;
+		}
+		with(context$1, fn, thisArg, ...args) {
+			this._enterContext(context$1);
+			try {
+				return fn.call(thisArg, ...args);
+			} finally {
+				this._exitContext();
+			}
+		}
+		enable() {
+			this._asyncHook.enable();
+			return this;
+		}
+		disable() {
+			this._asyncHook.disable();
+			this._contexts.clear();
+			this._stack = [];
+			return this;
+		}
+		/**
+		* Init hook will be called when userland create a async context, setting the
+		* context as the current one if it exist.
+		* @param uid id of the async context
+		* @param type the resource type
+		*/
+		_init(uid, type) {
+			if (type === "TIMERWRAP") return;
+			const context$1 = this._stack[this._stack.length - 1];
+			if (context$1 !== void 0) this._contexts.set(uid, context$1);
+		}
+		/**
+		* Destroy hook will be called when a given context is no longer used so we can
+		* remove its attached context.
+		* @param uid uid of the async context
+		*/
+		_destroy(uid) {
+			this._contexts.delete(uid);
+		}
+		/**
+		* Before hook is called just before executing a async context.
+		* @param uid uid of the async context
+		*/
+		_before(uid) {
+			const context$1 = this._contexts.get(uid);
+			if (context$1 !== void 0) this._enterContext(context$1);
+		}
+		/**
+		* After hook is called just after completing the execution of a async context.
+		*/
+		_after() {
+			this._exitContext();
+		}
+		/**
+		* Set the given context as active
+		*/
+		_enterContext(context$1) {
+			this._stack.push(context$1);
+		}
+		/**
+		* Remove the context at the root of the stack
+		*/
+		_exitContext() {
+			this._stack.pop();
+		}
+	};
+	exports.AsyncHooksContextManager = AsyncHooksContextManager;
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AsyncLocalStorageContextManager.js
+var require_AsyncLocalStorageContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
+	Object.defineProperty(exports, "__esModule", { value: true });
+	exports.AsyncLocalStorageContextManager = void 0;
+	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
+	const async_hooks_1 = __require("async_hooks");
+	const AbstractAsyncHooksContextManager_1 = require_AbstractAsyncHooksContextManager();
+	/**
+	* Wrapper around a token and _asyncLocalStorage to mirror the behavior of
+	* a Node.js RunScope
+	*
+	* @internal not intended for direct public consumption. Will be removed once
+	* withScope is available on all supported Node.js versions
+	*/
+	var DisposeOnceToken = class {
+		_isDisposed = false;
+		_previousContext;
+		_asyncLocalStorage;
+		constructor(previousContext, asyncLocalStorage) {
+			this._previousContext = previousContext;
+			this._asyncLocalStorage = asyncLocalStorage;
+		}
+		dispose() {
+			if (this._isDisposed) return;
+			this._asyncLocalStorage.enterWith(this._previousContext);
+			this._isDisposed = true;
+		}
+	};
+	var AsyncLocalStorageContextManager = class extends AbstractAsyncHooksContextManager_1.AbstractAsyncHooksContextManager {
+		_asyncLocalStorage;
+		constructor() {
+			super();
+			this._asyncLocalStorage = new async_hooks_1.AsyncLocalStorage();
+		}
+		active() {
+			return this._asyncLocalStorage.getStore() ?? api_1.ROOT_CONTEXT;
+		}
+		with(context$1, fn, thisArg, ...args) {
+			const cb = thisArg == null ? fn : fn.bind(thisArg);
+			return this._asyncLocalStorage.run(context$1, cb, ...args);
+		}
+		enable() {
+			return this;
+		}
+		disable() {
+			this._asyncLocalStorage.disable();
+			return this;
+		}
+		/**
+		* Imperatively sets `context` as active for the current async execution chain
+		* and operations spawned from it. Returns a {@link ContextManagementToken} whose `dispose()`
+		* restores the previous context (see {@link ContextManager.attach}).
+		*
+		* On Node.js 25.9+, delegates to `AsyncLocalStorage.withScope()` which returns
+		* a native `RunScope`. On older Node.js versions, falls back to `enterWith()` with
+		* a manual token.
+		*
+		* **Caveat for async functions:** Both `withScope()` and `enterWith()` affect the
+		* entire current async execution chain. If `attach()` is called inside an async
+		* function before the first `await`, the context change will leak into the caller's
+		* context and remain active there until something else restores it. Prefer `with()`
+		* for async code.
+		*
+		* @experimental This API is experimental and may change in minor releases without prior notice.
+		*/
+		attach(context$1) {
+			const withScope = this._asyncLocalStorage.withScope;
+			if (withScope) return withScope.call(this._asyncLocalStorage, context$1);
+			const previousContext = this.active();
+			this._asyncLocalStorage.enterWith(context$1);
+			return new DisposeOnceToken(previousContext, this._asyncLocalStorage);
+		}
+	};
+	exports.AsyncLocalStorageContextManager = AsyncLocalStorageContextManager;
+}));
+
+//#endregion
+//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/index.js
+var require_src$2 = /* @__PURE__ */ __commonJSMin(((exports) => {
+	Object.defineProperty(exports, "__esModule", { value: true });
+	exports.AsyncLocalStorageContextManager = exports.AsyncHooksContextManager = void 0;
+	var AsyncHooksContextManager_1 = require_AsyncHooksContextManager();
+	Object.defineProperty(exports, "AsyncHooksContextManager", {
+		enumerable: true,
+		get: function() {
+			return AsyncHooksContextManager_1.AsyncHooksContextManager;
+		}
+	});
+	var AsyncLocalStorageContextManager_1 = require_AsyncLocalStorageContextManager();
+	Object.defineProperty(exports, "AsyncLocalStorageContextManager", {
+		enumerable: true,
+		get: function() {
+			return AsyncLocalStorageContextManager_1.AsyncLocalStorageContextManager;
+		}
+	});
+}));
+
+//#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+sdk-trace@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/sdk-trace/build/src/enums.js
 var require_enums = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
@@ -28918,7 +29257,7 @@ var require_TraceIdRatioBasedSampler = /* @__PURE__ */ __commonJSMin(((exports) 
 
 //#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+sdk-trace@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/sdk-trace/build/src/index.js
-var require_src$2 = /* @__PURE__ */ __commonJSMin(((exports) => {
+var require_src$1 = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.SamplingDecision = exports.TraceIdRatioBasedSampler = exports.ParentBasedSampler = exports.createAlwaysRecordSampler = exports.AlwaysOnSampler = exports.AlwaysOffSampler = exports.NoopSpanProcessor = exports.SimpleSpanProcessor = exports.InMemorySpanExporter = exports.ConsoleSpanExporter = exports.RandomIdGenerator = exports.BatchSpanProcessor = exports.TracerProvider = void 0;
 	var TracerProvider_1 = require_TracerProvider();
@@ -29020,7 +29359,7 @@ var require_config = /* @__PURE__ */ __commonJSMin(((exports) => {
 	exports.buildSamplerFromEnv = exports.loadDefaultConfig = void 0;
 	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
 	const core_1 = require_src$7();
-	const sdk_trace_1 = require_src$2();
+	const sdk_trace_1 = require_src$1();
 	var TracesSamplerValues;
 	(function(TracesSamplerValues) {
 		TracesSamplerValues["AlwaysOff"] = "always_off";
@@ -29124,7 +29463,7 @@ var require_BasicTracerProvider_shim = /* @__PURE__ */ __commonJSMin(((exports) 
 	const core_1 = require_src$7();
 	const config_1 = require_config();
 	const utility_1 = require_utility();
-	const sdk_trace_1 = require_src$2();
+	const sdk_trace_1 = require_src$1();
 	/**
 	* A TracerProvider implementation that reads configuration defaults from
 	* OTEL_* environment variables per
@@ -29146,7 +29485,7 @@ var require_BatchSpanProcessor_shim = /* @__PURE__ */ __commonJSMin(((exports) =
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.BatchSpanProcessor = void 0;
 	const core_1 = require_src$7();
-	const sdk_trace_1 = require_src$2();
+	const sdk_trace_1 = require_src$1();
 	/**
 	* A BatchSpanProcessor that applies `OTEL_*` environment variable fallbacks per
 	* https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
@@ -29177,7 +29516,7 @@ var require_BatchSpanProcessor_shim = /* @__PURE__ */ __commonJSMin(((exports) =
 var require_SimpleSpanProcessor_shim = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.SimpleSpanProcessor = void 0;
-	const sdk_trace_1 = require_src$2();
+	const sdk_trace_1 = require_src$1();
 	/**
 	* A SimpleSpanProcessor with the old constructor call signature that
 	* takes just a single exporter argument. This version does not support
@@ -29217,7 +29556,7 @@ var require_index_shim = /* @__PURE__ */ __commonJSMin(((exports) => {
 			return SimpleSpanProcessor_shim_1.SimpleSpanProcessor;
 		}
 	});
-	var sdk_trace_1 = require_src$2();
+	var sdk_trace_1 = require_src$1();
 	Object.defineProperty(exports, "ConsoleSpanExporter", {
 		enumerable: true,
 		get: function() {
@@ -29275,350 +29614,11 @@ var require_index_shim = /* @__PURE__ */ __commonJSMin(((exports) => {
 }));
 
 //#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AbstractAsyncHooksContextManager.js
-var require_AbstractAsyncHooksContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
-	Object.defineProperty(exports, "__esModule", { value: true });
-	exports.AbstractAsyncHooksContextManager = void 0;
-	const events_1 = __require("events");
-	const ADD_LISTENER_METHODS = [
-		"addListener",
-		"on",
-		"once",
-		"prependListener",
-		"prependOnceListener"
-	];
-	var AbstractAsyncHooksContextManager = class {
-		/**
-		* Binds a the certain context or the active one to the target function and then returns the target
-		* @param context A context (span) to be bind to target
-		* @param target a function or event emitter. When target or one of its callbacks is called,
-		*  the provided context will be used as the active context for the duration of the call.
-		*/
-		bind(context$1, target) {
-			if (target instanceof events_1.EventEmitter) return this._bindEventEmitter(context$1, target);
-			if (typeof target === "function") return this._bindFunction(context$1, target);
-			return target;
-		}
-		_bindFunction(context$1, target) {
-			const manager = this;
-			const contextWrapper = function(...args) {
-				return manager.with(context$1, () => target.apply(this, args));
-			};
-			Object.defineProperty(contextWrapper, "length", {
-				enumerable: false,
-				configurable: true,
-				writable: false,
-				value: target.length
-			});
-			/**
-			* It isn't possible to tell Typescript that contextWrapper is the same as T
-			* so we forced to cast as any here.
-			*/
-			return contextWrapper;
-		}
-		/**
-		* By default, EventEmitter call their callback with their context, which we do
-		* not want, instead we will bind a specific context to all callbacks that
-		* go through it.
-		* @param context the context we want to bind
-		* @param ee EventEmitter an instance of EventEmitter to patch
-		*/
-		_bindEventEmitter(context$1, ee) {
-			if (this._getPatchMap(ee) !== void 0) return ee;
-			this._createPatchMap(ee);
-			ADD_LISTENER_METHODS.forEach((methodName) => {
-				if (ee[methodName] === void 0) return;
-				ee[methodName] = this._patchAddListener(ee, ee[methodName], context$1);
-			});
-			if (typeof ee.removeListener === "function") ee.removeListener = this._patchRemoveListener(ee, ee.removeListener);
-			if (typeof ee.off === "function") ee.off = this._patchRemoveListener(ee, ee.off);
-			if (typeof ee.removeAllListeners === "function") ee.removeAllListeners = this._patchRemoveAllListeners(ee, ee.removeAllListeners);
-			return ee;
-		}
-		/**
-		* Patch methods that remove a given listener so that we match the "patched"
-		* version of that listener (the one that propagate context).
-		* @param ee EventEmitter instance
-		* @param original reference to the patched method
-		*/
-		_patchRemoveListener(ee, original) {
-			const contextManager = this;
-			return function(event, listener) {
-				const events = contextManager._getPatchMap(ee)?.[event];
-				if (events === void 0) return original.call(this, event, listener);
-				const patchedListener = events.get(listener);
-				return original.call(this, event, patchedListener || listener);
-			};
-		}
-		/**
-		* Patch methods that remove all listeners so we remove our
-		* internal references for a given event.
-		* @param ee EventEmitter instance
-		* @param original reference to the patched method
-		*/
-		_patchRemoveAllListeners(ee, original) {
-			const contextManager = this;
-			return function(event) {
-				const map = contextManager._getPatchMap(ee);
-				if (map !== void 0) {
-					if (arguments.length === 0) contextManager._createPatchMap(ee);
-					else if (map[event] !== void 0) delete map[event];
-				}
-				return original.apply(this, arguments);
-			};
-		}
-		/**
-		* Patch methods on an event emitter instance that can add listeners so we
-		* can force them to propagate a given context.
-		* @param ee EventEmitter instance
-		* @param original reference to the patched method
-		* @param [context] context to propagate when calling listeners
-		*/
-		_patchAddListener(ee, original, context$1) {
-			const contextManager = this;
-			return function(event, listener) {
-				/**
-				* This check is required to prevent double-wrapping the listener.
-				* The implementation for ee.once wraps the listener and calls ee.on.
-				* Without this check, we would wrap that wrapped listener.
-				* This causes an issue because ee.removeListener depends on the onceWrapper
-				* to properly remove the listener. If we wrap their wrapper, we break
-				* that detection.
-				*/
-				if (contextManager._wrapped) return original.call(this, event, listener);
-				let map = contextManager._getPatchMap(ee);
-				if (map === void 0) map = contextManager._createPatchMap(ee);
-				let listeners = map[event];
-				if (listeners === void 0) {
-					listeners = /* @__PURE__ */ new WeakMap();
-					map[event] = listeners;
-				}
-				const patchedListener = contextManager.bind(context$1, listener);
-				listeners.set(listener, patchedListener);
-				/**
-				* See comment at the start of this function for the explanation of this property.
-				*/
-				contextManager._wrapped = true;
-				try {
-					return original.call(this, event, patchedListener);
-				} finally {
-					contextManager._wrapped = false;
-				}
-			};
-		}
-		_createPatchMap(ee) {
-			const map = Object.create(null);
-			ee[this._kOtListeners] = map;
-			return map;
-		}
-		_getPatchMap(ee) {
-			return ee[this._kOtListeners];
-		}
-		_kOtListeners = Symbol("OtListeners");
-		_wrapped = false;
-	};
-	exports.AbstractAsyncHooksContextManager = AbstractAsyncHooksContextManager;
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AsyncHooksContextManager.js
-var require_AsyncHooksContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
-	Object.defineProperty(exports, "__esModule", { value: true });
-	exports.AsyncHooksContextManager = void 0;
-	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
-	const asyncHooks = __require("async_hooks");
-	const AbstractAsyncHooksContextManager_1 = require_AbstractAsyncHooksContextManager();
-	/**
-	* @deprecated Use AsyncLocalStorageContextManager instead.
-	*/
-	var AsyncHooksContextManager = class extends AbstractAsyncHooksContextManager_1.AbstractAsyncHooksContextManager {
-		_asyncHook;
-		_contexts = /* @__PURE__ */ new Map();
-		_stack = [];
-		constructor() {
-			super();
-			this._asyncHook = asyncHooks.createHook({
-				init: this._init.bind(this),
-				before: this._before.bind(this),
-				after: this._after.bind(this),
-				destroy: this._destroy.bind(this),
-				promiseResolve: this._destroy.bind(this)
-			});
-		}
-		active() {
-			return this._stack[this._stack.length - 1] ?? api_1.ROOT_CONTEXT;
-		}
-		with(context$1, fn, thisArg, ...args) {
-			this._enterContext(context$1);
-			try {
-				return fn.call(thisArg, ...args);
-			} finally {
-				this._exitContext();
-			}
-		}
-		enable() {
-			this._asyncHook.enable();
-			return this;
-		}
-		disable() {
-			this._asyncHook.disable();
-			this._contexts.clear();
-			this._stack = [];
-			return this;
-		}
-		/**
-		* Init hook will be called when userland create a async context, setting the
-		* context as the current one if it exist.
-		* @param uid id of the async context
-		* @param type the resource type
-		*/
-		_init(uid, type) {
-			if (type === "TIMERWRAP") return;
-			const context$1 = this._stack[this._stack.length - 1];
-			if (context$1 !== void 0) this._contexts.set(uid, context$1);
-		}
-		/**
-		* Destroy hook will be called when a given context is no longer used so we can
-		* remove its attached context.
-		* @param uid uid of the async context
-		*/
-		_destroy(uid) {
-			this._contexts.delete(uid);
-		}
-		/**
-		* Before hook is called just before executing a async context.
-		* @param uid uid of the async context
-		*/
-		_before(uid) {
-			const context$1 = this._contexts.get(uid);
-			if (context$1 !== void 0) this._enterContext(context$1);
-		}
-		/**
-		* After hook is called just after completing the execution of a async context.
-		*/
-		_after() {
-			this._exitContext();
-		}
-		/**
-		* Set the given context as active
-		*/
-		_enterContext(context$1) {
-			this._stack.push(context$1);
-		}
-		/**
-		* Remove the context at the root of the stack
-		*/
-		_exitContext() {
-			this._stack.pop();
-		}
-	};
-	exports.AsyncHooksContextManager = AsyncHooksContextManager;
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/AsyncLocalStorageContextManager.js
-var require_AsyncLocalStorageContextManager = /* @__PURE__ */ __commonJSMin(((exports) => {
-	Object.defineProperty(exports, "__esModule", { value: true });
-	exports.AsyncLocalStorageContextManager = void 0;
-	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
-	const async_hooks_1 = __require("async_hooks");
-	const AbstractAsyncHooksContextManager_1 = require_AbstractAsyncHooksContextManager();
-	/**
-	* Wrapper around a token and _asyncLocalStorage to mirror the behavior of
-	* a Node.js RunScope
-	*
-	* @internal not intended for direct public consumption. Will be removed once
-	* withScope is available on all supported Node.js versions
-	*/
-	var DisposeOnceToken = class {
-		_isDisposed = false;
-		_previousContext;
-		_asyncLocalStorage;
-		constructor(previousContext, asyncLocalStorage) {
-			this._previousContext = previousContext;
-			this._asyncLocalStorage = asyncLocalStorage;
-		}
-		dispose() {
-			if (this._isDisposed) return;
-			this._asyncLocalStorage.enterWith(this._previousContext);
-			this._isDisposed = true;
-		}
-	};
-	var AsyncLocalStorageContextManager = class extends AbstractAsyncHooksContextManager_1.AbstractAsyncHooksContextManager {
-		_asyncLocalStorage;
-		constructor() {
-			super();
-			this._asyncLocalStorage = new async_hooks_1.AsyncLocalStorage();
-		}
-		active() {
-			return this._asyncLocalStorage.getStore() ?? api_1.ROOT_CONTEXT;
-		}
-		with(context$1, fn, thisArg, ...args) {
-			const cb = thisArg == null ? fn : fn.bind(thisArg);
-			return this._asyncLocalStorage.run(context$1, cb, ...args);
-		}
-		enable() {
-			return this;
-		}
-		disable() {
-			this._asyncLocalStorage.disable();
-			return this;
-		}
-		/**
-		* Imperatively sets `context` as active for the current async execution chain
-		* and operations spawned from it. Returns a {@link ContextManagementToken} whose `dispose()`
-		* restores the previous context (see {@link ContextManager.attach}).
-		*
-		* On Node.js 25.9+, delegates to `AsyncLocalStorage.withScope()` which returns
-		* a native `RunScope`. On older Node.js versions, falls back to `enterWith()` with
-		* a manual token.
-		*
-		* **Caveat for async functions:** Both `withScope()` and `enterWith()` affect the
-		* entire current async execution chain. If `attach()` is called inside an async
-		* function before the first `await`, the context change will leak into the caller's
-		* context and remain active there until something else restores it. Prefer `with()`
-		* for async code.
-		*
-		* @experimental This API is experimental and may change in minor releases without prior notice.
-		*/
-		attach(context$1) {
-			const withScope = this._asyncLocalStorage.withScope;
-			if (withScope) return withScope.call(this._asyncLocalStorage, context$1);
-			const previousContext = this.active();
-			this._asyncLocalStorage.enterWith(context$1);
-			return new DisposeOnceToken(previousContext, this._asyncLocalStorage);
-		}
-	};
-	exports.AsyncLocalStorageContextManager = AsyncLocalStorageContextManager;
-}));
-
-//#endregion
-//#region ../../node_modules/.pnpm/@opentelemetry+context-async-hooks@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/context-async-hooks/build/src/index.js
-var require_src$1 = /* @__PURE__ */ __commonJSMin(((exports) => {
-	Object.defineProperty(exports, "__esModule", { value: true });
-	exports.AsyncLocalStorageContextManager = exports.AsyncHooksContextManager = void 0;
-	var AsyncHooksContextManager_1 = require_AsyncHooksContextManager();
-	Object.defineProperty(exports, "AsyncHooksContextManager", {
-		enumerable: true,
-		get: function() {
-			return AsyncHooksContextManager_1.AsyncHooksContextManager;
-		}
-	});
-	var AsyncLocalStorageContextManager_1 = require_AsyncLocalStorageContextManager();
-	Object.defineProperty(exports, "AsyncLocalStorageContextManager", {
-		enumerable: true,
-		get: function() {
-			return AsyncLocalStorageContextManager_1.AsyncLocalStorageContextManager;
-		}
-	});
-}));
-
-//#endregion
 //#region ../../node_modules/.pnpm/@opentelemetry+sdk-trace-node@2.11.0_@opentelemetry+api@1.9.1/node_modules/@opentelemetry/sdk-trace-node/build/src/NodeTracerProvider.js
 var require_NodeTracerProvider = /* @__PURE__ */ __commonJSMin(((exports) => {
 	Object.defineProperty(exports, "__esModule", { value: true });
 	exports.NodeTracerProvider = void 0;
-	const context_async_hooks_1 = require_src$1();
+	const context_async_hooks_1 = require_src$2();
 	const sdk_trace_base_1 = require_index_shim();
 	const api_1 = (init_esm$2(), __toCommonJS(esm_exports$2));
 	const core_1 = require_src$7();
@@ -29758,7 +29758,6 @@ var require_src = /* @__PURE__ */ __commonJSMin(((exports) => {
 //#endregion
 //#region src/ids.ts
 var import_src$2 = require_src();
-var import_index_shim = require_index_shim();
 var import_src$1 = require_src$3();
 function hashHex(input, bytes) {
 	return createHash("sha256").update(input).digest("hex").slice(0, bytes * 2);
@@ -29825,16 +29824,17 @@ function estimateSpanBytes(span) {
 	return n;
 }
 /**
-* Splits `spans`, keeping their order, into groups whose estimated size stays
-* within `maxBytes`. A span larger than `maxBytes` on its own forms its own group.
+* Splits `spans`, keeping their order, into groups of at most `maxSpans` spans whose
+* estimated size stays within `maxBytes`. A span larger than `maxBytes` on its own
+* forms its own group.
 */
-function splitBySize(spans, maxBytes) {
+function splitBySize(spans, maxBytes, maxSpans = Infinity) {
 	const groups = [];
 	let group = [];
 	let size = 0;
 	for (const span of spans) {
 		const bytes = estimateSpanBytes(span);
-		if (group.length > 0 && size + bytes > maxBytes) {
+		if (group.length > 0 && (group.length >= maxSpans || size + bytes > maxBytes)) {
 			groups.push(group);
 			group = [];
 			size = 0;
@@ -29849,75 +29849,50 @@ function splitBySize(spans, maxBytes) {
 //#endregion
 //#region src/exporter.ts
 var import_src = require_src$7();
+/** Keeps every ended span, so the hook can send them all once it has ended them. */
+var CollectingProcessor = class {
+	spans = [];
+	onStart() {}
+	onEnd(span) {
+		this.spans.push(span);
+	}
+	async forceFlush() {}
+	async shutdown() {}
+};
 /** One export call; a throwing exporter is reported as a failed export. */
-function exportSafely(exporter, spans, resultCallback) {
-	try {
-		exporter.export(spans, resultCallback);
-	} catch (error) {
-		resultCallback({
-			code: import_src.ExportResultCode.FAILED,
-			error: error instanceof Error ? error : new Error(String(error))
-		});
-	}
-}
-/**
-* Passes spans through to `inner` and records the ids of every span whose export
-* call succeeded, so a span is only treated as sent once the backend accepted it.
-* A throwing `inner.export` is reported as a failed export, never propagated.
-*/
-var DeliveryTrackingExporter = class {
-	delivered = /* @__PURE__ */ new Set();
-	constructor(inner) {
-		this.inner = inner;
-	}
-	export(spans, resultCallback) {
-		exportSafely(this.inner, spans, (result) => {
-			if (result.code === import_src.ExportResultCode.SUCCESS) for (const span of spans) this.delivered.add(span.spanContext().spanId);
-			resultCallback(result);
-		});
-	}
-	shutdown() {
-		return this.inner.shutdown();
-	}
-	forceFlush() {
-		return this.inner.forceFlush?.() ?? Promise.resolve();
-	}
-};
-/**
-* Sends each export call as sequential requests whose estimated size stays within
-* `maxBytes`, to keep each request under the ingest endpoint's size limit. A span
-* whose estimate alone passes `maxBytes` is still sent, in a request of its own. Each
-* request goes through `inner` on its own, so a failed request fails only its own
-* spans; the call as a whole reports the first failure, after trying every request.
-*/
-var SizeLimitedExporter = class {
-	inFlight = /* @__PURE__ */ new Set();
-	constructor(inner, maxBytes) {
-		this.inner = inner;
-		this.maxBytes = maxBytes;
-	}
-	export(spans, resultCallback) {
-		const call = this.exportInRequests(spans).then(resultCallback);
-		this.inFlight.add(call);
-		call.finally(() => this.inFlight.delete(call));
-	}
-	async exportInRequests(spans) {
-		let firstFailure;
-		for (const request of splitBySize(spans, this.maxBytes)) {
-			const result = await new Promise((resolve) => exportSafely(this.inner, request, resolve));
-			if (result.code !== import_src.ExportResultCode.SUCCESS) firstFailure ??= result;
+function exportOnce(exporter, spans) {
+	return new Promise((resolve) => {
+		try {
+			exporter.export(spans, resolve);
+		} catch (error) {
+			resolve({
+				code: import_src.ExportResultCode.FAILED,
+				error: error instanceof Error ? error : new Error(String(error))
+			});
 		}
-		return firstFailure ?? { code: import_src.ExportResultCode.SUCCESS };
+	});
+}
+const MAX_SPANS_PER_REQUEST = 1024;
+/**
+* Sends `spans` as sequential requests of at most 1,024 spans whose estimated size
+* stays within `maxBytes`, to keep each request under the ingest endpoint's size
+* limit; a span whose estimate alone passes `maxBytes` goes in a request of its own.
+* Adds the ids of each accepted request to `delivered`, so a span counts as sent
+* only once the backend accepted it. A failed request fails only its own spans:
+* every request is tried, then the first failure is thrown.
+*/
+async function sendInRequests(exporter, spans, maxBytes, delivered) {
+	let failure;
+	for (const request of splitBySize(spans, maxBytes, MAX_SPANS_PER_REQUEST)) {
+		const result = await exportOnce(exporter, request);
+		if (result.code !== import_src.ExportResultCode.SUCCESS) {
+			failure ??= result;
+			continue;
+		}
+		for (const span of request) delivered.add(span.spanContext().spanId);
 	}
-	async shutdown() {
-		await Promise.all(this.inFlight);
-		await this.inner.shutdown();
-	}
-	async forceFlush() {
-		await Promise.all(this.inFlight);
-		await this.inner.forceFlush?.();
-	}
-};
+	if (failure) throw failure.error ?? /* @__PURE__ */ new Error("span export failed");
+}
 function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set()) {
 	const provider = new import_src$2.NodeTracerProvider({
 		idGenerator: idGen,
@@ -29928,11 +29903,8 @@ function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set(
 		idGen,
 		delivered,
 		shutdown: async () => {
-			try {
-				await provider.forceFlush();
-			} finally {
-				await provider.shutdown();
-			}
+			await provider.forceFlush();
+			await provider.shutdown();
 		}
 	};
 }
@@ -29948,12 +29920,18 @@ function otlpExporter(config) {
 	});
 }
 function buildTracing(config, exporter = otlpExporter(config)) {
-	const tracked = new DeliveryTrackingExporter(exporter);
-	return buildTracingWith(new import_index_shim.BatchSpanProcessor(new SizeLimitedExporter(tracked, config.maxRequestBytes), {
-		maxQueueSize: 4096,
-		maxExportBatchSize: 1024,
-		scheduledDelayMillis: 3e4
-	}), new PrimedIdGenerator(), tracked.delivered);
+	const collected = new CollectingProcessor();
+	const delivered = /* @__PURE__ */ new Set();
+	return {
+		...buildTracingWith(collected, new PrimedIdGenerator(), delivered),
+		shutdown: async () => {
+			try {
+				await sendInRequests(exporter, collected.spans, config.maxRequestBytes, delivered);
+			} finally {
+				await exporter.shutdown();
+			}
+		}
+	};
 }
 
 //#endregion
@@ -30013,9 +29991,11 @@ async function loadEmittedSpanIds(rolloutFile) {
 		return /* @__PURE__ */ new Set();
 	}
 }
-async function markSpanEmitted(rolloutFile, spanId) {
+/** Records `spanIds` as sent, in one append; an empty list writes nothing. */
+async function markSpansEmitted(rolloutFile, spanIds) {
+	if (spanIds.length === 0) return;
 	try {
-		await fs.appendFile(`${rolloutFile}${suffix}`, `${spanId}\n`, "utf-8");
+		await fs.appendFile(`${rolloutFile}${suffix}`, `${spanIds.join("\n")}\n`, "utf-8");
 	} catch {}
 }
 
@@ -30766,7 +30746,7 @@ async function dispatch(hook, config, deps) {
 		try {
 			await tracing.shutdown();
 		} finally {
-			for (const id of emittedIds) if (tracing.delivered.has(id)) await markSpanEmitted(transcript, id);
+			await markSpansEmitted(transcript, emittedIds.filter((id) => tracing.delivered.has(id)));
 		}
 	}
 	debugLog(`emitted ${emitted} spans`);

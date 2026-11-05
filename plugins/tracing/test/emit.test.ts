@@ -2,26 +2,14 @@ import { InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { dispatch } from "../src/emit.js";
-import type { Config } from "../src/config.js";
-import { memTracing } from "./helpers.js";
+import { copyFixture, memTracing, testConfig } from "./helpers.js";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const config: Config = {
-  enabled: true, apiKey: "tr-x", hostUrl: "http://x", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024, debug: false, failOnError: true, captureImages: false,
-};
+const config = testConfig();
 
 let dir: string;
 afterEach(async () => { if (dir) await fs.rm(dir, { recursive: true, force: true }); });
-
-async function copyFixture(): Promise<string> {
-  dir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-emit-"));
-  const dst = path.join(dir, "rollout.jsonl");
-  await fs.copyFile(path.join(here, "fixtures", "rollout-basic.jsonl"), dst);
-  return dst;
-}
 
 describe("dispatch", () => {
   it("emits AGENT+LLM+TOOL once, and is idempotent on a second run", async () => {
@@ -43,12 +31,10 @@ describe("dispatch", () => {
   });
 
   it("live: completed LLM/TOOL stream mid-turn with NO root (trace stays live); Stop emits the root", async () => {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-live-"));
-    const transcript = path.join(dir, "rollout.jsonl");
-    await fs.copyFile(path.join(here, "fixtures", "rollout-inprogress.jsonl"), transcript);
+    const transcript = await copyFixture("rollout-inprogress.jsonl");
 
     const mem = new InMemorySpanExporter();
-    // memTracing's shutdown only flushes, so the InMemory exporter keeps spans
+    // memTracing never shuts the InMemory exporter down, so it keeps spans
     // across dispatch() calls.
     const deps = {
       buildTracing: () => memTracing(mem),

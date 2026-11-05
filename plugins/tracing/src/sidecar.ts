@@ -19,9 +19,11 @@ export async function loadEmittedSpanIds(rolloutFile: string): Promise<Set<strin
   }
 }
 
-export async function markSpanEmitted(rolloutFile: string, spanId: string): Promise<void> {
+/** Records `spanIds` as sent, in one append; an empty list writes nothing. */
+export async function markSpansEmitted(rolloutFile: string, spanIds: string[]): Promise<void> {
+  if (spanIds.length === 0) return;
   try {
-    await fs.appendFile(`${rolloutFile}${suffix}`, `${spanId}\n`, "utf-8");
+    await fs.appendFile(`${rolloutFile}${suffix}`, `${spanIds.join("\n")}\n`, "utf-8");
   } catch {
     // Best-effort: a failed write only risks a duplicate emit next time.
   }

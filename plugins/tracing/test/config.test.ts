@@ -77,3 +77,26 @@ describe("getConfig", () => {
     }
   });
 });
+
+describe("max_request_bytes", () => {
+  const MiB = 1024 * 1024;
+
+  it("defaults to 12 MiB", async () => {
+    expect((await getConfig()).maxRequestBytes).toBe(12 * MiB);
+  });
+
+  it("reads TRACEROOT_CODEX_MAX_REQUEST_BYTES", async () => {
+    process.env.TRACEROOT_CODEX_MAX_REQUEST_BYTES = "5000000";
+    expect((await getConfig()).maxRequestBytes).toBe(5_000_000);
+  });
+
+  it("reads max_request_bytes from traceroot.json", async () => {
+    fs.writeFileSync(path.join(tmpHome, "traceroot.json"), JSON.stringify({ max_request_bytes: 4194304 }));
+    expect((await getConfig()).maxRequestBytes).toBe(4 * MiB);
+  });
+
+  it.each(["0", "-1", "lots"])("falls back to the default for %j", async (value) => {
+    process.env.TRACEROOT_CODEX_MAX_REQUEST_BYTES = value;
+    expect((await getConfig()).maxRequestBytes).toBe(12 * MiB);
+  });
+});

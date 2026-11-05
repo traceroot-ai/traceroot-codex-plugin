@@ -3,17 +3,51 @@ import {
   type InMemorySpanExporter, type ReadableSpan, type SpanExporter, SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildTracingWith, DeliveryTrackingExporter, type Tracing } from "../src/exporter.js";
+import { onTestFinished } from "vitest";
+import type { Config } from "../src/config.js";
+import { buildTracing, buildTracingWith, type Tracing } from "../src/exporter.js";
 import { PrimedIdGenerator } from "../src/ids.js";
 import type { EmitCtx } from "../src/spans.js";
 
 export const OK: ExportResult = { code: ExportResultCode.SUCCESS };
 
-export const failed = (message: string): ExportResult => ({ code: ExportResultCode.FAILED, error: new Error(message) });
+/** A failed export; `code` is the HTTP status, set on the error as the OTLP exporter does. */
+export const failed = (message: string, code?: number): ExportResult => ({
+  code: ExportResultCode.FAILED, error: Object.assign(new Error(message), code === undefined ? {} : { code }),
+});
 
 export const ids = (spans: ReadableSpan[]): string[] => spans.map((s) => s.spanContext().spanId);
+
+/** A config with tracing on and a host nothing listens on, with `overrides` applied. */
+export const testConfig = (overrides: Partial<Config> = {}): Config => ({
+  enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024,
+  debug: false, failOnError: true, captureImages: false,
+  ...overrides,
+});
+
+/** A fresh temp dir, removed when the current test finishes. */
+function tempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-test-"));
+  onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+/** Copies fixtures/`name` into a temp dir that is removed after the test, and returns the copy's path. */
+export async function copyFixture(name = "rollout-basic.jsonl"): Promise<string> {
+  const copy = path.join(tempDir(), name);
+  fs.copyFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", name), copy);
+  return copy;
+}
+
+/** Writes `lines` as a rollout in a temp dir that is removed after the test, and returns its path. */
+export async function writeRollout(lines: unknown[]): Promise<string> {
+  const file = path.join(tempDir(), "rollout.jsonl");
+  fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n"));
+  return file;
+}
 
 /**
  * Records every export call and answers it with `outcome(spans)` after
@@ -47,18 +81,38 @@ export class ScriptedExporter implements SpanExporter {
   }
 }
 
+/** `count` distinct span ids. */
+export const distinctIds = (count: number): string[] =>
+  Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(16, "0"));
+
+/** Ends one span per id through `tracing`, primed like emitSpan does, each with `bytes` of output text. */
+export function endSpans(tracing: Tracing, spanIds: string[], bytes = 0): void {
+  for (const id of spanIds) {
+    tracing.idGen.nextSpanId = id;
+    tracing.tracer.startSpan(`span-${id}`, { attributes: { "traceroot.span.output": "x".repeat(bytes) } }).end();
+  }
+}
+
+/** The real ReadableSpans that `end` ends through a throwaway tracing. */
+export async function captureSpans(end: (tracing: Tracing) => void): Promise<ReadableSpan[]> {
+  const sink = new ScriptedExporter();
+  const tracing = buildTracingWith(new SimpleSpanProcessor(sink), new PrimedIdGenerator());
+  end(tracing);
+  await tracing.shutdown();
+  return sink.calls.flat();
+}
+
+/** Real ReadableSpans with the given ids, each with `bytes` of output text. */
+export const makeSpans = (spanIds: string[], bytes = 0): Promise<ReadableSpan[]> =>
+  captureSpans((tracing) => endSpans(tracing, spanIds, bytes));
+
 /**
- * Tracing that exports each span into `mem` as it ends and tracks delivery the
- * way buildTracing does. Its shutdown only flushes: provider.shutdown() would
- * clear InMemorySpanExporter, and tests read the spans after dispatch.
+ * The tracing a hook builds, sending its spans into `mem`. It never shuts `mem`
+ * down: that would clear InMemorySpanExporter, and tests read the spans after dispatch.
  */
 export function memTracing(mem: InMemorySpanExporter): Tracing {
-  const tracked = new DeliveryTrackingExporter(mem);
-  const processor = new SimpleSpanProcessor(tracked);
-  return {
-    ...buildTracingWith(processor, new PrimedIdGenerator(), tracked.delivered),
-    shutdown: () => processor.forceFlush(),
-  };
+  const keep: SpanExporter = { export: (spans, done) => mem.export(spans, done), shutdown: async () => {} };
+  return buildTracing(testConfig(), keep);
 }
 
 /**

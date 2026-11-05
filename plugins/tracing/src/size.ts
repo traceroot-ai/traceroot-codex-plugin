@@ -43,16 +43,17 @@ export function estimateSpanBytes(span: ReadableSpan): number {
 }
 
 /**
- * Splits `spans`, keeping their order, into groups whose estimated size stays
- * within `maxBytes`. A span larger than `maxBytes` on its own forms its own group.
+ * Splits `spans`, keeping their order, into groups of at most `maxSpans` spans whose
+ * estimated size stays within `maxBytes`. A span larger than `maxBytes` on its own
+ * forms its own group.
  */
-export function splitBySize(spans: ReadableSpan[], maxBytes: number): ReadableSpan[][] {
+export function splitBySize(spans: ReadableSpan[], maxBytes: number, maxSpans = Infinity): ReadableSpan[][] {
   const groups: ReadableSpan[][] = [];
   let group: ReadableSpan[] = [];
   let size = 0;
   for (const span of spans) {
     const bytes = estimateSpanBytes(span);
-    if (group.length > 0 && size + bytes > maxBytes) {
+    if (group.length > 0 && (group.length >= maxSpans || size + bytes > maxBytes)) {
       groups.push(group);
       group = [];
       size = 0;
