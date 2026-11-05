@@ -4,9 +4,7 @@ import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
 // endpoint /api/v1/public/traces accepts OTLP protobuf ONLY (it 415s JSON), and
 // the traceroot-ts SDK uses this same proto exporter — keep them aligned.
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
-import {
-  type ReadableSpan, type SpanExporter, type SpanProcessor, BatchSpanProcessor,
-} from "@opentelemetry/sdk-trace-base";
+import type { ReadableSpan, SpanExporter, SpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import type { Config } from "./config.js";
 import { PrimedIdGenerator } from "./ids.js";
@@ -20,37 +18,52 @@ export type Tracing = {
   shutdown: () => Promise<void>;
 };
 
-/**
- * Passes spans through to `inner` and records the ids of every span whose export
- * call succeeded, so a span is only treated as sent once the backend accepted it.
- * A throwing `inner.export` is reported as a failed export, never propagated.
- */
-export class DeliveryTrackingExporter implements SpanExporter {
-  readonly delivered = new Set<string>();
+/** Keeps every ended span, so the hook can send them all once it has ended them. */
+class CollectingProcessor implements SpanProcessor {
+  readonly spans: ReadableSpan[] = [];
+  onStart(): void {}
+  onEnd(span: ReadableSpan): void {
+    this.spans.push(span);
+  }
+  async forceFlush(): Promise<void> {}
+  async shutdown(): Promise<void> {}
+}
 
-  constructor(private readonly inner: SpanExporter) {}
-
-  export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    const done = (result: ExportResult): void => {
-      if (result.code === ExportResultCode.SUCCESS) {
-        for (const span of spans) this.delivered.add(span.spanContext().spanId);
-      }
-      resultCallback(result);
-    };
+/** One export call; a throwing exporter is reported as a failed export. */
+export function exportOnce(exporter: SpanExporter, spans: ReadableSpan[]): Promise<ExportResult> {
+  return new Promise((resolve) => {
     try {
-      this.inner.export(spans, done);
+      exporter.export(spans, resolve);
     } catch (error) {
-      done({ code: ExportResultCode.FAILED, error: error instanceof Error ? error : new Error(String(error)) });
+      resolve({ code: ExportResultCode.FAILED, error: error instanceof Error ? error : new Error(String(error)) });
     }
-  }
+  });
+}
 
-  shutdown(): Promise<void> {
-    return this.inner.shutdown();
-  }
+// The most spans one request carries, however small they are, so the ingest
+// endpoint never gets an unbounded number of spans in one request.
+const MAX_SPANS_PER_REQUEST = 1024;
 
-  forceFlush(): Promise<void> {
-    return this.inner.forceFlush?.() ?? Promise.resolve();
+/**
+ * Sends `spans` as sequential requests of at most 1,024 spans and adds the ids of
+ * each accepted request to `delivered`, so a span counts as sent only once the
+ * backend accepted it. A failed request fails only its own spans: every request is
+ * tried, then the first failure is thrown.
+ */
+export async function sendInRequests(
+  exporter: SpanExporter, spans: ReadableSpan[], delivered: Set<string>,
+): Promise<void> {
+  let failure: ExportResult | undefined;
+  for (let i = 0; i < spans.length; i += MAX_SPANS_PER_REQUEST) {
+    const request = spans.slice(i, i + MAX_SPANS_PER_REQUEST);
+    const result = await exportOnce(exporter, request);
+    if (result.code !== ExportResultCode.SUCCESS) {
+      failure ??= result;
+      continue;
+    }
+    for (const span of request) delivered.add(span.spanContext().spanId);
   }
+  if (failure) throw failure.error ?? new Error("span export failed");
 }
 
 export function buildTracingWith(
@@ -63,15 +76,9 @@ export function buildTracingWith(
     delivered,
     // Both needed: forceFlush drains pending spans, shutdown awaits in-flight
     // OTLP HTTP delivery so this short-lived process delivers spans before exit.
-    // forceFlush rejects on the first failed batch while other exports may still
-    // be in flight, so shutdown runs either way: `delivered` is complete only
-    // once every export has been answered.
     shutdown: async () => {
-      try {
-        await provider.forceFlush();
-      } finally {
-        await provider.shutdown();
-      }
+      await provider.forceFlush();
+      await provider.shutdown();
     },
   };
 }
@@ -89,16 +96,19 @@ function otlpExporter(config: Config): SpanExporter {
 }
 
 export function buildTracing(config: Config, exporter: SpanExporter = otlpExporter(config)): Tracing {
-  const tracked = new DeliveryTrackingExporter(exporter);
-  // Batch (not Simple): a hook invocation can complete many spans at once (a turn
-  // with many tools, or a subagent's whole subtree). Simple sends one HTTP POST
-  // per span, and a burst loses the tail before this short-lived process exits.
-  // Batch coalesces them into few large OTLP POSTs that forceFlush ships reliably.
-  // Liveness is unchanged: each hook invocation still flushes its spans on shutdown.
-  const processor = new BatchSpanProcessor(tracked, {
-    maxQueueSize: 4096,
-    maxExportBatchSize: 1024,
-    scheduledDelayMillis: 30000, // won't auto-fire in a short hook; we forceFlush on shutdown
-  });
-  return buildTracingWith(processor, new PrimedIdGenerator(), tracked.delivered);
+  // A hook ends every span before it sends any, so the spans are collected and
+  // sent at shutdown, one request at a time. Nothing goes out earlier and nothing
+  // is dropped, and shutdown sees the result of every request.
+  const collected = new CollectingProcessor();
+  const delivered = new Set<string>();
+  return {
+    ...buildTracingWith(collected, new PrimedIdGenerator(), delivered),
+    shutdown: async () => {
+      try {
+        await sendInRequests(exporter, collected.spans, delivered);
+      } finally {
+        await exporter.shutdown();
+      }
+    },
+  };
 }

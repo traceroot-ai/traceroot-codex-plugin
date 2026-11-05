@@ -3,33 +3,17 @@
  * These tests inject findSubagent so they never touch the real ~/.codex.
  */
 import { InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { makeSpanId, makeTraceId } from "../src/ids.js";
 import { dispatch } from "../src/emit.js";
-import type { Config } from "../src/config.js";
-import { memTracing } from "./helpers.js";
+import { copyFixture, memTracing, testConfig } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.join(here, "fixtures");
 
-const config: Config = {
-  enabled: true, apiKey: "tr-x", hostUrl: "http://x", maxChars: 20000, debug: false, failOnError: true,
-};
-
-let tmpDir: string;
-afterEach(async () => { if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }); });
-
-/** Copy a fixture file to a fresh temp dir and return the temp path. */
-async function copyFixture(name: string): Promise<string> {
-  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "tr-sa-"));
-  const dst = path.join(tmpDir, name);
-  await fs.copyFile(path.join(fixturesDir, name), dst);
-  return dst;
-}
+const config = testConfig();
 
 /** Build a buildTracing that keeps spans in `mem`. */
 function makeTracingDeps(mem: InMemorySpanExporter) {
