@@ -63,7 +63,7 @@ export type EventMsgPayload = {
   last_agent_message?: string | null;
   info?: { total_token_usage?: TokenUsage; last_token_usage?: TokenUsage; model_context_window?: number } | null;
   /** item_completed */
-  item?: { type?: string; content?: MessageContentPart[] } | null;
+  item?: { type?: string; content?: MessageContentPart[]; [key: string]: unknown } | null;
   // *_end event fields
   status?: string;
   exit_code?: number;

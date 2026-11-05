@@ -106,8 +106,14 @@ function parseSpawnAgentId(output: unknown): string | undefined {
   return typeof id === "string" && id ? id : undefined;
 }
 
+/** Adds a subagent ref to `t` unless another path already recorded that thread. */
+function addSubagent(t: Turn, ref: SubagentRef): void {
+  if (!(t.subagents ??= []).some((s) => s.threadId === ref.threadId)) t.subagents.push(ref);
+}
+
 export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; turns: Turn[] } {
   let sessionMeta: SessionMeta = { sessionId: "" };
+  let sawSessionMeta = false;
   const turns: Turn[] = [];
   let turn: Turn | undefined;
   let step: ModelStep | undefined;
@@ -140,6 +146,9 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
   for (const line of lines) {
     const at = ms(line.timestamp);
     if (line.type === "session_meta") {
+      // A forked child rollout copies its parent's session_meta after its own; keep the first.
+      if (sawSessionMeta) continue;
+      sawSessionMeta = true;
       sessionMeta = {
         sessionId: (line.payload as { id: string }).id,
         cwd: (line.payload as { cwd?: string }).cwd,
@@ -182,6 +191,17 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
             const text = messageText(p.item.content);
             if (text) appendAuthoritativeUserInput(turn, text);
           }
+          // Codex 0.166+, paginated history: the spawn's call_id is the item's id.
+          if (turn && p.item?.type === "SubAgentActivity" && p.item.kind === "started") {
+            const { agent_thread_id: threadId, id: spawnCallId } = p.item;
+            if (typeof threadId === "string" && typeof spawnCallId === "string") addSubagent(turn, { threadId, spawnCallId });
+          }
+          break;
+        case "sub_agent_activity":
+          // Codex 0.166+, legacy history: the spawn's call_id is the event_id.
+          if (turn && p.kind === "started" && typeof p.agent_thread_id === "string" && typeof p.event_id === "string") {
+            addSubagent(turn, { threadId: p.agent_thread_id, spawnCallId: p.event_id });
+          }
           break;
         case "agent_message":
           // Older Codex versions emit this before task_complete. Keep it as a
@@ -211,7 +231,7 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
           if (turn && typeof p.new_thread_id === "string") {
             const ref: SubagentRef = { threadId: p.new_thread_id };
             if (typeof p.call_id === "string") ref.spawnCallId = p.call_id;
-            (turn.subagents ??= []).push(ref);
+            addSubagent(turn, ref);
           }
           if (turn && p.type.endsWith("_end") && typeof p.call_id === "string") {
             const tc = toolsByCallId.get(p.call_id);
@@ -240,7 +260,7 @@ export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; 
         // under this spawn_agent TOOL span, in the same trace.
         if (turn && spawnAgentCallIds.has(p.call_id)) {
           const threadId = parseSpawnAgentId(p.output);
-          if (threadId) (turn.subagents ??= []).push({ threadId, spawnCallId: p.call_id });
+          if (threadId) addSubagent(turn, { threadId, spawnCallId: p.call_id });
         }
         continue;
       }

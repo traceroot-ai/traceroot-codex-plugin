@@ -43,6 +43,7 @@ async function emitTurnTree(
   tracing: Tracing,
   already: Set<string>,
   findSubagent: Deps["findSubagent"],
+  rolloutTurnIds: ReadonlySet<string>, // turn ids in the rollout that holds `turn`
 ): Promise<number> {
   let n = 0;
 
@@ -92,10 +93,13 @@ async function emitTurnTree(
         seedPrefix: sub.threadId + ":",                   // unique, stable child span ids
       };
 
+      const childTurnIds = new Set(child.turns.flatMap((t) => t.turnId ?? []));
       for (const childTurn of child.turns) {
+        // A forked child copies its parent's turns; those belong to the parent.
+        if (childTurn.turnId && rolloutTurnIds.has(childTurn.turnId)) continue;
         n += await emitTurnTree(
           child.sessionMeta, childTurn, ctx, childOpts, visited, depth + 1,
-          tracing, already, findSubagent,
+          tracing, already, findSubagent, childTurnIds,
         );
       }
     } catch (err) {
@@ -156,11 +160,10 @@ async function emitSession(
   const turnEnding = handOff.turnEndedAt !== undefined && !!latest && latest.startTime <= handOff.turnEndedAt;
 
   // A subagent session is emitted NESTED under its parent's trace (via the
-  // parent's spawn_agent tool). Codex fires PostToolUse/Stop on the subagent
-  // session itself too; emitting here would duplicate it as a redundant
-  // standalone trace — skip, the parent owns it. (Note: the SubagentStop hook
-  // carries transcript_path = the PARENT session, so it does NOT hit this guard;
-  // it usefully re-walks the parent to nest the just-finished subagent live.)
+  // parent's spawn_agent tool). Codex fires PostToolUse on the subagent session
+  // itself too; emitting here would duplicate it as a redundant standalone
+  // trace — skip, the parent owns it. A child turn ends with SubagentStop, not
+  // Stop, and its transcript_path is the PARENT's, so it re-walks the parent.
   if (sessionMeta.threadSource === "subagent" || sessionMeta.parentThreadId) {
     debugLog(`subagent session ${sessionMeta.sessionId}; skipping standalone emit (nested under parent)`);
     return { emitted: 0 };
@@ -183,12 +186,13 @@ async function emitSession(
 
   // One visited set per dispatch so a thread referenced from multiple turns is emitted once.
   const visited = new Set<string>();
+  const turnIds = new Set(turns.flatMap((t) => t.turnId ?? []));
 
   try {
     for (const turn of turns) {
       emitted += await emitTurnTree(
         sessionMeta, turn, ctx, {}, visited, 0,
-        tracing, already, findSubagentFn,
+        tracing, already, findSubagentFn, turnIds,
       );
     }
   } finally {

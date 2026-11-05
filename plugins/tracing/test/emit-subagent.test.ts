@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { makeSpanId, makeTraceId } from "../src/ids.js";
 import { dispatch } from "../src/emit.js";
-import { copyFixture, memExporter, testConfig } from "./helpers.js";
+import { copyFixture, memExporter, testConfig, writeRollout } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.join(here, "fixtures");
@@ -33,6 +33,40 @@ const childSeed    = "child-thread-1:";
 const childRootId  = makeSpanId(childSeed + "child-turn-1:root");
 const childStepId  = makeSpanId(childSeed + "child-turn-1:step:0");
 const childExecId  = makeSpanId(childSeed + "child-exec-1");
+
+// Codex 0.166: spawn_agent returns {task_name}; the child thread id is in sub_agent_activity.
+const ev = (t: string, payload: object) => ({ timestamp: `2026-11-01T00:00:${t}Z`, type: "event_msg", payload });
+const ri = (t: string, payload: object) => ({ timestamp: `2026-11-01T00:00:${t}Z`, type: "response_item", payload });
+const parentMeta = { timestamp: "2026-11-01T00:00:00Z", type: "session_meta", payload: { id: "p166", thread_source: "user" } };
+const parentTurnLines = (t: string) => [
+  ev(t, { type: "task_started", turn_id: "p-turn" }),
+  ri(t, { type: "function_call", name: "exec_command", call_id: "p-exec", arguments: "{}" }),
+  ri(t, { type: "function_call_output", call_id: "p-exec", output: "start" }),
+  ri(t, { type: "function_call", name: "spawn_agent", call_id: "spawn-166", arguments: "{\"task_name\":\"echo_one\"}" }),
+];
+const parent166 = [
+  parentMeta,
+  ...parentTurnLines("01"),
+  ev("02", { type: "sub_agent_activity", event_id: "spawn-166", agent_thread_id: "c166", agent_path: "/root/echo_one", kind: "started" }),
+  ri("02", { type: "function_call_output", call_id: "spawn-166", output: "{\"task_name\":\"/root/echo_one\"}" }),
+  ri("05", { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }),
+  ev("05", { type: "token_count", info: { last_token_usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }),
+  ev("06", { type: "task_complete", turn_id: "p-turn" }),
+];
+// A forked child: its session_meta, a copy of the parent's (meta included), then its own turn.
+const child166 = [
+  { timestamp: "2026-11-01T00:00:02Z", type: "session_meta",
+    payload: { id: "c166", thread_source: "subagent", parent_thread_id: "p166", forked_from_id: "p166" } },
+  { ...parentMeta, timestamp: "2026-11-01T00:00:02Z" },
+  ...parentTurnLines("02"),
+  ev("02", { type: "turn_aborted", turn_id: "p-turn", reason: "interrupted" }),
+  ev("03", { type: "task_started", turn_id: "c-turn" }),
+  ri("03", { type: "function_call", name: "exec_command", call_id: "c-exec", arguments: "{}" }),
+  ri("04", { type: "function_call_output", call_id: "c-exec", output: "hi" }),
+  ri("04", { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi" }] }),
+  ev("04", { type: "token_count", info: { last_token_usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }),
+  ev("04", { type: "task_complete", turn_id: "c-turn" }),
+];
 
 describe("dispatch with subagent", () => {
   it("1. emits spans from both parent and child, all sharing one traceId", async () => {
@@ -154,5 +188,40 @@ describe("dispatch with subagent", () => {
     expect(ids).toContain(spawnToolId);
     // No child spans were emitted.
     expect(ids).not.toContain(childRootId);
+  });
+
+  it("7. Codex 0.166: sub_agent_activity nests the child under spawn_agent, without its copied parent turn", async () => {
+    const transcript = await writeRollout(parent166);
+    const childPath = await writeRollout(child166);
+    const mem = new InMemorySpanExporter();
+
+    await dispatch({ transcript_path: transcript }, config, {
+      ...makeTracingDeps(mem),
+      findSubagent: async (id) => id === "c166" ? childPath : undefined,
+    });
+
+    const spans = mem.getFinishedSpans();
+    const childRoot = spans.find((s) => s.spanContext().spanId === makeSpanId("c166:c-turn:root"));
+    expect(childRoot?.parentSpanContext?.spanId).toBe(makeSpanId("spawn-166"));
+    expect(childRoot?.spanContext().traceId).toBe(makeTraceId("p166", "p-turn"));
+    const ids = spans.map((s) => s.spanContext().spanId);
+    expect(ids).toContain(makeSpanId("c166:c-exec"));
+    // The copied parent turn is emitted once, by the parent, not again under the child's seed.
+    expect(ids).not.toContain(makeSpanId("c166:p-exec"));
+    expect(ids).not.toContain(makeSpanId("c166:p-turn:root"));
+    expect(ids.filter((id) => id === makeSpanId("p-exec"))).toHaveLength(1);
+  });
+
+  it("8. a child rollout holding a copy of the parent's session_meta emits nothing standalone", async () => {
+    const childPath = await writeRollout(child166);
+    const mem = new InMemorySpanExporter();
+
+    const r = await dispatch({ transcript_path: childPath, hook_event_name: "PostToolUse" }, config, {
+      ...makeTracingDeps(mem),
+      findSubagent: async () => undefined,
+    });
+
+    expect(r.emitted).toBe(0);
+    expect(mem.getFinishedSpans()).toHaveLength(0);
   });
 });
