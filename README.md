@@ -69,7 +69,7 @@ Non-interactive Codex never shows the trust prompt, so untrusted hooks are skipp
 
 1. **Trust interactively, then carry the entries over.** Run `codex` once somewhere you can answer the prompt, trust the hooks, then copy the three `[hooks.state."tracing@traceroot-codex-plugin:…"]` tables Codex wrote to `~/.codex/config.toml` into the config your headless environment uses. The hashes come from your own Codex, so there is nothing to take on faith.
 
-2. **Write the entries yourself.** If you can't run Codex interactively anywhere, these are the entries Codex generates for the `hooks.json` shipped in plugin 0.1.1 (verified on Codex 0.135 through 0.163):
+2. **Write the entries yourself.** If you can't run Codex interactively anywhere, these are the entries Codex generates for the `hooks.json` shipped in plugin 0.1.1 and 0.2.0 (verified on Codex 0.135 through 0.163):
 
    ```toml
    [hooks.state."tracing@traceroot-codex-plugin:hooks/hooks.json:post_tool_use:0:0"]
