@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { imagePolicy } from "../src/content.js";
 import { dispatch } from "../src/emit.js";
 import { makeSpanId } from "../src/ids.js";
 import { MAX_SPAN_BYTES, OVERSIZE_IMAGE, SPAN_TOO_LARGE_IMAGE } from "../src/images.js";
@@ -18,7 +19,7 @@ const MiB = 1024 * 1024;
 const INPUT = "traceroot.span.input";
 const OUTPUT = "traceroot.span.output";
 
-const on: EmitCtx = { maxChars: 64, turnEnding: true, captureImages: true };
+const on: EmitCtx = { maxChars: 64, turnEnding: true, content: imagePolicy };
 
 async function fixtureImage(fixture: string, mime: string): Promise<string> {
   const text = fs.readFileSync(path.join(fixtures, fixture), "utf-8");
@@ -274,7 +275,7 @@ describe("image capture on, fixtures without images", () => {
   it.each(cases)(
     "%s (%s context) changes only by the tool call ids",
     async (fixture, context) => {
-      const spans = await planFixture(fixture, { ...GOLDEN_CONTEXTS[context]!, captureImages: true });
+      const spans = await planFixture(fixture, { ...GOLDEN_CONTEXTS[context]!, content: imagePolicy });
       for (const span of spans.filter((s) => s.kind === "TOOL")) {
         const { call_id, ...rest } = JSON.parse(String(span.attributes["traceroot.span.metadata"]));
         expect(makeSpanId(call_id)).toBe(span.spanId);

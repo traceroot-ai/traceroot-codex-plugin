@@ -1,4 +1,5 @@
 import type { Config } from "./config.js";
+import { imagePolicy, textPolicy } from "./content.js";
 import { buildTracing as defaultBuildTracing, type Tracing } from "./exporter.js";
 import { getGitContext } from "./git.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
@@ -137,7 +138,7 @@ export async function dispatch(
   const git = await getGit(cwd).catch(() => ({}));
   const ctx: EmitCtx = {
     environment: config.environment, userId: config.userId, git, maxChars: config.maxChars, turnEnding,
-    captureImages: config.captureImages,
+    content: config.captureImages ? imagePolicy : textPolicy,
   };
 
   const already = await loadEmittedSpanIds(transcript);
