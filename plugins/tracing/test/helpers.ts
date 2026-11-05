@@ -1,15 +1,37 @@
 import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
-import {
-  type InMemorySpanExporter, type ReadableSpan, type SpanExporter, SimpleSpanProcessor,
-} from "@opentelemetry/sdk-trace-base";
-import { buildTracingWith, DeliveryTrackingExporter, type Tracing } from "../src/exporter.js";
-import { PrimedIdGenerator } from "../src/ids.js";
+import type { InMemorySpanExporter, ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { onTestFinished } from "vitest";
+import type { Config } from "../src/config.js";
+import { buildTracing, type Tracing } from "../src/exporter.js";
 
 export const OK: ExportResult = { code: ExportResultCode.SUCCESS };
 
-export const failed = (message: string): ExportResult => ({ code: ExportResultCode.FAILED, error: new Error(message) });
+/** A failed export; `code` is the HTTP status, set on the error as the OTLP exporter does. */
+export const failed = (message: string, code?: number): ExportResult => ({
+  code: ExportResultCode.FAILED, error: Object.assign(new Error(message), code === undefined ? {} : { code }),
+});
 
 export const ids = (spans: ReadableSpan[]): string[] => spans.map((s) => s.spanContext().spanId);
+
+/** A config with tracing on and a host nothing listens on, with `overrides` applied. */
+export const testConfig = (overrides: Partial<Config> = {}): Config => ({
+  enabled: true, apiKey: "tr-x", hostUrl: "http://127.0.0.1:9", maxChars: 20000, maxRequestBytes: 12 * 1024 * 1024,
+  debug: false, failOnError: true,
+  ...overrides,
+});
+
+/** Copies fixtures/`name` into a temp dir that is removed after the test, and returns the copy's path. */
+export async function copyFixture(name = "rollout-basic.jsonl"): Promise<string> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tr-fixture-"));
+  onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const copy = path.join(dir, name);
+  fs.copyFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", name), copy);
+  return copy;
+}
 
 /**
  * Records every export call and answers it with `outcome(spans)` after
@@ -44,15 +66,10 @@ export class ScriptedExporter implements SpanExporter {
 }
 
 /**
- * Tracing that exports each span into `mem` as it ends and tracks delivery the
- * way buildTracing does. Its shutdown only flushes: provider.shutdown() would
- * clear InMemorySpanExporter, and tests read the spans after dispatch.
+ * The tracing a hook builds, sending its spans into `mem`. It never shuts `mem`
+ * down: that would clear InMemorySpanExporter, and tests read the spans after dispatch.
  */
 export function memTracing(mem: InMemorySpanExporter): Tracing {
-  const tracked = new DeliveryTrackingExporter(mem);
-  const processor = new SimpleSpanProcessor(tracked);
-  return {
-    ...buildTracingWith(processor, new PrimedIdGenerator(), tracked.delivered),
-    shutdown: () => processor.forceFlush(),
-  };
+  const keep: SpanExporter = { export: (spans, done) => mem.export(spans, done), shutdown: async () => {} };
+  return buildTracing(testConfig(), keep);
 }
