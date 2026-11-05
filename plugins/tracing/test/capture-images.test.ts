@@ -11,7 +11,7 @@ import { attributesBytes } from "../src/size.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
 import type { SessionMeta, Turn } from "../src/types.js";
 import { GOLDEN_CONTEXTS, readGolden } from "./golden.js";
-import { copyFixture, memTracing, planFixture, testConfig } from "./helpers.js";
+import { copyFixture, memExporter, planFixture, testConfig } from "./helpers.js";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const MiB = 1024 * 1024;
@@ -193,7 +193,7 @@ describe("image capture on: an image sent while the turn is running", () => {
       line(3200, "event_msg", { type: "task_complete", turn_id: "turn-steer", last_agent_message: "Done." }),
     ];
     const mem = new InMemorySpanExporter();
-    const deps = { buildTracing: () => memTracing(mem), getGit: async () => ({}) };
+    const deps = { exporter: () => memExporter(mem), getGit: async () => ({}) };
 
     fs.writeFileSync(transcript, `${throughFirstCall.join("\n")}\n`);
     await dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config, deps);
@@ -292,7 +292,7 @@ describe("capture_images setting", () => {
     const png = await fixtureImage("rollout-tool-image.jsonl", "png");
     const config = testConfig({ maxChars: 64, captureImages: true });
     const mem = new InMemorySpanExporter();
-    await dispatch({ transcript_path: transcript }, config, { buildTracing: () => memTracing(mem), getGit: async () => ({}) });
+    await dispatch({ transcript_path: transcript }, config, { exporter: () => memExporter(mem), getGit: async () => ({}) });
     const tool = mem.getFinishedSpans().find((s) => s.attributes["traceroot.span.type"] === "TOOL")!;
     expect(String(tool.attributes[OUTPUT])).toContain(png);
   });

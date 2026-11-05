@@ -1,6 +1,7 @@
+import type { SpanExporter } from "@opentelemetry/sdk-trace-base";
 import type { Config } from "./config.js";
 import { spawnDrainer } from "./drainer.js";
-import { buildTracing as defaultBuildTracing, type Tracing } from "./exporter.js";
+import { buildTracing, otlpExporter, sendInRequests, type Tracing } from "./exporter.js";
 import { getGitContext } from "./git.js";
 import { makeSpanId, makeTraceId } from "./ids.js";
 import { drainSession, type HandOff, type LockTimings, type SessionLock, withSessionLock } from "./lock.js";
@@ -15,11 +16,8 @@ import { debugLog } from "./util.js";
 const STACK_GUARD = 32;
 
 export type Deps = {
-  /**
-   * `stillHeld` says whether this hook still holds the session's lock; each request
-   * is sent only while it does. `onDelivered` records each accepted request's spans.
-   */
-  buildTracing: (c: Config, stillHeld?: () => Promise<boolean>, onDelivered?: (ids: string[]) => Promise<void>) => Tracing;
+  /** Where the hook sends its spans; shut down once every request has been answered. */
+  exporter: (c: Config) => SpanExporter;
   getGit: (cwd: string) => Promise<{ repo?: string; ref?: string }>;
   /**
    * Resolve a subagent's child rollout path by thread id.
@@ -43,7 +41,6 @@ async function emitTurnTree(
   depth: number,
   tracing: Tracing,
   already: Set<string>,
-  emittedIds: string[],
   findSubagent: Deps["findSubagent"],
 ): Promise<number> {
   let n = 0;
@@ -57,7 +54,6 @@ async function emitTurnTree(
     const isTraceRoot = span.parentSpanId === null;
     if (already.has(span.spanId) && !isTraceRoot) continue;
     emitSpan(tracing, span);
-    emittedIds.push(span.spanId);
     already.add(span.spanId);
     n++;
   }
@@ -98,7 +94,7 @@ async function emitTurnTree(
       for (const childTurn of child.turns) {
         n += await emitTurnTree(
           child.sessionMeta, childTurn, ctx, childOpts, visited, depth + 1,
-          tracing, already, emittedIds, findSubagent,
+          tracing, already, findSubagent,
         );
       }
     } catch (err) {
@@ -180,19 +176,9 @@ async function emitSession(
   const already = await loadEmittedSpanIds(transcript);
   // A hook that froze past the stale limit and lost the lock must not send what it read.
   if (!(await lock.held())) { debugLog("session lock lost before export; skipping"); return { emitted: 0 }; }
-  // Each request's spans are recorded as soon as it is accepted, so a hook killed
-  // at Codex's deadline keeps what it delivered and the next hook sends only the rest.
-  const marked = new Set<string>();
-  const record = async (ids: string[]) => {
-    const fresh = ids.filter((id) => !marked.has(id));
-    for (const id of fresh) marked.add(id);
-    await markSpansEmitted(transcript, fresh);
-  };
-  const tracing = deps?.buildTracing
-    ? deps.buildTracing(config, lock.held, record)
-    : defaultBuildTracing(config, undefined, lock.held, record);
+  const exporter = (deps?.exporter ?? otlpExporter)(config);
+  const tracing = buildTracing();
   let emitted = 0;
-  const emittedIds: string[] = [];
 
   // One visited set per dispatch so a thread referenced from multiple turns is emitted once.
   const visited = new Set<string>();
@@ -201,16 +187,20 @@ async function emitSession(
     for (const turn of turns) {
       emitted += await emitTurnTree(
         sessionMeta, turn, ctx, {}, visited, 0,
-        tracing, already, emittedIds, findSubagentFn,
+        tracing, already, findSubagentFn,
       );
     }
   } finally {
     try {
       await tracing.shutdown();
+      // Each request's spans are recorded as soon as it is accepted, so a hook killed
+      // at Codex's deadline keeps what it delivered and the next hook sends only the rest.
+      await sendInRequests(exporter, tracing.spans, {
+        maxBytes: config.maxRequestBytes, stillHeld: lock.held,
+        onDelivered: (ids) => markSpansEmitted(transcript, ids),
+      });
     } finally {
-      // Mark only the spans the backend accepted, even when shutdown reports a
-      // failed export: anything left unmarked is sent again on the next hook.
-      await record(emittedIds.filter((id) => tracing.delivered.has(id)));
+      await exporter.shutdown();
     }
   }
   debugLog(`emitted ${emitted} spans`);

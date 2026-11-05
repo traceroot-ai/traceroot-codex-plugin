@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { onTestFinished } from "vitest";
 import type { Config } from "../src/config.js";
-import { buildTracing, buildTracingWith, type Tracing } from "../src/exporter.js";
+import { buildTracingWith, type Tracing } from "../src/exporter.js";
 import { PrimedIdGenerator } from "../src/ids.js";
 import { type EmitCtx, type EmittableSpan, planTurnSpans } from "../src/spans.js";
 import { parseRollout, readRollout } from "../src/transcript.js";
@@ -96,6 +96,12 @@ export function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+/** An `onDelivered` for sendInRequests that keeps every id it is given in `delivered`. */
+export function recorder(): { delivered: string[]; onDelivered: (ids: string[]) => Promise<void> } {
+  const delivered: string[] = [];
+  return { delivered, onDelivered: async (got) => { delivered.push(...got); } };
+}
+
 /** `count` distinct span ids. */
 export const distinctIds = (count: number): string[] =>
   Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(16, "0"));
@@ -122,12 +128,11 @@ export const makeSpans = (spanIds: string[], bytes = 0): Promise<ReadableSpan[]>
   captureSpans((tracing) => endSpans(tracing, spanIds, bytes));
 
 /**
- * The tracing a hook builds, sending its spans into `mem`. It never shuts `mem`
+ * An exporter for a hook that sends its spans into `mem`. It never shuts `mem`
  * down: that would clear InMemorySpanExporter, and tests read the spans after dispatch.
  */
-export function memTracing(mem: InMemorySpanExporter): Tracing {
-  const keep: SpanExporter = { export: (spans, done) => mem.export(spans, done), shutdown: async () => {} };
-  return buildTracing(testConfig(), keep);
+export function memExporter(mem: InMemorySpanExporter): SpanExporter {
+  return { export: (spans, done) => mem.export(spans, done), shutdown: async () => {} };
 }
 
 /** Every span planned from fixtures/`name`, turn by turn, in `ctx`. */

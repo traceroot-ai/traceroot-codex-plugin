@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { dispatch } from "../src/emit.js";
 import { makeSpanId } from "../src/ids.js";
-import { memTracing, testConfig, writeRollout } from "./helpers.js";
+import { memExporter, testConfig, writeRollout } from "./helpers.js";
 
 const png = /data:image\/png;base64,[A-Za-z0-9+/]+=*/.exec(fs.readFileSync(
   path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "rollout-tool-image.jsonl"), "utf-8",
@@ -25,7 +25,7 @@ const append = (file: string, lines: unknown[]) =>
 const OUTPUT = "traceroot.span.output";
 const tools = (mem: InMemorySpanExporter) =>
   mem.getFinishedSpans().filter((s) => s.attributes["traceroot.span.type"] === "TOOL");
-const deps = (mem: InMemorySpanExporter) => ({ buildTracing: () => memTracing(mem), getGit: async () => ({}) });
+const deps = (mem: InMemorySpanExporter) => ({ exporter: () => memExporter(mem), getGit: async () => ({}) });
 
 // A screenshot tool call, up to its end event: the PostToolUse hook comes here.
 const throughEndEvent = [

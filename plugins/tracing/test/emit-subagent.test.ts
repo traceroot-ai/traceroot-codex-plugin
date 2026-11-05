@@ -8,17 +8,17 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { makeSpanId, makeTraceId } from "../src/ids.js";
 import { dispatch } from "../src/emit.js";
-import { copyFixture, memTracing, testConfig } from "./helpers.js";
+import { copyFixture, memExporter, testConfig } from "./helpers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.join(here, "fixtures");
 
 const config = testConfig();
 
-/** Build a buildTracing that keeps spans in `mem`. */
+/** Deps whose exporter keeps spans in `mem`. */
 function makeTracingDeps(mem: InMemorySpanExporter) {
   return {
-    buildTracing: () => memTracing(mem),
+    exporter: () => memExporter(mem),
     getGit: async () => ({}),
   };
 }

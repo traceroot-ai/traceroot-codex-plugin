@@ -1,13 +1,12 @@
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import { describe, expect, it } from "vitest";
-import type { Config } from "../src/config.js";
 import { dispatch } from "../src/emit.js";
 import { buildTracing, sendInRequests } from "../src/exporter.js";
 import { makeSpanId } from "../src/ids.js";
 import { loadEmittedSpanIds } from "../src/sidecar.js";
 import { estimateSpanBytes } from "../src/size.js";
 import {
-  distinctIds, endSpans, failed, ids, makeSpans, OK, ScriptedExporter, testConfig, writeRollout,
+  copyFixture, distinctIds, endSpans, failed, ids, makeSpans, OK, recorder, ScriptedExporter, testConfig, writeRollout,
 } from "./helpers.js";
 
 const MiB = 1024 * 1024;
@@ -19,14 +18,14 @@ describe("sendInRequests splits by size", () => {
   it("sends 1,024 small spans as one request", async () => {
     const spans = await makeSpans(distinctIds(1024), 100);
     const inner = new ScriptedExporter();
-    await sendInRequests(inner, spans, { maxBytes: BUDGET }, new Set());
+    await sendInRequests(inner, spans, { maxBytes: BUDGET });
     expect(inner.calls).toEqual([spans]);
   });
 
   it("sends spans totalling 30 MiB as three or more requests, each under the budget", async () => {
     const spans = await makeSpans(distinctIds(30), MiB);
     const inner = new ScriptedExporter();
-    await sendInRequests(inner, spans, { maxBytes: BUDGET }, new Set());
+    await sendInRequests(inner, spans, { maxBytes: BUDGET });
     expect(inner.calls.length).toBeGreaterThanOrEqual(3);
     for (const request of inner.calls) expect(sizeOf(request)).toBeLessThanOrEqual(BUDGET);
     expect(inner.calls.flat()).toEqual(spans);
@@ -35,7 +34,7 @@ describe("sendInRequests splits by size", () => {
   it("sends a span larger than the budget on its own", async () => {
     const [small, huge] = [await makeSpans(["1".repeat(16)], 10), await makeSpans(["2".repeat(16)], 2 * MiB)];
     const inner = new ScriptedExporter();
-    await sendInRequests(inner, [...small, ...huge, ...small], { maxBytes: MiB }, new Set());
+    await sendInRequests(inner, [...small, ...huge, ...small], { maxBytes: MiB });
     expect(inner.calls).toEqual([small, huge, small]);
   });
 
@@ -43,9 +42,9 @@ describe("sendInRequests splits by size", () => {
     const spans = await makeSpans(distinctIds(30), MiB);
     let call = 0;
     const inner = new ScriptedExporter(() => (++call === 2 ? failed("Request Entity Too Large") : OK));
-    const delivered = new Set<string>();
+    const { delivered, onDelivered } = recorder();
 
-    await expect(sendInRequests(inner, spans, { maxBytes: BUDGET }, delivered)).rejects.toThrow("Request Entity Too Large");
+    await expect(sendInRequests(inner, spans, { maxBytes: BUDGET, onDelivered })).rejects.toThrow("Request Entity Too Large");
 
     expect(inner.calls.length).toBeGreaterThanOrEqual(3);
     const failedIds = ids(inner.calls[1]!);
@@ -56,45 +55,58 @@ describe("sendInRequests splits by size", () => {
     const spans = await makeSpans(distinctIds(3), MiB);
     let call = 0;
     const inner = new ScriptedExporter(() => (++call === 1 ? "throw" : failed("Service Unavailable")));
-    await expect(sendInRequests(inner, spans, { maxBytes: MiB + 1024 }, new Set())).rejects.toThrow("exporter crashed");
+    await expect(sendInRequests(inner, spans, { maxBytes: MiB + 1024 })).rejects.toThrow("exporter crashed");
     expect(inner.calls).toHaveLength(3);
   });
 
   it("succeeds without a request when there are no spans", async () => {
     const inner = new ScriptedExporter();
-    await sendInRequests(inner, [], { maxBytes: BUDGET }, new Set());
+    await sendInRequests(inner, [], { maxBytes: BUDGET });
     expect(inner.calls).toHaveLength(0);
   });
 });
 
 const config = testConfig({ maxRequestBytes: BUDGET });
 
-describe("buildTracing splits its spans by max_request_bytes", () => {
+/** The spans of a hook, collected by buildTracing, each `MiB` in size. */
+async function collected(count: number) {
+  const tracing = buildTracing();
+  endSpans(tracing, distinctIds(count), MiB);
+  await tracing.shutdown();
+  return tracing.spans;
+}
+
+describe("the spans buildTracing collects split by max_request_bytes", () => {
   it("sends requests under the configured budget and counts every span delivered", async () => {
     const inner = new ScriptedExporter();
-    const tracing = buildTracing({ ...config, maxRequestBytes: 3 * MiB }, inner);
-    endSpans(tracing, distinctIds(6), MiB);
-    await tracing.shutdown();
+    const { delivered, onDelivered } = recorder();
+    await sendInRequests(inner, await collected(6), { maxBytes: 3 * MiB, onDelivered });
 
     expect(inner.calls.length).toBeGreaterThanOrEqual(3);
     for (const request of inner.calls) expect(sizeOf(request)).toBeLessThanOrEqual(3 * MiB);
-    expect([...tracing.delivered].sort()).toEqual(ids(inner.calls.flat()).sort());
-    expect(tracing.delivered.size).toBe(6);
+    expect([...delivered].sort()).toEqual(ids(inner.calls.flat()).sort());
+    expect(delivered).toHaveLength(6);
   });
 
   it("leaves only the spans of a failed request undelivered", async () => {
     let call = 0;
     const inner = new ScriptedExporter(() => (++call === 1 ? failed("Request Entity Too Large") : OK));
-    const tracing = buildTracing({ ...config, maxRequestBytes: 3 * MiB }, inner);
-    endSpans(tracing, distinctIds(6), MiB);
-    await expect(tracing.shutdown()).rejects.toBeDefined();
+    const { delivered, onDelivered } = recorder();
+    await expect(sendInRequests(inner, await collected(6), { maxBytes: 3 * MiB, onDelivered })).rejects.toBeDefined();
 
     const lost = ids(inner.calls[0]!);
     expect(lost.length).toBeGreaterThan(0);
-    expect([...tracing.delivered].sort()).toEqual(ids(inner.calls.flat()).filter((id) => !lost.includes(id)).sort());
+    expect([...delivered].sort()).toEqual(ids(inner.calls.flat()).filter((id) => !lost.includes(id)).sort());
   });
+});
 
+const deps = (exporter: ScriptedExporter) => ({
+  exporter: () => exporter, getGit: async () => ({}),
+});
+
+describe("dispatch with a request per span", () => {
   it("sends every request before it shuts the exporter down", async () => {
+    const transcript = await copyFixture();
     let stopped = false;
     const late: string[] = [];
     const inner = new ScriptedExporter((spans) => {
@@ -102,18 +114,12 @@ describe("buildTracing splits its spans by max_request_bytes", () => {
       return OK;
     });
     inner.shutdown = async () => { stopped = true; };
-    const tracing = buildTracing({ ...config, maxRequestBytes: 64 * 1024 }, inner);
-    endSpans(tracing, distinctIds(1100), 1000);
-    await tracing.shutdown();
+    await dispatch({ transcript_path: transcript }, { ...config, maxRequestBytes: 1 }, deps(inner));
 
     expect(late).toEqual([]);
     expect(inner.calls.length).toBeGreaterThan(2);
-    expect(tracing.delivered.size).toBe(1100);
+    expect(await loadEmittedSpanIds(transcript)).toEqual(new Set(ids(inner.calls.flat())));
   });
-});
-
-const deps = (exporter: ScriptedExporter) => ({
-  buildTracing: (c: Config) => buildTracing(c, exporter), getGit: async () => ({}),
 });
 
 describe("dispatch with a request that fails", () => {

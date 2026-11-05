@@ -1,5 +1,6 @@
 import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
-import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
+import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -7,9 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import type { Config } from "../src/config.js";
 import { dispatch } from "../src/emit.js";
-import { buildTracing } from "../src/exporter.js";
 import { makeSpanId } from "../src/ids.js";
 import { loadEmittedSpanIds } from "../src/sidecar.js";
 import { copyFixture, failed, ids, OK, ScriptedExporter, testConfig, writeRollout } from "./helpers.js";
@@ -21,8 +20,8 @@ const ROOT = makeSpanId("turn-1:root");
 const STEP = makeSpanId("turn-1:step:0");
 const TOOL = makeSpanId("call-1");
 
-const deps = (exporter: ScriptedExporter) => ({
-  buildTracing: (c: Config) => buildTracing(c, exporter),
+const deps = (exporter: SpanExporter) => ({
+  exporter: () => exporter,
   getGit: async () => ({}),
 });
 
@@ -58,6 +57,19 @@ describe("dispatch marks spans as sent only after their export succeeded", () =>
     expect(ids(retry.calls.flat()).sort()).toEqual([ROOT, STEP, TOOL].sort());
     expect(await sidecar(transcript)).toEqual([ROOT, STEP, TOOL].sort());
   });
+
+  it.each([["succeeds", OK], ["fails", failed("Service Unavailable")]])(
+    "shuts the exporter down after the last request, when it %s",
+    async (_label, outcome) => {
+      const order: string[] = [];
+      const inner: SpanExporter = {
+        export: (_spans, resultCallback) => { order.push("export"); setTimeout(() => resultCallback(outcome), 1); },
+        shutdown: async () => { order.push("shutdown"); },
+      };
+      await dispatch({ transcript_path: await copyFixture() }, config, deps(inner)).catch(() => {});
+      expect(order).toEqual(["export", "shutdown"]);
+    },
+  );
 });
 
 describe("dispatch records spans as each request is accepted", () => {
@@ -143,11 +155,18 @@ describe("dispatch with more spans than one request carries", () => {
   it("a failed final request does not cause the accepted first request to be re-sent", async () => {
     const transcript = await writeBigRollout();
     let call = 0;
-    const exporter = new ScriptedExporter(() => (++call === 2 ? failed("Service Unavailable", 503) : OK));
+    let markedBeforeFinal: string[] = [];
+    const exporter = new ScriptedExporter(() => {
+      if (++call === 1) return OK;
+      // What a hook killed during the final request would have kept.
+      markedBeforeFinal = readFileSync(`${transcript}.traceroot`, "utf-8").split("\n").filter(Boolean);
+      return failed("Service Unavailable", 503);
+    });
 
     await expect(dispatch({ transcript_path: transcript }, config, deps(exporter))).rejects.toBeDefined();
     expect(exporter.calls).toHaveLength(2);
     const [firstBatch, finalBatch] = [ids(exporter.calls[0]!), ids(exporter.calls[1]!)];
+    expect([...markedBeforeFinal].sort()).toEqual([...firstBatch].sort());
     expect(await sidecar(transcript)).toEqual([...firstBatch].sort());
 
     // Only the rejected request goes again, plus the always re-sent root.

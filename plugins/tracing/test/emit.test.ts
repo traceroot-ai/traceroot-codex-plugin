@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { dispatch } from "../src/emit.js";
-import { copyFixture, memTracing, testConfig } from "./helpers.js";
+import { copyFixture, memExporter, testConfig } from "./helpers.js";
 
 const config = testConfig();
 
@@ -16,7 +16,7 @@ describe("dispatch", () => {
     const transcript = await copyFixture();
     const mem = new InMemorySpanExporter();
     const deps = {
-      buildTracing: () => memTracing(mem),
+      exporter: () => memExporter(mem),
       getGit: async () => ({ repo: "traceroot-ai/traceroot", ref: "a".repeat(40) }),
     };
 
@@ -34,10 +34,10 @@ describe("dispatch", () => {
     const transcript = await copyFixture("rollout-inprogress.jsonl");
 
     const mem = new InMemorySpanExporter();
-    // memTracing never shuts the InMemory exporter down, so it keeps spans
+    // memExporter never shuts the InMemory exporter down, so it keeps spans
     // across dispatch() calls.
     const deps = {
-      buildTracing: () => memTracing(mem),
+      exporter: () => memExporter(mem),
       getGit: async () => ({}),
     };
 
@@ -72,7 +72,7 @@ describe("dispatch", () => {
     await fs.writeFile(transcript, lines);
     const mem = new InMemorySpanExporter();
     const deps = {
-      buildTracing: () => memTracing(mem),
+      exporter: () => memExporter(mem),
       getGit: async () => ({}),
     };
     const r = await dispatch({ transcript_path: transcript }, config, deps);

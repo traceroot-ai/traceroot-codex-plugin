@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
 import { dispatch, drain } from "../src/emit.js";
-import { buildTracing } from "../src/exporter.js";
 import { makeSpanId } from "../src/ids.js";
 import { drainSession, type HandOff, type LockTimings, withSessionLock } from "../src/lock.js";
 import { loadEmittedSpanIds } from "../src/sidecar.js";
@@ -702,8 +701,8 @@ describe("dispatch under the session lock", () => {
   });
 
   const depsFor = (label: string, events: string[], exporter: SpanExporter, timings: LockTimings) => ({
-    // A fresh exporter wrapper per run: each run builds and shuts down its own tracing.
-    buildTracing: (c: Config, stillHeld?: () => Promise<boolean>) => buildTracing(c, exporter, stillHeld),
+    // Every run of this hook sends through, then shuts down, this same exporter.
+    exporter: () => exporter,
     // getGit runs right after the rollout is read.
     getGit: async () => { events.push(`${label}:read`); return {}; },
     lockTimings: timings,
@@ -850,7 +849,7 @@ describe("dispatch under the session lock", () => {
     const referenceRollout = path.join(path.dirname(transcript), "reference.jsonl");
     await fs.copyFile(path.join(here, "fixtures", "rollout-inprogress.jsonl"), referenceRollout);
     await dispatch({ transcript_path: referenceRollout, hook_event_name: "Stop" }, config,
-      { buildTracing: (c: Config) => buildTracing(c, reference), getGit: async () => ({}), lockTimings: T });
+      { exporter: () => reference, getGit: async () => ({}), lockTimings: T });
     expect(drainers).toHaveLength(1);
     expect(collector.calls).toHaveLength(2);
     expect(ids(collector.calls[0]!)).toContain(ROOT);
@@ -867,7 +866,7 @@ describe("dispatch under the session lock", () => {
     const gate = deferred();
     let reads = 0;
     const deps = {
-      buildTracing: (c: Config, stillHeld?: () => Promise<boolean>) => buildTracing(c, exporter, stillHeld),
+      exporter: () => exporter,
       // The Stop's first run waits right after reading the rollout.
       getGit: async () => {
         if (++reads === 1) { reading.resolve(); await gate.promise; }
@@ -925,7 +924,7 @@ describe("dispatch under the session lock", () => {
     }
     const next = new ScriptedExporter();
     await dispatch({ transcript_path: transcript, hook_event_name: "PostToolUse" }, config,
-      { buildTracing: (c: Config) => buildTracing(c, next), getGit: async () => ({}), lockTimings: T });
+      { exporter: () => next, getGit: async () => ({}), lockTimings: T });
 
     const sent = ids(next.calls.flat());
     expect(sent).toContain(ROOT);
@@ -955,7 +954,7 @@ describe("dispatch under the session lock", () => {
       return OK;
     });
     const deps = {
-      buildTracing: (c: Config, stillHeld?: () => Promise<boolean>) => buildTracing(c, exporter, stillHeld),
+      exporter: () => exporter,
       getGit: async () => ({}),
       lockTimings: T,
     };

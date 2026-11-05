@@ -29932,12 +29932,12 @@ const MAX_SPANS_PER_REQUEST = 1024;
 * Sends `spans` as sequential requests of at most 1,024 spans whose estimated size
 * stays within `maxBytes`, to keep each request under the ingest endpoint's size
 * limit; a span whose estimate alone passes `maxBytes` goes in a request of its own.
-* Adds the ids of each accepted request to `delivered`, so a span counts as sent
+* Passes the ids of each accepted request to `onDelivered`, so a span counts as sent
 * only once the backend accepted it. A failed request fails only its own spans:
 * every request is tried, then the first failure is thrown. A request that
 * `stillHeld` holds back fails too, so the next hook sends its spans.
 */
-async function sendInRequests(exporter, spans, opts, delivered) {
+async function sendInRequests(exporter, spans, opts) {
 	let failure;
 	for (const request of splitBySize(spans, opts.maxBytes, MAX_SPANS_PER_REQUEST)) {
 		if (opts.stillHeld && !await opts.stillHeld()) {
@@ -29952,13 +29952,11 @@ async function sendInRequests(exporter, spans, opts, delivered) {
 			failure ??= result;
 			continue;
 		}
-		const ids = request.map((span) => span.spanContext().spanId);
-		for (const id of ids) delivered.add(id);
-		await opts.onDelivered?.(ids);
+		await opts.onDelivered?.(request.map((span) => span.spanContext().spanId));
 	}
 	if (failure) throw failure.error ?? /* @__PURE__ */ new Error("span export failed");
 }
-function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set()) {
+function buildTracingWith(processor, idGen) {
 	const provider = new import_src$2.NodeTracerProvider({
 		idGenerator: idGen,
 		spanProcessors: [processor]
@@ -29966,7 +29964,6 @@ function buildTracingWith(processor, idGen, delivered = /* @__PURE__ */ new Set(
 	return {
 		tracer: provider.getTracer(SDK_NAME, SDK_VERSION),
 		idGen,
-		delivered,
 		shutdown: async () => {
 			await provider.forceFlush();
 			await provider.shutdown();
@@ -29984,22 +29981,11 @@ function otlpExporter(config) {
 		compression: "gzip"
 	});
 }
-function buildTracing(config, exporter = otlpExporter(config), stillHeld, onDelivered) {
+function buildTracing() {
 	const collected = new CollectingProcessor();
-	const delivered = /* @__PURE__ */ new Set();
 	return {
-		...buildTracingWith(collected, new PrimedIdGenerator(), delivered),
-		shutdown: async () => {
-			try {
-				await sendInRequests(exporter, collected.spans, {
-					maxBytes: config.maxRequestBytes,
-					stillHeld,
-					onDelivered
-				}, delivered);
-			} finally {
-				await exporter.shutdown();
-			}
-		}
+		...buildTracingWith(collected, new PrimedIdGenerator()),
+		spans: collected.spans
 	};
 }
 
@@ -31091,14 +31077,13 @@ function parseRollout(lines) {
 //#region src/emit.ts
 const STACK_GUARD = 32;
 /** Emit all complete, not-yet-seen spans for `turn` and recurse into its subagents. */
-async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, emittedIds, findSubagent) {
+async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracing, already, findSubagent) {
 	let n = 0;
 	for (const span of planTurnSpans(sessionMeta, turn, ctx, opts)) {
 		if (!span.complete) continue;
 		const isTraceRoot = span.parentSpanId === null;
 		if (already.has(span.spanId) && !isTraceRoot) continue;
 		emitSpan(tracing, span);
-		emittedIds.push(span.spanId);
 		already.add(span.spanId);
 		n++;
 	}
@@ -31123,7 +31108,7 @@ async function emitTurnTree(sessionMeta, turn, ctx, opts, visited, depth, tracin
 				rootParentSpanId: makeSpanId(parentSeed + sub.spawnCallId),
 				seedPrefix: sub.threadId + ":"
 			};
-			for (const childTurn of child.turns) n += await emitTurnTree(child.sessionMeta, childTurn, ctx, childOpts, visited, depth + 1, tracing, already, emittedIds, findSubagent);
+			for (const childTurn of child.turns) n += await emitTurnTree(child.sessionMeta, childTurn, ctx, childOpts, visited, depth + 1, tracing, already, findSubagent);
 		} catch (err) {
 			debugLog(`subagent ${sub.threadId} resolve/read/parse failed; skipping: ${String(err)}`);
 			continue;
@@ -31180,23 +31165,22 @@ async function emitSession(hook, transcript, config, lock, handOff, deps) {
 		debugLog("session lock lost before export; skipping");
 		return { emitted: 0 };
 	}
-	const marked = /* @__PURE__ */ new Set();
-	const record = async (ids) => {
-		const fresh = ids.filter((id) => !marked.has(id));
-		for (const id of fresh) marked.add(id);
-		await markSpansEmitted(transcript, fresh);
-	};
-	const tracing = deps?.buildTracing ? deps.buildTracing(config, lock.held, record) : buildTracing(config, void 0, lock.held, record);
+	const exporter = (deps?.exporter ?? otlpExporter)(config);
+	const tracing = buildTracing();
 	let emitted = 0;
-	const emittedIds = [];
 	const visited = /* @__PURE__ */ new Set();
 	try {
-		for (const turn of turns) emitted += await emitTurnTree(sessionMeta, turn, ctx, {}, visited, 0, tracing, already, emittedIds, findSubagentFn);
+		for (const turn of turns) emitted += await emitTurnTree(sessionMeta, turn, ctx, {}, visited, 0, tracing, already, findSubagentFn);
 	} finally {
 		try {
 			await tracing.shutdown();
+			await sendInRequests(exporter, tracing.spans, {
+				maxBytes: config.maxRequestBytes,
+				stillHeld: lock.held,
+				onDelivered: (ids) => markSpansEmitted(transcript, ids)
+			});
 		} finally {
-			await record(emittedIds.filter((id) => tracing.delivered.has(id)));
+			await exporter.shutdown();
 		}
 	}
 	debugLog(`emitted ${emitted} spans`);
