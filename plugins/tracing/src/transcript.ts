@@ -106,9 +106,11 @@ function parseSpawnAgentId(output: unknown): string | undefined {
   return typeof id === "string" && id ? id : undefined;
 }
 
-/** Adds a subagent ref to `t` unless another path already recorded that thread. */
+/** Adds a subagent ref to `t`, or fills in the spawn call id of one already recorded. */
 function addSubagent(t: Turn, ref: SubagentRef): void {
-  if (!(t.subagents ??= []).some((s) => s.threadId === ref.threadId)) t.subagents.push(ref);
+  const existing = (t.subagents ??= []).find((s) => s.threadId === ref.threadId);
+  if (!existing) t.subagents.push(ref);
+  else existing.spawnCallId ??= ref.spawnCallId;
 }
 
 export function parseRollout(lines: RolloutLine[]): { sessionMeta: SessionMeta; turns: Turn[] } {

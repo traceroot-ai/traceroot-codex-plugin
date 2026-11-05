@@ -44,10 +44,17 @@ const parentTurnLines = (t: string) => [
   ri(t, { type: "function_call_output", call_id: "p-exec", output: "start" }),
   ri(t, { type: "function_call", name: "spawn_agent", call_id: "spawn-166", arguments: "{\"task_name\":\"echo_one\"}" }),
 ];
-const parent166 = [
+// The spawn's "started" record, as legacy and as paginated history persist it.
+const started166 = {
+  legacy: ev("02", { type: "sub_agent_activity", event_id: "spawn-166", agent_thread_id: "c166", agent_path: "/root/echo_one", kind: "started" }),
+  paginated: ev("02", { type: "item_completed", thread_id: "p166", turn_id: "p-turn", item: {
+    type: "SubAgentActivity", id: "spawn-166", kind: "started", agent_thread_id: "c166", agent_path: "/root/echo_one" } }),
+};
+const parent166 = (started: object) => [
   parentMeta,
   ...parentTurnLines("01"),
-  ev("02", { type: "sub_agent_activity", event_id: "spawn-166", agent_thread_id: "c166", agent_path: "/root/echo_one", kind: "started" }),
+  ev("02", { type: "collab_agent_spawn_end", new_thread_id: "c166" }), // records c166 without a call id
+  started,
   ri("02", { type: "function_call_output", call_id: "spawn-166", output: "{\"task_name\":\"/root/echo_one\"}" }),
   ri("05", { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }),
   ev("05", { type: "token_count", info: { last_token_usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }),
@@ -190,8 +197,8 @@ describe("dispatch with subagent", () => {
     expect(ids).not.toContain(childRootId);
   });
 
-  it("7. Codex 0.166: sub_agent_activity nests the child under spawn_agent, without its copied parent turn", async () => {
-    const transcript = await writeRollout(parent166);
+  it.each(["legacy", "paginated"] as const)("7. Codex 0.166 (%s): SubAgentActivity nests the child under spawn_agent, without its copied parent turn", async (shape) => {
+    const transcript = await writeRollout(parent166(started166[shape]));
     const childPath = await writeRollout(child166);
     const mem = new InMemorySpanExporter();
 
