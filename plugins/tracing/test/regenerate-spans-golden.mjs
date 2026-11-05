@@ -20,6 +20,13 @@ const testDir = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(testDir, "../../..");
 const git = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "inherit" });
 
+// A shallow clone may not have BASE, so fetch that one commit when it is missing.
+try {
+  execFileSync("git", ["-C", repo, "cat-file", "-e", `${BASE}^{commit}`], { stdio: "ignore" });
+} catch {
+  git("fetch", "--quiet", "--no-tags", "--depth=1", "origin", BASE);
+}
+
 // The temporary checkout has no node_modules, so the planner's one package
 // dependency resolves from this checkout.
 const load = async (file) =>
