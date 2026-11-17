@@ -30862,6 +30862,9 @@ function reasoningText(p) {
 	const parts = [];
 	for (const s of p.summary ?? []) if (s?.text) parts.push(s.text);
 	if (typeof p.content === "string") parts.push(p.content);
+	else if (Array.isArray(p.content)) {
+		for (const c of p.content) if (typeof c?.text === "string") parts.push(c.text);
+	}
 	return parts.length ? parts.join("\n") : void 0;
 }
 function messageText(content) {
