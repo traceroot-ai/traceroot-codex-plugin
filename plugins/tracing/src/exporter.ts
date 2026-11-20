@@ -1,6 +1,6 @@
 import type { Tracer } from "@opentelemetry/api";
 import { type ExportResult, ExportResultCode } from "@opentelemetry/core";
-// Protobuf exporter (Content-Type: application/x-protobuf). The TraceRoot ingest
+// Protobuf exporter (Content-Type: application/x-protobuf). The traceroot ingest
 // endpoint /api/v1/public/traces accepts OTLP protobuf ONLY (it 415s JSON), and
 // the traceroot-ts SDK uses this same proto exporter — keep them aligned.
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
