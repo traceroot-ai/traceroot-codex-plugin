@@ -1,6 +1,6 @@
 # traceroot-codex-plugin
 
-Trace OpenAI Codex sessions to [TraceRoot](https://traceroot.ai). Every query becomes **one live trace** — agent turn, model calls, tool calls, file edits, and any subagents it spawns — streamed as the agent works and linked to your git repo. No service to run, and the hooks fail open, so a tracing error doesn't stop Codex.
+Trace OpenAI Codex sessions to [traceroot](https://traceroot.ai). Every query becomes **one live trace** — agent turn, model calls, tool calls, file edits, and any subagents it spawns — streamed as the agent works and linked to your git repo. No service to run, and the hooks fail open, so a tracing error doesn't stop Codex.
 
 ## Install
 
@@ -26,7 +26,7 @@ features.hooks = true
 enabled = true
 ```
 
-Trust the plugin's hooks. Codex won't run a plugin's hooks until you've reviewed and trusted them, and installing the plugin doesn't do that for you. The reason it asks: hooks run as your user, outside Codex's sandbox. What you're trusting here is three hook definitions in [`plugins/tracing/hooks/hooks.json`](plugins/tracing/hooks/hooks.json) (`PostToolUse`, `Stop`, `SubagentStop`), each running `node "$PLUGIN_ROOT/dist/index.mjs"`. That script reads the session transcript and sends spans to your TraceRoot host; it writes nothing back into Codex and fails open. Hooks of one session take turns through a lock directory next to the transcript (`<transcript>.traceroot.lock.d`). A hook that waits more than 10 s for it leaves a request in `<transcript>.traceroot.pending.d` and exits, and may start a background copy of the same script (`node dist/index.mjs --drain`, holding `<transcript>.traceroot.drainer.d` while it works) that sends the rest and exits within 2 minutes. Source is in [`plugins/tracing/src/`](plugins/tracing/src/).
+Trust the plugin's hooks. Codex won't run a plugin's hooks until you've reviewed and trusted them, and installing the plugin doesn't do that for you. The reason it asks: hooks run as your user, outside Codex's sandbox. What you're trusting here is three hook definitions in [`plugins/tracing/hooks/hooks.json`](plugins/tracing/hooks/hooks.json) (`PostToolUse`, `Stop`, `SubagentStop`), each running `node "$PLUGIN_ROOT/dist/index.mjs"`. That script reads the session transcript and sends spans to your traceroot host; it writes nothing back into Codex and fails open. Hooks of one session take turns through a lock directory next to the transcript (`<transcript>.traceroot.lock.d`). A hook that waits more than 10 s for it leaves a request in `<transcript>.traceroot.pending.d` and exits, and may start a background copy of the same script (`node dist/index.mjs --drain`, holding `<transcript>.traceroot.drainer.d` while it works) that sends the rest and exits within 2 minutes. Source is in [`plugins/tracing/src/`](plugins/tracing/src/).
 
 Start `codex`. At the "Hooks need review" prompt, choose **Trust all and continue** if you've looked at the above, or **Continue without trusting (hooks won't run)** and review them first under `/hooks`. Note that "all" means every hook awaiting review, not only this plugin's. Codex records a hash of each hook definition in `~/.codex/config.toml`, so you're asked once per definition and again if `hooks.json` changes; the hash does not cover `dist/index.mjs`, so a plugin update that changes the script runs under the existing grant. See [Codex hooks](https://developers.openai.com/codex/hooks).
 
@@ -88,7 +88,7 @@ Non-interactive Codex never shows the trust prompt, so untrusted hooks are skipp
 
 3. **`codex exec --dangerously-bypass-hook-trust`**, as a last resort. This skips the trust check for every hook in that run, not only this plugin's. It's intended for one-off automation that vets hook sources elsewhere, not as the standing flag in a CI job; use 1 or 2 for that.
 
-To check a headless setup, run `codex exec --skip-git-repo-check "echo hello" < /dev/null`. The output should include `hook: Stop Completed`, and a trace should appear in TraceRoot. If there are no `hook:` lines, the hooks aren't trusted. If the hooks run but no trace appears, check `api_key` and `host_url`.
+To check a headless setup, run `codex exec --skip-git-repo-check "echo hello" < /dev/null`. The output should include `hook: Stop Completed`, and a trace should appear in traceroot. If there are no `hook:` lines, the hooks aren't trusted. If the hooks run but no trace appears, check `api_key` and `host_url`.
 
 ## Images
 
@@ -99,17 +99,17 @@ By default, tool output is cut at `max_chars`, which also cuts any screenshot in
 - When a tool's output is fed to the next model call, each image in it shows there as `[image: see tool call <call id>]` instead of a second copy. The tool span's metadata carries the matching `call_id`.
 - An image larger than 5 MiB is replaced with `[image omitted: larger than 5 MiB]`. If a span would still be larger than 8 MiB, its largest images are replaced with `[image omitted: span larger than 8 MiB]` until it fits. Where a placeholder would point at an image replaced this way, it shows the same text instead.
 
-Screenshots are stored as images only when your TraceRoot server has image extraction enabled for the project. On a self-hosted server, set `ATTACHMENT_ENABLED=true`, and optionally `ATTACHMENT_PROJECT_IDS` to a comma-separated list of the projects to enable it for. Without it, screenshots are stored inline in the span text. See [Images in span input and output](https://traceroot.ai/docs/tracing/data-capture#images-in-span-input-and-output) for the server's own limits and placeholders, and [Self-hosting](https://traceroot.ai/docs/developer/self-hosting#image-attachments) for its settings.
+Screenshots are stored as images only when your traceroot server has image extraction enabled for the project. On a self-hosted server, set `ATTACHMENT_ENABLED=true`, and optionally `ATTACHMENT_PROJECT_IDS` to a comma-separated list of the projects to enable it for. Without it, screenshots are stored inline in the span text. See [Images in span input and output](https://traceroot.ai/docs/tracing/data-capture#images-in-span-input-and-output) for the server's own limits and placeholders, and [Self-hosting](https://traceroot.ai/docs/developer/self-hosting#image-attachments) for its settings.
 
 ## Sending and retries
 
-Each hook sends what it read in requests of up to `max_request_bytes`, one at a time, and records a span as sent (in `<transcript>.traceroot`) only once TraceRoot accepts the request carrying it. A request answered with 429, 502, 503 or 504 is retried a few times within the export's 10 s timeout, following `Retry-After`. Spans that still aren't accepted are sent by the session's next hook, after the next tool call or turn end.
+Each hook sends what it read in requests of up to `max_request_bytes`, one at a time, and records a span as sent (in `<transcript>.traceroot`) only once traceroot accepts the request carrying it. A request answered with 429, 502, 503 or 504 is retried a few times within the export's 10 s timeout, following `Retry-After`. Spans that still aren't accepted are sent by the session's next hook, after the next tool call or turn end.
 
 A hook that hands its run to the lock holder starts the background drainer described in [Install](#install), as does a holder that exits with handed-off runs still waiting, because a run failed or it used its 15 s budget. Only one drainer runs per session. It retries a failed run after 1 s, 2 s, 4 s and so on, up to 15 s apart, starts no run after 90 s, and exits within 2 minutes; anything left is sent by the session's next hook. Set `debug` to see these steps on stderr.
 
 ## Privacy
 
-Only what appears in your traces is sent to your TraceRoot host: prompts, tool inputs/outputs (which can include commands and file contents), model and token info, and git repo/branch. If your tools handle secrets, their inputs/outputs are part of the trace. With `capture_images` on, screenshots and other images in tool output, and images you attach to prompts, are sent too.
+Only what appears in your traces is sent to your traceroot host: prompts, tool inputs/outputs (which can include commands and file contents), model and token info, and git repo/branch. If your tools handle secrets, their inputs/outputs are part of the trace. With `capture_images` on, screenshots and other images in tool output, and images you attach to prompts, are sent too.
 
 ## License
 

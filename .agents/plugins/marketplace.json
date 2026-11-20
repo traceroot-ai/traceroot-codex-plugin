@@ -1,6 +1,6 @@
 {
   "name": "traceroot-codex-plugin",
-  "interface": { "displayName": "TraceRoot" },
+  "interface": { "displayName": "traceroot" },
   "plugins": [
     {
       "name": "tracing",

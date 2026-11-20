@@ -2,7 +2,7 @@ import type { Attributes } from "@opentelemetry/api";
 import { attributesBytes } from "./size.js";
 import { truncate } from "./util.js";
 
-// Base64 image data URLs in the formats the TraceRoot backend stores as attachments.
+// Base64 image data URLs in the formats the traceroot backend stores as attachments.
 const IMAGE_DATA_URL = /data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/]+={0,2}/g;
 const WHOLE_IMAGE_DATA_URL = new RegExp(`^(?:${IMAGE_DATA_URL.source})$`);
 
