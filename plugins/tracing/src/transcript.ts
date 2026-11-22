@@ -46,6 +46,9 @@ function reasoningText(p: { summary?: unknown[]; content?: unknown }): string | 
   const parts: string[] = [];
   for (const s of (p.summary ?? []) as Array<{ text?: string }>) if (s?.text) parts.push(s.text);
   if (typeof p.content === "string") parts.push(p.content);
+  else if (Array.isArray(p.content)) {
+    for (const c of p.content as Array<{ text?: string }>) if (typeof c?.text === "string") parts.push(c.text);
+  }
   return parts.length ? parts.join("\n") : undefined;
 }
 

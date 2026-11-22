@@ -82,6 +82,33 @@ describe("parseRollout", () => {
     expect(turns[0]!.finalOutput).toBe("two files");
   });
 
+  it("reads reasoning text from content parts", () => {
+    const lines: RolloutLine[] = [
+      { timestamp: ts(100), type: "session_meta", payload: { id: "sess-1" } },
+      { timestamp: ts(101), type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } },
+      {
+        timestamp: ts(102),
+        type: "response_item",
+        payload: { type: "message", role: "user", content: [{ type: "input_text", text: "trace this" }] },
+      },
+      {
+        timestamp: ts(103),
+        type: "response_item",
+        payload: {
+          type: "reasoning",
+          content: [
+            { type: "reasoning_text", text: "Check the transcript shape." },
+            { type: "reasoning_text", text: "Then emit the trace." },
+          ],
+        },
+      },
+      { timestamp: ts(104), type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } },
+    ];
+
+    const { turns } = parseRollout(lines);
+    expect(turns[0]!.steps[0]!.reasoning).toBe("Check the transcript shape.\nThen emit the trace.");
+  });
+
   it.each([
     "environment_context",
     "user_instructions",
