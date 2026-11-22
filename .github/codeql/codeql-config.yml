@@ -1,0 +1,4 @@
+# The committed bundle contains third-party dependencies. Keep scanning the
+# maintained source in plugins/tracing/src, but exclude the generated bundle.
+paths-ignore:
+  - 'plugins/tracing/dist/**'
