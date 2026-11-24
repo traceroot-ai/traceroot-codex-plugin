@@ -82,6 +82,17 @@ function runShellCommand(
   });
 }
 
+// Codex fills each `${NAME}` from the plugin's environment into the command text
+// before running it, on every OS, and passes the same variables in the hook's
+// environment. The shell is never asked to expand the plugin root, which matters
+// on Windows: cmd.exe doesn't expand `$NAME`.
+function fillCodexPlaceholders(command: string, env: Record<string, string>): string {
+  return Object.entries(env).reduce(
+    (filled, [key, value]) => filled.replaceAll(`\${${key}}`, value),
+    command,
+  );
+}
+
 afterEach(async () => {
   while (tempDirs.length) {
     await fs.rm(tempDirs.pop()!, { recursive: true, force: true });
@@ -112,7 +123,10 @@ describe("bundled hook command", () => {
     const hooks = JSON.parse(await fs.readFile(path.join(pluginRoot, "hooks", "hooks.json"), "utf-8")) as {
       hooks: { Stop: Array<{ hooks: Array<{ command: string }> }> };
     };
-    const command = hooks.hooks.Stop[0]!.hooks[0]!.command;
+    const command = fillCodexPlaceholders(hooks.hooks.Stop[0]!.hooks[0]!.command, {
+      PLUGIN_ROOT: installedPluginRoot,
+    });
+    expect(command).not.toContain("PLUGIN_ROOT");
     const result = await runShellCommand(command, {
       cwd: sessionCwd,
       env: {
