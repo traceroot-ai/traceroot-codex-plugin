@@ -18,7 +18,7 @@ describe("plugin manifest", () => {
     for (const ev of ["PostToolUse", "Stop", "SubagentStop"]) {
       expect(h.hooks[ev]).toBeDefined();
       const cmd = h.hooks[ev][0].hooks[0].command;
-      expect(cmd).toBe('node "$PLUGIN_ROOT/dist/index.mjs"');
+      expect(cmd).toBe('node "${PLUGIN_ROOT}/dist/index.mjs"');
       expect(cmd).not.toContain("/plugins/cache/");
     }
   });

@@ -41,3 +41,32 @@ jobs:
 
       - name: Lint dist
         run: pnpm run lint:dist
+
+  windows:
+    name: Typecheck, test (Windows)
+    runs-on: windows-latest
+    steps:
+      # Check out with LF endings, as on Linux, so fixtures and goldens compare the same.
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm test
